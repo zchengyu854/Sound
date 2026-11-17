@@ -180,11 +180,15 @@ node test_reply_ui.cjs
 ## MP3 / MP4 角色声音本地训练后端
 
 训练后端 API 另有独立可视化工作台：启动或重启应用后直接访问 <http://127.0.0.1:8000/training/>。它不嵌入聊天首页，也不添加首页导航入口；原有黑色聊天页面和 CLI 用法不变。需要本机 `ffmpeg`、`ffprobe`（可用 `brew install ffmpeg` 安装）及固定版本 MLX 依赖；不调用远程训练，不修改 `.venv` 或共享 CLI 算法。只处理本人或已获授权的单一目标说话者素材；不含自动说话人分离、背景音乐分离或多人混合训练。
+
+工作台导航分为“导入素材”“试听与校对”“训练与任务”“声音对照”。选择素材集后，可在各页之间切换；未保存的片段原文会保留，切换素材集或刷新前仍需保存。“声音对照”页可直接选择已完成的训练任务。
+
 ### 声音对照
 
 素材处理完成后，工作台会排队分析当前素材；被排除的片段不参与，尚待审核的片段会参与。审核状态或原文变化后，当前结果会标为过期，可点击重新分析。训练完成后会分析该任务的冻结素材和两条原有试听；在任务记录中选择历史完成任务，可以手动补算或重试。分析结果单独保存在 `data/training/` 的素材集及任务目录，不修改训练快照、试听确认或发布记录。
 
 - 原声内部一致性比较不同参考片段的说话人特征；至少两个有效参考片段才能计算。训练结果指数比较两条生成试听和同一组参考片段，一个有效参考片段也可以计算。固定选择最多 8 条足够长、非静音的参考：训练任务优先使用冻结快照的独立验证片段；没有独立验证片段时使用训练素材，页面会明确标注。
+- 所选任务的指数图同时展示该任务快照的原声一致性和生成声音相似度，使用同一组参考片段；两项比较对象不同，不能将差值当作训练提升。当前素材集与任务快照可能不同，请查看页面的版本和条件提示。
 - 指数是余弦相似度限制在 0–1 后乘以 100 的特征指数，不是真人相似概率、合格率或发音评分。请逐条试听，判断音色、发音、情绪、自然度及失真。
 - 质量对照对 24 kHz PCM 音频计算均方根整体响度（dBFS）、20 毫秒低于 −40 dBFS 的低能量帧占比，以及绝对幅度达到满量程 99.9% 的采样占比。多段音频按时长加权；低能量不等于噪声或静音，这些数值不代表主观音质。
 - 历史趋势仅连接冻结素材、参考片段、试听文本、特征模型版本和计算方法一致的结果；其他条件的任务单独展示，并提供步数、时间和参数文字明细。
@@ -239,6 +243,9 @@ curl -X POST "http://127.0.0.1:8000/api/training/jobs/$JOB/publish" \
 | GET | `/capabilities` | 工具、固定版本兼容性、硬件内存、当前可用性和任务 |
 | GET / POST | `/datasets` | 列表 / 创建数据集 |
 | PATCH | `/datasets/{id}` | 更新单一目标说话者确认 |
+| GET / POST | `/datasets/{id}/metrics` | 只读当前分析结果 / 排队重算；审核变化后标记过期 |
+| GET | `/datasets/{id}/metrics/history` | 已完成训练任务及保存的历史分析；只读取、不重复计算 |
+| GET / POST | `/jobs/{id}/metrics` | 只读冻结任务分析 / 手动补算或重试 |
 | POST | `/datasets/{id}/sources` | 流式接收单个 MP3 / MP4，multipart 字段 `source` |
 | POST | `/datasets/{id}/prepare` | 有界后台解码、切片和逐片转写 |
 | GET | `/datasets/{id}/segments` | `offset>=0`、`limit=1..200`，默认50 |
@@ -331,3 +338,41 @@ uv pip install --python .venv-separator/bin/python -r requirements-separator.txt
 **必须人工试听**：人声分离不保证干净，残留伴奏、混响、多人声或断词都会污染训练；脚本只标记 `review_required` 和 `single_speaker_unverified`，不会判断授权、说话人数或转写是否正确。确认只有一位说话者、人声清晰后，把 `.vocals.mp3` 当作普通素材上传到训练工作台，继续“处理素材并转写 → 逐片审核 → 训练 → 试听验收”流程。分离不能替代真人音色相似度验收。
 
 本部分验证命令：`.venv/bin/python -m py_compile separate_vocals.py`、`.venv/bin/python -m unittest -q test_separate_vocals`。测试用真实 ffmpeg 转码、替身模拟 demucs，不下载模型或触发真实分离。
+
+## 训练验收与实时语音（三阶段）
+
+按“素材准备 → 审核 → 本地训练 → A/B 对照 → 发布 → 自动语音对话 → 开口打断”的主线补齐能力。仍保持单进程、单模型执行线程与统一 gate；LLM 网络读取可与合成重叠，本地模型运算仍串行。
+
+### 阶段 1 · 训练闭环
+- **WAV 导入**：训练素材现接受未压缩 PCM WAV（与 MP3/MP4 同样校验真实容器、编码、音轨、时长、大小与磁盘上限，统一解码为 24 kHz 单声道 PCM16）。带伴奏素材先运行 `separate_vocals.py` 抽成人声，试听后直接上传 `.vocals.wav`，无需再压 MP3。工作台导入区给出该指引。
+- **对照训练**：`POST /api/training/jobs/{id}/variants`（UUID 幂等键，请求体 `{"steps": N}`）从已完成训练任务复制**同一不可变数据快照、划分与摘要**，仅改步数，从相同基座与种子重新训练；与“从检查点恢复”明确区分。`training_jobs` 新增可空 `parent_job_id`，升级时 SQLite 备份、失败回滚，旧任务为空。
+- **A/B 验收**：每条新训练任务按相同文本、相同参考片段、相同推理配置与重置种子，顺序生成“基座 / 训练后”两组音频（不同时加载两套模型）。验收记录版本化保存基座/adapter/快照/参考摘要、文本、配置、种子、两组音频哈希、时长、合成耗时、首块耗时、RTF 与有界 loss 记录。工作台按文本成对展示两组播放控件与 RTF，每次只播一个；固定试听“你好，好久不见”，另一条从预置文本中选未出现在训练/参考原文的句子，无法选择时明确报错。确认后发布，确认绑定两组音频、文本、配置与 adapter 哈希，任一变化即失效；旧任务保持原试听与确认规则。
+- **发布入口**：发布成功后显示“用此声音开始语音对话”，直达 `/realtime/?voice_id=...`；新声音为独立不可变 adapter 版本，切回普通声音不残留 adapter。
+
+### 阶段 2 · 自动接话
+新增独立页面 **`/realtime/`**（`/realtime` 跳转）。选择已发布声音或普通参考声音，点击开始后才请求麦克风并解锁 AudioContext，创建仅绑定 `voice_id` 的会话；切换声音新建会话，刷新不自动恢复。浏览器端 `web/vad.js` 用约 20 ms 帧、自适应阈值、约 150 ms 起始、约 700 ms 静音结束、约 200 ms 前置缓冲、最长 30 秒、短于 0.5 秒不提交；音频采集经 `web/realtime-worklet.js` 以约 20 ms 帧送入。说完自动识别，空文本/低可信不发送；自动发送用 `Idempotency-Key`，失败先查原任务不重复调用聊天服务。播放期间暂停自动收音，可手动停止播放；识别失败可用文字输入入口。本阶段仍等完整文字结束再合成，不宣称低延迟。
+
+### 阶段 3 · 分句合成与打断
+实时页发送的消息带 `mode: realtime`（默认 `standard`，持久化并用于重试；升级备份回滚）。`realtime_runtime.py` 提供增量断句、有界队列（≤4 段）与轮次控制：LLM 网络读取在独立 I/O 执行器，仅正文入分句器（思考不进语音）；中文句末标点/换行优先，无标点约 80 字在合理边界切分。模型线程逐句合成，PCM 顺序写入同一 live buffer 与临时 WAV，成功后原子发布完整 WAV；每段失败不重试。SSE 在文字仍增长时即可报告音频开始，实时页收到 `synthesizing` 便开始播放；音频流按当前任务/attempt/live buffer/mode 判断可读。分别记录 LLM 首正文、首句就绪、首 PCM、分句与总耗时。
+
+播放时保留麦克风检测（建议耳机验收，浏览器回声消除开启）：检测到用户讲话即停播放器、请求取消、停 LLM 读取并清队列，旧任务真正释放 gate 后再识别新一轮；只允许一段待处理录音、等待有界。异步回调核对会话/消息/attempt/轮次，过期数据不进当前界面。实时主动打断产生新终态 `interrupted`：历史与数据库保留并标注，但下一轮上下文排除被打断的整轮配对；标准聊天的取消与重试规则保持兼容。
+
+### 限制与验收
+- 人声分离仍是独立工具，独立环境**不是**资源隔离；先完成分离再启动模型服务，避免与训练/推理争用 GPU。
+- 未训练文本试听、真人音色相似度、发音/断句/失真、真实麦克风多轮对话、说话结束到首次实际播放的端到端延迟、缓冲耗尽与停顿，均为**人工/实测验收项**，不由有效 WAV、有限 loss 或自动化测试代替。
+- 性能记录要求：固定声音与配置，冷启动与预热后分开；短、中两档中文回复，每档预热后至少 5 次，报告原始值/中位数/最大值/样本量；端到端首音以浏览器实测为准，不用服务端首 PCM 代替。预热后 RTF < 1（争取约 20% 余量）是持续播放目标，非未测承诺；若训练后声音持续 RTF ≥ 1，保留自动接话与完整生成播放并如实记录，不靠加大缓冲冒充实时输出。
+
+本阶段验证：`test_realtime_runtime.py`（断句/队列/轮次）、`test_realtime_ui.cjs`（自动发送、幂等、SSE 早播、旧轮次隔离、结束回收）、`test_voice_app.py` 的 realtime 消息测试（分句合成、interrupted 终态、标准取消兼容、幂等模式校验、合成失败分类），以及原有全量回归均通过。
+
+```sh
+.venv/bin/python -m unittest -v test_voice_app test_characters test_audio_runtime \
+  test_breeze_training test_media_processing test_training_store \
+  test_training_service test_training_web test_separate_vocals test_realtime_runtime
+node --check training_web/app.js && node --check web/app.js
+node --check web/vad.js && node --check web/realtime-worklet.js && node --check realtime_web/app.js
+node test_training_ui.cjs && node test_audio_ui.cjs && node test_reply_ui.cjs
+node test_vad.cjs && node test_realtime_ui.cjs
+.venv/bin/python -m py_compile voice_app.py breezetts2_mac_fast.py breeze_training.py \
+  media_processing.py training_store.py training_service.py realtime_runtime.py separate_vocals.py
+git diff --check
+```

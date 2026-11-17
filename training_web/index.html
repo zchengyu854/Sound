@@ -25,37 +25,47 @@
       <div class="local-note"><span class="dot steady" aria-hidden="true"></span><div>素材留在本机<p>独立训练页，不改动聊天首页。仅使用本人或已获授权的声音。</p></div></div>
     </aside>
     <main id="workspace" tabindex="-1">
-      <div id="welcome" class="welcome">
-        <div class="record-symbol" aria-hidden="true"><span></span></div>
-        <h2>从一段清晰的声音开始。</h2>
-        <p>创建一个素材集，导入录音，听一遍、校对原文。<br>让训练从可靠的素材开始，而不是从一大堆参数开始。</p>
-        <button id="welcome-create" class="primary" type="button">创建第一个素材集</button>
-        <p class="footnote">支持 MP3 与带音轨的 MP4，不做多人声分离。</p>
-      </div>
-      <div id="dataset-workspace" hidden>
-        <div class="workspace-heading"><div><p class="muted">当前素材集</p><h2 id="dataset-title"></h2></div><span id="dataset-version" class="tag"></span></div>
-        <ol class="workflow" aria-label="训练流程"><li><span>1</span>导入素材</li><li><span>2</span>试听与审核</li><li><span>3</span>对照训练</li><li><span>4</span>试听确认与发布</li></ol>
-        <section class="import-section" aria-labelledby="import-title">
-          <div class="section-heading"><h3 id="import-title">导入声音素材</h3><span class="muted">MP3 / MP4</span></div>
+      <nav class="workbench-nav" role="tablist" aria-label="训练工作区">
+        <button id="tab-import" type="button" role="tab" aria-controls="panel-import" aria-selected="true">导入素材</button>
+        <button id="tab-review" type="button" role="tab" aria-controls="panel-review" aria-selected="false" tabindex="-1">试听与校对</button>
+        <button id="tab-training" type="button" role="tab" aria-controls="panel-training" aria-selected="false" tabindex="-1">训练与任务</button>
+        <button id="tab-comparison" type="button" role="tab" aria-controls="panel-comparison" aria-selected="false" tabindex="-1">声音对照</button>
+      </nav>
+      <div id="dataset-workspace">
+        <div id="workspace-heading" class="workspace-heading" hidden><div><p class="muted">当前素材集</p><h2 id="dataset-title"></h2></div><span id="dataset-version" class="tag"></span></div>
+        <section id="panel-import" class="import-section" role="tabpanel" aria-labelledby="tab-import" tabindex="0">
+          <div id="welcome" class="welcome">
+            <div class="record-symbol" aria-hidden="true"><span></span></div>
+            <h2>从一段清晰的声音开始。</h2>
+            <p>创建一个素材集，导入录音，听一遍、校对原文。<br>让训练从可靠的素材开始，而不是从一大堆参数开始。</p>
+            <button id="welcome-create" class="primary" type="button">创建第一个素材集</button>
+            <p class="footnote">支持 MP3、带音轨的 MP4 与未压缩 PCM WAV，不做多人声分离。带背景音乐的素材先用 <code>separate_vocals.py</code> 抽成人声、试听后再上传。</p>
+          </div>
+          <div id="import-content" hidden>
+          <div class="section-heading"><h3 id="import-title">导入声音素材</h3><span class="muted">MP3 / MP4 / WAV</span></div>
           <div id="drop-zone" class="drop-zone">
             <svg aria-hidden="true" width="28" height="28" viewBox="0 0 28 28" fill="none"><path d="M14 19V5m-5 5 5-5 5 5M5 18v5h18v-5" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
             <div><strong>把录音或视频拖到这里</strong><p>每文件 ≤ 200 MiB / 60 分钟，素材集累计 ≤ 2 小时</p></div>
-            <label class="button file-label" for="source-files">选择文件<input id="source-files" type="file" accept=".mp3,.mp4,audio/mpeg,video/mp4" multiple></label>
+            <label class="button file-label" for="source-files">选择文件<input id="source-files" type="file" accept=".mp3,.mp4,.wav,audio/mpeg,video/mp4,audio/wav,audio/x-wav" multiple></label>
           </div>
+          <p class="footnote import-guide">带背景音乐的音视频请先在终端运行 <code>separate_vocals.py</code> 抽成人声，试听 <code>.vocals.wav</code> 确认无伴奏、单一说话者后，直接上传该 WAV；本工作台不识别也不剥离背景音乐。</p>
           <p id="upload-status" class="muted" aria-live="polite">文件会逐个上传。上传后，点击处理素材生成切片与转写。</p>
           <ul id="uploads" class="upload-list" aria-label="本次上传结果"></ul>
           <div class="import-actions"><span class="muted">已处理的来源会自动跳过。</span><button id="prepare" type="button">处理素材并转写</button></div>
+          </div>
         </section>
-        <section class="review-section" aria-labelledby="review-title">
+        <section id="panel-review" class="review-section" role="tabpanel" aria-labelledby="tab-review" tabindex="0" hidden>
           <div class="section-heading"><div><h3 id="review-title">试听与校对</h3><p id="review-summary" class="muted">正在读取片段…</p></div><button id="refresh-segments" class="quiet small" type="button">刷新片段</button></div>
           <label class="speaker-check"><input id="speaker-confirmed" type="checkbox"><span>我确认此素材集属于同一位目标说话者，并拥有使用授权。</span></label>
           <p id="draft-notice" class="draft-notice" hidden>有尚未保存的原文。刷新或切换素材集前，请先保存。</p>
           <div id="segments" class="segments"></div>
           <div class="pagination"><button id="previous-segments" class="quiet small" type="button">上一页</button><span id="segment-page" class="muted"></span><button id="next-segments" class="quiet small" type="button">下一页</button></div>
         </section>
-        <section class="comparison-section" aria-labelledby="comparison-title">
-          <div class="section-heading"><div><h3 id="comparison-title">声音对照</h3><p class="muted">当前原声与右侧所选已完成训练任务</p></div></div>
+        <section id="panel-comparison" class="comparison-section" role="tabpanel" aria-labelledby="tab-comparison" tabindex="0" hidden>
+          <div class="section-heading"><div><h3 id="comparison-title">声音对照</h3><p class="muted">当前原声与所选已完成训练任务</p></div></div>
+          <label class="comparison-select" for="comparison-job-select">选择训练任务<select id="comparison-job-select"><option value="">暂无任务</option></select></label>
           <p class="comparison-note">音色特征指数并非主观听感评分。请逐条试听发音、情绪和自然度，也留意失真；试听确认与发布仍按原流程进行。</p>
+          <p class="footnote">质量图的响度显示范围为 −80 至 0 dBFS，两项占比为 0–100%；文字显示测量值。低能量不等于噪声或静音。</p>
           <div class="comparison-grid">
             <article class="comparison-card" aria-labelledby="original-metrics-title">
               <div class="comparison-card-heading"><h3 id="original-metrics-title">当前原声</h3><button id="dataset-metrics-action" class="small" type="button">计算原声</button></div>
@@ -77,8 +87,7 @@
           </div>
         </section>
       </div>
-    </main>
-    <aside class="training-panel" aria-label="训练与任务">
+      <section id="panel-training" class="training-panel" role="tabpanel" aria-labelledby="tab-training" tabindex="0" hidden>
       <section aria-labelledby="training-title">
         <div class="section-heading"><h2 id="training-title">训练声音</h2><span class="tag">LoRA</span></div>
         <p id="training-readiness" class="muted">选择素材集后，先确认说话者并审核片段。</p>
@@ -103,11 +112,12 @@
           <div class="job-status"><strong id="job-status"></strong><span id="job-attempt" class="muted"></span></div>
           <p id="job-progress-text" class="muted"></p><progress id="job-progress" aria-labelledby="job-progress-text" hidden></progress>
           <p id="job-error" class="job-error" hidden></p><p id="validation-warning" class="footnote" hidden></p><p id="job-summary" class="footnote" hidden></p>
-          <div class="job-actions"><button id="cancel-job" class="danger" type="button" hidden>取消任务</button><button id="retry-job" type="button" hidden>重新尝试</button><button id="restart-job" class="quiet small" type="button" hidden>放弃检查点重训</button></div>
+          <div class="job-actions"><button id="cancel-job" class="danger" type="button" hidden>取消任务</button><button id="retry-job" type="button" hidden>重新尝试</button><button id="restart-job" class="quiet small" type="button" hidden>放弃检查点重训</button><button id="variant-job" class="quiet small" type="button" hidden>按原快照做对照训练</button></div>
+          <p id="variant-note" class="footnote" hidden>对照训练复制原任务的数据快照与全部参数，只改步数，从同一基座和随机种子重新训练；与“从检查点恢复”不同，且不共享检查点。</p>
           <p id="cancel-note" class="footnote" hidden>取消将在当前片段或训练步骤退出后生效，不会提前释放模型。</p>
           <section id="preview-section" class="preview-section" hidden>
             <div class="section-heading"><h3>试听验收</h3><span class="tag">发布前必做</span></div>
-            <p class="muted">逐条播放试听，检查音色、发音、断句和失真；建议用未参与训练的文本对照。有效 WAV 与低损失不代表音色相似。</p>
+            <p class="muted">每条文本按“基座 / 训练后”成对试听，使用同一文本、同一参考片段、同一推理配置与随机种子。逐条检查音色、发音、断句和失真；RTF 等指数不是音色相似度。有效 WAV 与低损失也不代表音色相似。</p>
             <div id="preview-samples" class="preview-samples"></div>
             <label class="preview-check"><input id="preview-check" type="checkbox"><span>我已逐条试听，并检查音色、发音、断句和失真。</span></label>
             <label for="preview-note">试听备注（可选）</label>
@@ -117,10 +127,11 @@
           </section>
           <form id="publish-form" class="publish-form" hidden><h3>发布为新声音</h3><p class="muted">生成独立版本，不覆盖已有声音或会话。</p><label>声音名称<input id="voice-name" maxlength="60" required placeholder="例如：角色一 · 声音版本 1"></label><button id="publish" class="primary full" type="submit">验证并发布声音</button></form>
         </div>
-        <div id="published" class="published" hidden><strong>声音已发布</strong><p id="published-name"></p><label for="published-id">声音 UUID</label><input id="published-id" readonly><button id="copy-voice" class="quiet small" type="button">复制声音 UUID</button><p class="footnote">可以在聊天项目中为人物选择此声音，再创建新会话试听。旧会话保持原声音。</p></div>
+        <div id="published" class="published" hidden><strong>声音已发布</strong><p id="published-name"></p><label for="published-id">声音 UUID</label><input id="published-id" readonly><button id="copy-voice" class="quiet small" type="button">复制声音 UUID</button><a id="start-realtime" class="button small published-realtime" href="/realtime/">用此声音开始语音对话</a><p class="footnote">也可在聊天项目中为人物选择此声音，再创建新会话试听。旧会话保持原声音。</p></div>
       </section>
       <details class="environment"><summary>本机环境与限制</summary><p id="environment" class="footnote">正在读取能力信息…</p></details>
-    </aside>
+      </section>
+    </main>
   </div>
   <footer class="page-footer">训练只在本机进行。请用未参与训练的句子试听，确认音色、发音与失真情况。</footer>
   <dialog id="create-dialog" aria-labelledby="create-title"><form id="create-form"><div class="section-heading"><h2 id="create-title">新建声音素材集</h2><button id="close-create" class="quiet small" type="button" aria-label="关闭新建素材集">关闭</button></div><p class="muted">为一位目标说话者建立独立素材集。</p><label>素材集名称<input id="dataset-name" maxlength="60" required placeholder="例如：角色一的声音" autocomplete="off"></label><p id="create-error" class="job-error" role="alert" hidden></p><button id="create-dataset" class="primary full" type="submit">创建素材集</button></form></dialog>

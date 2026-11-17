@@ -195,6 +195,42 @@ class TrainingStoreTests(unittest.TestCase):
             with self.assertRaises(HTTPException):
                 TrainingStore(chat).dataset_dir(str(uuid4()))
 
+    def test_variant_copies_snapshot_and_changes_only_steps(self):
+        segment = self.segment()
+        parent = self.store.create_job(self.did, 'train', {'rank': 4, 'steps': 20, 'seed': 7})
+        key = str(uuid4())
+        variant = self.store.create_variant_job(parent['id'], 50, key)
+        self.assertEqual(variant['parent_job_id'], parent['id'])
+        self.assertEqual(variant['snapshot'], parent['snapshot'])
+        self.assertEqual(variant['digest'], parent['digest'])
+        self.assertEqual({k: v for k, v in variant['config'].items() if k != 'steps'},
+                         {k: v for k, v in parent['config'].items() if k != 'steps'})
+        self.assertEqual(variant['config']['steps'], 50)
+        self.assertEqual(self.store.create_variant_job(parent['id'], 50, key)['id'], variant['id'])
+        with self.assertRaises(HTTPException) as error:
+            self.store.create_variant_job(parent['id'], 100, key)
+        self.assertEqual(error.exception.status_code, 409)
+        prepare = self.store.create_job(self.did, 'prepare', {})
+        with self.assertRaises(HTTPException):
+            self.store.create_variant_job(prepare['id'], 50)
+        with self.assertRaises(HTTPException):
+            self.store.create_variant_job(parent['id'], 0)
+        with self.assertRaises(HTTPException):
+            self.store.update('training_jobs', variant['id'], parent_job_id=parent['id'])
+
+    def test_parent_job_id_migration_adds_column(self):
+        with tempfile.TemporaryDirectory() as directory:
+            chat = Chat(directory)
+            store = TrainingStore(chat)
+            with closing(chat.connect()) as db, db:
+                db.execute(f"CREATE TABLE training_datasets({SCHEMAS['training_datasets']})")
+                legacy_jobs = SCHEMAS['training_jobs'].replace(', parent_job_id TEXT', '')
+                db.execute(f"CREATE TABLE training_jobs({legacy_jobs})")
+            store.start()
+            with closing(chat.connect()) as db:
+                self.assertIn('parent_job_id', [row[1] for row in db.execute('PRAGMA table_info(training_jobs)')])
+            self.assertEqual(len(list(Path(directory).glob('before-training-*.sqlite3'))), 1)
+
 
 if __name__ == '__main__':
     unittest.main()

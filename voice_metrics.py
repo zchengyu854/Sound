@@ -148,7 +148,7 @@ def compute_audio_metrics(path):
 
 
 def compute_dataset_metrics(paths):
-    """Aggregate WAV quality, weighting RMS by time and clipping by samples.
+    """Aggregate WAV quality, weighting each file by its audio duration.
 
     Returns an aggregate with metric/count keys, a 'files' list, and file
     counts. Low-energy fractions are weighted by analyzed
@@ -165,6 +165,7 @@ def compute_dataset_metrics(paths):
     # Divide out the channel count first, so stereo and mono have equal weight
     # per unit of time rather than weighting stereo files twice as heavily.
     power_sum = sum(item["sum_squares"] / item["channel_count"] for item in included)
+    clipped_frames = sum(item["clipped_sample_count"] / item["channel_count"] for item in included)
     available = power_sum > 0
     reason = None if available else ("silent" if included else "no_valid_audio")
     return {
@@ -174,7 +175,7 @@ def compute_dataset_metrics(paths):
         "low_energy_window_count": low_windows, "clipped_sample_count": clipped,
         "rms_dbfs": 10 * math.log10(power_sum / total_frames) if available else None,
         "low_energy_fraction": low_windows / windows if available and windows else None,
-        "clipping_fraction": clipped / total_samples if available else None,
+        "clipping_fraction": clipped_frames / total_frames if available else None,
         "file_count": len(scans), "valid_file_count": len(included),
         "non_silent_file_count": sum(item["status"] == "ok" for item in scans),
         "unavailable_file_count": sum(item["status"] != "ok" for item in scans),

@@ -2,12 +2,17 @@
 
 ## Project Structure & Module Organization
 
-- `voice_app.py`: FastAPI endpoints, SQLite persistence, task scheduling, cancellation, and Breeze integration.
+- `voice_app.py`: FastAPI endpoints, SQLite persistence, task scheduling, cancellation, and Breeze integration. Standard (`mode=standard`) and realtime (`mode=realtime`) replies share one model thread; realtime streams LLM text on a separate I/O executor and synthesizes per sentence.
+- `realtime_runtime.py`: incremental Chinese sentence splitting, bounded segment queue, and turn/round control for realtime replies. Pure logic; keep it free of model and I/O dependencies.
 - `breezetts2_mac_fast.py`: streaming inference CLI and shared helpers such as `FastDepth`, `pcm_chunks`, and `pcm16_bytes`. Preserve existing CLI behavior when changing shared code.
 - `character_store.py`: character profiles, immutable conversation snapshots, and bounded memory extraction.
-- `web/`: native HTML, CSS, and JavaScript; no frontend build pipeline.
-- `test_voice_app.py`: backend regression tests and fake inference/provider implementations.
-- `README.md` describes streaming inference; `WEB_APP.md` covers web configuration and APIs. `fish_s2_mac_stream.py.py` is a separate Fish streaming script.
+- `media_processing.py`: bounded MP3/MP4/WAV probe, decode to 24 kHz mono PCM16, and silence-aware slicing.
+- `training_store.py`, `training_service.py`, `breeze_training.py`: dataset/snapshot review gates, LoRA training jobs, checkpoints, versioned A/B validation records, and publishing immutable voice versions.
+- `separate_vocals.py` + `requirements-separator.txt`: standalone vocal separation CLI that runs in its own `.venv-separator` and calls `demucs-mlx`; outputs a review WAV plus an uploadable MP3. Not part of the web service.
+- `web/`: chat frontend (native HTML/CSS/JS, no build step). `web/vad.js` and `web/realtime-worklet.js` are shared with the realtime page.
+- `training_web/`: standalone training workbench served at `/training/`. `realtime_web/`: standalone realtime voice page served at `/realtime/`.
+- `test_voice_app.py`: backend regression tests and fake inference/provider implementations. `test_realtime_runtime.py` covers splitting/queue/turn logic; `test_vad.cjs` and `test_realtime_ui.cjs` cover the realtime browser logic with DOM/API doubles.
+- `README.md` describes streaming inference; `WEB_APP.md` covers web configuration, APIs, training/realtime behavior, and the manual acceptance checklist. `fish_s2_mac_stream.py.py` is a separate Fish streaming script.
 - Ignored `data/` holds private recordings, generated audio, SQLite state, and migration backups. Keep verification artifacts in ignored `web-test-artifacts/`.
 
 ## Build, Test, and Development Commands

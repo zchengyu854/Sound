@@ -63,6 +63,8 @@ def separate(source, output_dir, separator_venv, model=DEFAULT_MODEL, cancel=Non
         raise MediaError("separator_unavailable")
     if not shutil.which("ffmpeg"):
         raise MediaError("media_tool_unavailable")
+    if source.suffix.lower().lstrip(".") not in ("mp3", "mp4"):
+        raise MediaError("unsupported_format")
     metadata = probe_media(source, source.suffix)
     check_cancel(cancel)
 

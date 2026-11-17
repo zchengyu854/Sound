@@ -97,7 +97,7 @@ class VoiceMetricsTests(unittest.TestCase):
         self.assertEqual(metrics.compute_dataset_metrics([empty, corrupt])["reason"], "no_valid_audio")
         self.assertEqual(metrics.compute_dataset_metrics([])["status"], "unavailable")
 
-    def test_dataset_weights_power_by_time_frames_by_duration_and_clipping_by_samples(self):
+    def test_dataset_weights_power_frames_and_clipping_by_duration(self):
         mono = self.constant("mono.wav", -32768)
         stereo = self.wav("stereo.wav", np.full((24000, 2), 16384, dtype=np.int16), channels=2)
         silence = self.constant("silent.wav", 0, seconds=2)
@@ -106,7 +106,7 @@ class VoiceMetricsTests(unittest.TestCase):
         self.assertEqual(result["status"], "ok")
         self.assertAlmostEqual(result["rms_dbfs"], 10 * math.log10((1 + 0.25) / 4))
         self.assertEqual(result["low_energy_fraction"], 0.5)
-        self.assertEqual(result["clipping_fraction"], 24000 / (24000 + 48000 + 48000))
+        self.assertEqual(result["clipping_fraction"], 0.25)
         self.assertEqual(result["duration_seconds"], 4)
         self.assertEqual((result["file_count"], result["valid_file_count"],
                           result["non_silent_file_count"], result["unavailable_file_count"]), (4, 3, 2, 2))

@@ -19,6 +19,9 @@ MAX_DECODE_BYTES = 180 * 1024**2
 PROBE_TIMEOUT = 15
 DECODE_TIMEOUT = 300
 RATE = 24000
+PCM_CODECS = {"pcm_u8", "pcm_s16le", "pcm_s16be", "pcm_s24le", "pcm_s24be",
+              "pcm_s32le", "pcm_s32be"}
+DEMUXERS = {"mp3": "mp3", "mp4": "mov", "wav": "wav"}
 
 
 class MediaError(Exception):
@@ -71,23 +74,29 @@ def run_tool(arguments, timeout, cancel=None):
 def probe_media(path, extension):
     path = Path(path)
     extension = extension.lower().lstrip(".")
-    if extension not in ("mp3", "mp4"):
+    if extension not in DEMUXERS:
         raise MediaError("unsupported_format")
     try:
         if not path.is_file() or not 0 < path.stat().st_size <= MAX_SOURCE_BYTES:
             raise MediaError("source_size_limit")
         output = run_tool(["ffprobe", "-v", "error", "-protocol_whitelist", "file,pipe",
-                           "-show_entries", "format=format_name,duration:stream=index,codec_type,duration:stream_disposition=default",
+                           "-show_entries", "format=format_name,duration:stream=index,codec_type,codec_name,duration:stream_disposition=default",
                            "-of", "json", str(path.resolve())], PROBE_TIMEOUT)
         document = json.loads(output)
         container = document["format"]["format_name"]
         formats = set(container.split(","))
-        if (extension == "mp3" and formats != {"mp3"}) or (extension == "mp4" and "mp4" not in formats):
+        if extension == "mp3" and formats != {"mp3"}:
+            raise MediaError("container_mismatch")
+        if extension == "mp4" and "mp4" not in formats:
+            raise MediaError("container_mismatch")
+        if extension == "wav" and "wav" not in formats:
             raise MediaError("container_mismatch")
         streams = [s for s in document.get("streams", []) if s.get("codec_type") == "audio"]
         if not streams:
             raise MediaError("no_audio_stream")
         selected = next((s for s in streams if s.get("disposition", {}).get("default")), streams[0])
+        if extension == "wav" and selected.get("codec_name") not in PCM_CODECS:
+            raise MediaError("unsupported_codec")
         duration = float(document["format"].get("duration", selected.get("duration", 0)))
         if not math.isfinite(duration) or not 0 < duration <= MAX_DURATION:
             raise MediaError("duration_limit")
@@ -108,7 +117,7 @@ def decode_media(source, destination, cancel):
     try:
         # Explicit demuxers plus a protocol allowlist prevent playlist/network interpretation.
         run_tool(["ffmpeg", "-nostdin", "-v", "error", "-xerror", "-y",
-                  "-protocol_whitelist", "file,pipe", "-f", "mp3" if source.suffix.lower() == ".mp3" else "mov",
+                  "-protocol_whitelist", "file,pipe", "-f", DEMUXERS[source.suffix.lower().lstrip(".")],
                   "-i", str(source.resolve()), "-map", f"0:{metadata['audio_stream']}",
                   "-vn", "-sn", "-dn", "-ac", "1", "-ar", str(RATE), "-c:a", "pcm_s16le",
                   "-fs", str(min(MAX_DECODE_BYTES, int(MAX_DURATION * RATE * 2) + 4096)),

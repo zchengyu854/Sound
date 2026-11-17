@@ -6,7 +6,7 @@
   const STATUS = {queued: "排队等待", preparing: "准备素材与模型", transcribing: "逐片转写", review_required: "等待人工审核", training: "正在训练", validating: "验证训练产物", completed: "训练完成，待试听确认", failed: "任务失败", cancelling: "正在取消", cancelled: "已取消"};
   const REVIEW = {pending: "待审核", approved: "已确认", excluded: "已排除"};
   const HINTS = {forced_split_check_words: "强制切分，请检查断词", short_segment: "片段偏短，请检查内容", low_volume_or_silence: "低音量或静音", possible_clipping: "可能削波失真", no_speech: "未识别到人声，请人工核对", transcription_failed_edit_required: "转写失败，请手动填写原文"};
-  const ERRORS = {interrupted: "上次任务因应用退出而中断，请显式重试或恢复。", training_failed: "任务执行失败。请检查素材、可用内存和模型状态，再重试。", dispatch_failed: "任务未能投递，请重试。", cancelled: "任务已取消。可在退出后显式恢复或重试。", media_timeout: "媒体工具处理超时。请缩短素材后重新上传。", invalid_media: "素材损坏或无法解码，请重新导出 MP3 或 MP4。", disk_space: "磁盘剩余空间不足，请清理空间后重试。", decoded_size_limit: "解码音频超过限制，请先缩短素材。", duration_limit: "媒体实际时长超限，请缩短素材。", container_mismatch: "扩展名与实际容器不一致，请正确导出素材。", no_audio_stream: "视频没有可用音轨。", media_tool_unavailable: "未找到 FFmpeg 或 FFprobe，请安装后重试。"};
+  const ERRORS = {interrupted: "上次任务因应用退出而中断，请显式重试或恢复。", training_failed: "任务执行失败。请检查素材、可用内存和模型状态，再重试。", dispatch_failed: "任务未能投递，请重试。", cancelled: "任务已取消。可在退出后显式恢复或重试。", media_timeout: "媒体工具处理超时。请缩短素材后重新上传。", invalid_media: "素材损坏或无法解码，请重新导出 MP3、MP4 或 WAV。", unsupported_codec: "WAV 必须使用未压缩 PCM 编码，不能是压缩或浮点格式。", disk_space: "磁盘剩余空间不足，请清理空间后重试。", decoded_size_limit: "解码音频超过限制，请先缩短素材。", duration_limit: "媒体实际时长超限，请缩短素材。", container_mismatch: "扩展名与实际容器不一致，请正确导出素材。", no_audio_stream: "视频没有可用音轨。", media_tool_unavailable: "未找到 FFmpeg 或 FFprobe，请安装后重试。"};
 
   function formatDuration(value) {
     const seconds = Math.max(0, Math.round(Number(value) || 0));
@@ -23,7 +23,7 @@
   function createWorkbench(doc, win) {
     const $ = id => doc.getElementById(id);
     const state = {datasets: [], jobs: [], capabilities: null, health: null, selected: "", jobId: "", segments: [], offset: 0,
-      drafts: new Map(), uploads: [], published: new Map(), busy: "", connected: false, segmentsLoading: false, needsSegments: false};
+      drafts: new Map(), uploads: [], published: new Map(), busy: "", connected: false, segmentsLoading: false, needsSegments: false, view: "import"};
     let refreshing = null, segmentRequest = 0, pollTimer = null, disposed = false;
     let librarySignature = "", jobsSignature = "", previewSignature = "";
     const metricCache = new Map(), metricErrors = new Map(), metricRequests = new Map();
@@ -37,6 +37,25 @@
     const storageSet = (storage, key, value) => { try { storage.setItem(key, value); } catch { /* The page also works without storage. */ } };
     const storageRemove = (storage, key) => { try { storage.removeItem(key); } catch { /* Nothing to clear when storage is blocked. */ } };
 
+    const views = ["import", "review", "training", "comparison"];
+    function renderView() {
+      const hasDataset = Boolean(dataset());
+      if (!hasDataset && ["review", "comparison"].includes(state.view)) state.view = "import";
+      for (const view of views) {
+        const tab = $(`tab-${view}`), active = state.view === view;
+        tab.disabled = !hasDataset && ["review", "comparison"].includes(view);
+        tab.setAttribute("aria-selected", String(active));
+        tab.tabIndex = active ? 0 : -1;
+        $(`panel-${view}`).hidden = !active;
+      }
+    }
+    function setView(view, focus = false) {
+      if (!views.includes(view) || $(`tab-${view}`).disabled) return;
+      state.view = view;
+      renderView();
+      if (focus) $(`tab-${view}`).focus();
+    }
+
     function node(tag, className, text) {
       const element = doc.createElement(tag);
       if (className) element.className = className;
@@ -47,7 +66,7 @@
     const metricKey = (kind, id) => `${kind}:${id}`;
     const metricVersion = key => metricVersions.get(key) || 0;
     const invalidateMetric = key => metricVersions.set(key, metricVersion(key) + 1);
-    const metricNumber = (value, unit = "") => typeof value === "number" && Number.isFinite(value) ? `${value}${unit}` : "不可用";
+    const metricNumber = (value, unit = "") => typeof value === "number" && Number.isFinite(value) ? `${Number(value.toPrecision(8))}${unit}` : "不可用";
     const metricText = value => typeof value === "string" && value ? value : "不可用";
     const metricResult = metric => metric?.result && typeof metric.result === "object" ? metric.result : null;
     const metricBusy = metric => ["queued", "running"].includes(metric?.status);
@@ -56,8 +75,8 @@
       const error = metricErrors.get(key);
       if (!metric) return metricPosting.has(key) ? "正在提交计算…" : error ? `读取或提交失败：${error}` : metricRequests.has(key) ? "正在读取分析状态…" : "分析状态不可用。";
       const labels = {not_started: "未开始", queued: "排队中", running: "计算中", completed: "计算完成", failed: "计算失败", interrupted: "计算中断"};
-      const parts = [labels[metric.status] || "状态不可用"];
       const features = metricResult(metric)?.features;
+      const parts = [metric.status === "completed" && features?.status === "failed" ? "音频质量已计算" : labels[metric.status] || "状态不可用"];
       if (features?.status === "insufficient") parts.push("素材不足");
       if (features?.status === "failed") parts.push("音色特征计算失败");
       if (metric.stale) parts.push("结果已过期，请重新计算");
@@ -79,10 +98,22 @@
       if (!quality || quality.status !== "ok") {
         block.append(node("span", "muted", `质量数据不可用${quality?.message ? `：${quality.message}` : ""}`));
       } else {
-        block.append(node("span", "", `平均电平：${metricNumber(quality.dbfs, " dBFS")}`),
-          node("span", "", `低能量帧：${metricNumber(quality.low_energy_percent, "%")}`),
-          node("span", "", `接近削波：${metricNumber(quality.clipping_percent, "%")}`),
-          node("span", "muted", `时长：${metricNumber(quality.duration_seconds, " 秒")} · 文件：${metricNumber(quality.file_count)}`));
+        for (const [name, value, unit, min, max] of [
+          ["整体响度", quality.dbfs, " dBFS", -80, 0],
+          ["低能量帧", quality.low_energy_percent, "%", 0, 100],
+          ["接近削波", quality.clipping_percent, "%", 0, 100]
+        ]) {
+          const row = node("div", "metrics-quality-row");
+          row.append(node("span", "", `${name}：${metricNumber(value, unit)}`));
+          if (typeof value === "number" && Number.isFinite(value)) {
+            const meter = node("meter", "metrics-meter");
+            meter.min = min; meter.max = max; meter.value = Math.max(min, Math.min(max, value));
+            meter.setAttribute("aria-hidden", "true");
+            row.append(meter);
+          }
+          block.append(row);
+        }
+        block.append(node("span", "muted", `时长：${metricNumber(quality.duration_seconds, " 秒")} · 文件：${metricNumber(quality.file_count)}`));
         if (typeof quality.message === "string" && quality.message) block.append(node("span", "muted", quality.message));
       }
       return block;
@@ -97,21 +128,43 @@
       return audio;
     }
 
+    function indexChart(features) {
+      const chart = node("div", "index-chart");
+      chart.append(node("strong", "", "训练快照音色指数（0–100）"));
+      for (const [label, value] of [["任务快照原声指数", features.original_index], ["生成音色指数", features.generated_index]]) {
+        const row = node("div", "index-row");
+        row.append(node("span", "", `${label}：${metricNumber(value)}`));
+        if (typeof value === "number" && Number.isFinite(value) && value >= 0 && value <= 100) {
+          const meter = node("meter", "index-meter");
+          meter.min = 0; meter.max = 100; meter.value = value;
+          meter.setAttribute("aria-hidden", "true");
+          row.append(meter);
+        }
+        chart.append(row);
+      }
+      chart.append(node("p", "muted", "原声指数衡量参考片段间的一致性；生成指数衡量生成声音与参考片段的相似度。计算方式不同，不能直接相减。"));
+      return chart;
+    }
+
     function renderMetricResult(container, metric, job) {
       container.replaceChildren();
       const result = metricResult(metric);
       if (!result) return;
       const features = result.features || {}, source = result.source || {}, quality = result.quality || {};
       const details = node("div", "metrics-details");
-      const selectedIndex = job ? features.generated_index : features.original_index;
-      details.append(node("div", "metrics-value", `${job ? "生成音色指数" : "原声音色指数"}：${metricNumber(selectedIndex)}`));
-      if (job) details.append(node("p", "", `任务快照原声指数：${metricNumber(features.original_index)}`));
+      if (job) details.append(indexChart(features));
+      else details.append(node("div", "metrics-value", `原声音色指数：${metricNumber(features.original_index)}`));
+      if (job) details.append(node("p", "", `有效生成试听：${metricNumber(features.generated_count)} / 2`));
       details.append(node("p", "", `参考数量：${metricNumber(features.reference_count)} · 配对数：${metricNumber(features.pair_count)}`));
-      details.append(node("p", "muted", `分析时间：${metricText(result.analyzed_at)} · 素材版本：${metricNumber(source.dataset_version)}`));
-      const kinds = {validation: "验证集", training: "训练集", current: "当前素材"};
-      details.append(node("p", "muted", `参考来源：${kinds[source.reference_kind] || "不可用"} · 素材摘要：${metricText(source.material_digest)}`));
-      details.append(node("p", "muted", `模型：${metricText(features.model)} · 版本：${metricText(features.revision)} · 算法：${metricText(features.algorithm)}`));
-      details.append(node("p", "muted", `比较条件标识：${metricText(result.comparison_key)}`));
+      const kinds = {validation: "独立验证片段", training: "训练素材（没有独立验证片段）", current: "当前素材"};
+      details.append(node("p", "muted", `参考来源：${kinds[source.reference_kind] || "不可用"}`));
+      const provenance = node("details", "metrics-provenance");
+      provenance.append(node("summary", "", "分析详情"),
+        node("p", "muted", `分析时间：${metricText(result.analyzed_at)} · 素材版本：${metricNumber(source.dataset_version)}`),
+        node("p", "muted", `素材摘要：${metricText(source.material_digest)}`),
+        node("p", "muted", `模型：${metricText(features.model)} · 版本：${metricText(features.revision)} · 算法：${metricText(features.algorithm)}`),
+        node("p", "muted", `比较条件标识：${metricText(result.comparison_key)}`));
+      details.append(provenance);
       details.append(node("p", "metrics-subtitle", "试听质量"), qualityBlock(job ? "任务快照原声" : "当前原声", quality.original));
       if (job) details.append(qualityBlock("生成试听", quality.generated));
 
@@ -167,28 +220,34 @@
 
     function historyChart(records, comparable) {
       const points = records.filter(record => record.metrics?.status === "completed" && !record.metrics?.stale &&
-        metricResult(record.metrics)?.features?.status === "completed" &&
+        metricResult(record.metrics)?.features?.status !== "failed" &&
         typeof record.config?.steps === "number" && Number.isFinite(record.config.steps) &&
+        Number.isFinite(Date.parse(record.created_at)) &&
         typeof metricResult(record.metrics)?.features?.generated_index === "number" && Number.isFinite(metricResult(record.metrics).features.generated_index))
-        .map(record => ({steps: record.config.steps, value: metricResult(record.metrics).features.generated_index, id: record.id}))
-        .sort((a, b) => a.steps - b.steps);
-      if (!points.length) return node("p", "muted", "没有可绘制的有效指数；完整状态见下方记录。 ");
-      const chart = svgNode("svg", {viewBox: "0 0 360 155", class: "history-chart", role: "img", "aria-label": "生成音色指数随训练步数变化；具体数值见下方表格"});
-      chart.append(svgNode("title", {}, "生成音色指数与训练步数"), svgNode("desc", {}, "横轴为训练步数，纵轴为生成音色指数。完整数值和训练参数见记录表。"));
+        .map(record => ({steps: record.config.steps, value: metricResult(record.metrics).features.generated_index,
+          id: record.id, created: record.created_at, time: Date.parse(record.created_at)}))
+        .sort((a, b) => a.time - b.time || a.id.localeCompare(b.id));
+      if (!points.length) return node("p", "muted", "没有可绘制的有效指数；完整状态见下方记录。");
+      const chart = svgNode("svg", {viewBox: "0 0 360 155", class: "history-chart", role: "img", "aria-label": "生成音色指数随任务创建时间变化；具体数值和参数见下方表格"});
+      chart.append(svgNode("title", {}, "生成音色指数与训练时间"), svgNode("desc", {}, "横轴为任务创建时间，纵轴为生成音色指数。完整数值和训练参数见记录表。"));
       chart.append(svgNode("line", {x1: 40, y1: 15, x2: 40, y2: 120, class: "chart-axis"}), svgNode("line", {x1: 40, y1: 120, x2: 340, y2: 120, class: "chart-axis"}));
-      const xs = points.map(point => point.steps), ys = points.map(point => point.value);
-      const minX = Math.min(...xs), maxX = Math.max(...xs), minY = Math.min(...ys), maxY = Math.max(...ys);
-      const coords = points.map(point => ({...point, x: maxX === minX ? 190 : 40 + (point.steps - minX) / (maxX - minX) * 300,
-        y: maxY === minY ? 67 : 110 - (point.value - minY) / (maxY - minY) * 85}));
+      chart.append(svgNode("text", {x: 34, y: 19, "text-anchor": "end"}, "100"), svgNode("text", {x: 34, y: 123, "text-anchor": "end"}, "0"));
+      const times = points.map(point => point.time), ys = points.map(point => point.value);
+      const minX = Math.min(...times), maxX = Math.max(...times), minY = Math.min(...ys), maxY = Math.max(...ys);
+      const coords = points.map((point, index) => ({...point,
+        x: maxX === minX ? (points.length === 1 ? 190 : 40 + index / (points.length - 1) * 300) : 40 + (point.time - minX) / (maxX - minX) * 300,
+        y: 120 - Math.max(0, Math.min(100, point.value)) / 100 * 105}));
       if (comparable && coords.length > 1) chart.append(svgNode("polyline", {points: coords.map(point => `${point.x},${point.y}`).join(" "), class: "chart-line"}));
       for (const point of coords) {
         const circle = svgNode("circle", {cx: point.x, cy: point.y, r: 4, class: "chart-point"});
-        circle.append(svgNode("title", {}, `任务 ${point.id}：${point.steps} 步，指数 ${point.value}`));
+        circle.append(svgNode("title", {}, `任务 ${point.id}，创建时间 ${point.created}，${point.steps} 步，指数 ${point.value}`));
         chart.append(circle);
       }
-      chart.append(svgNode("text", {x: 40, y: 139}, `${minX} 步`), svgNode("text", {x: 340, y: 139, "text-anchor": "end"}, `${maxX} 步`));
+      const timeLabel = value => value.slice(0, 16).replace("T", " ");
+      chart.append(svgNode("text", {x: 40, y: 139}, timeLabel(points[0].created)),
+        svgNode("text", {x: 340, y: 139, "text-anchor": "end"}, timeLabel(points[points.length - 1].created)));
       const wrap = node("div");
-      wrap.append(chart, node("p", "muted", `图中生成指数范围：${minY} 至 ${maxY}；具体数值见下表。`));
+      wrap.append(chart, node("p", "muted", `图中生成指数范围：${minY} 至 ${maxY}；步数、时间和参数见下表。`));
       return wrap;
     }
 
@@ -272,18 +331,21 @@
       }
       const originalResult = metricResult(original), trainedResult = metricResult(trained);
       const conditions = $("comparison-conditions");
-      conditions.hidden = !(original?.status === "completed" && trained?.status === "completed" && originalResult && trainedResult);
-      if (!conditions.hidden) {
+      const hideConditions = !(original?.status === "completed" && trained?.status === "completed" && originalResult && trainedResult);
+      if (conditions.hidden !== hideConditions) conditions.hidden = hideConditions;
+      if (!hideConditions) {
         const a = originalResult.source || {}, b = trainedResult.source || {};
         const aKey = originalResult.comparison_key, bKey = trainedResult.comparison_key;
-        if (original.stale || trained.stale) conditions.textContent = "分析结果已过期，不能直接比较；请先重新计算。";
-        else if (a.dataset_version != null && b.dataset_version != null && a.dataset_version !== b.dataset_version ||
-          a.material_digest && b.material_digest && a.material_digest !== b.material_digest ||
-          typeof aKey === "string" && aKey && typeof bKey === "string" && bKey && aKey !== bKey) {
-          conditions.textContent = "当前原声与任务快照的素材或分析条件不同，不能直接比较。";
+        let message;
+        if (original.stale || trained.stale) message = "分析结果已过期，不能直接比较；请先重新计算。";
+        else if ((a.dataset_version != null && b.dataset_version != null && a.dataset_version !== b.dataset_version) ||
+          (a.material_digest && b.material_digest && a.material_digest !== b.material_digest) ||
+          (typeof aKey === "string" && aKey && typeof bKey === "string" && bKey && aKey !== bKey)) {
+          message = "当前原声与任务快照的素材或分析条件不同，不能直接比较。";
         } else if (typeof aKey !== "string" || !aKey || typeof bKey !== "string" || !bKey || a.dataset_version == null || b.dataset_version == null || !a.material_digest || !b.material_digest) {
-          conditions.textContent = "素材或分析条件信息不完整，无法确认是否可以直接比较。";
-        } else conditions.textContent = "素材版本和比较条件标识一致；仍请逐条试听发音、情绪和自然度。";
+          message = "素材或分析条件信息不完整，无法确认是否可以直接比较。";
+        } else message = "素材版本和比较条件标识一致；仍请逐条试听发音、情绪和自然度。";
+        if (conditions.textContent !== message) conditions.textContent = message;
       }
       const historySignature = JSON.stringify([selected, state.connected, history, signature(historyKey), [...metricPosting], [...metricErrors]]);
       if (historySignature !== comparisonSignatures.history) {
@@ -400,19 +462,44 @@
     }
 
     function renderPreview(item, preview) {
-      const signature = item ? `${item.id}:${JSON.stringify(preview?.texts || [])}:${Boolean(preview?.confirmed)}` : "";
+      const isAb = (preview?.ab || 0) >= 2;
+      const signature = item ? `${item.id}:${JSON.stringify(preview?.texts || [])}:${Boolean(preview?.confirmed)}:${isAb}` : "";
       if (signature !== previewSignature) {
         previewSignature = signature;
         const samples = $("preview-samples");
         samples.replaceChildren();
+        const players = [];
         for (const [index, text] of (preview?.texts || []).entries()) {
           const sample = node("div", "preview-sample");
-          const audio = node("audio");
-          audio.controls = true;
-          audio.preload = "none";
-          audio.src = `${path("jobs", item.id)}/preview/${index + 1}`;
-          audio.setAttribute("aria-label", `试听验收样本 ${index + 1}`);
-          sample.append(audio, node("p", "", text));
+          if (isAb) {
+            sample.append(node("p", "preview-label", `验收 ${index + 1} · 同文本同参考`));
+            for (const variant of ["base", "trained"]) {
+              const row = node("div", "preview-variant");
+              const name = variant === "base" ? "基座" : "训练后";
+              const metrics = preview.preview_metrics?.[variant]?.[String(index + 1).padStart(2, "0")];
+              const detail = metrics ? ` · RTF ${metricNumber(metrics.rtf)} · ${metricNumber(metrics.duration, " 秒")}` : "";
+              row.append(node("strong", "", name + detail));
+              const audio = node("audio");
+              audio.controls = true;
+              audio.preload = "none";
+              audio.src = `${path("jobs", item.id)}/preview/${index + 1}?variant=${variant}`;
+              audio.setAttribute("aria-label", `${name}试听 ${index + 1}`);
+              audio.addEventListener("play", () => players.forEach(other => { if (other !== audio) other.pause(); }));
+              players.push(audio);
+              row.append(audio);
+              sample.append(row);
+            }
+          } else {
+            const audio = node("audio");
+            audio.controls = true;
+            audio.preload = "none";
+            audio.src = `${path("jobs", item.id)}/preview/${index + 1}`;
+            audio.setAttribute("aria-label", `试听验收样本 ${index + 1}`);
+            audio.addEventListener("play", () => players.forEach(other => { if (other !== audio) other.pause(); }));
+            players.push(audio);
+            sample.append(audio);
+          }
+          sample.append(node("p", "", text));
           samples.append(sample);
         }
         if (!preview?.confirmed) {
@@ -436,21 +523,26 @@
       const item = currentJob();
       const preview = item?.kind === "train" ? item.preview : null;
       const signature = JSON.stringify(state.jobs.map(job => [job.id, job.status, job.dataset_id, job.preview?.confirmed]));
+      const selects = [$("job-select"), $("comparison-job-select")];
       if (jobsSignature !== signature) {
         jobsSignature = signature;
-        $("job-select").replaceChildren();
-        if (!state.jobs.length) $("job-select").append(node("option", "", "暂无任务"));
-        for (const job of state.jobs) {
-          const name = state.datasets.find(entry => entry.id === job.dataset_id)?.name || "素材集";
-          const label = job.kind === "train" && job.status === "completed"
-            ? (job.preview?.confirmed ? "训练完成，已确认试听" : STATUS[job.status]) : STATUS[job.status] || job.status;
-          const option = node("option", "", `${name} / ${job.kind === "train" ? "训练" : "处理"} / ${label} / ${job.id.slice(0, 8)}`);
-          option.value = job.id;
-          $("job-select").append(option);
+        for (const select of selects) {
+          select.replaceChildren();
+          if (!state.jobs.length) select.append(node("option", "", "暂无任务"));
+          for (const job of state.jobs) {
+            const name = state.datasets.find(entry => entry.id === job.dataset_id)?.name || "素材集";
+            const label = job.kind === "train" && job.status === "completed"
+              ? (job.preview?.confirmed ? "训练完成，已确认试听" : STATUS[job.status]) : STATUS[job.status] || job.status;
+            const option = node("option", "", `${name} / ${job.kind === "train" ? "训练" : "处理"} / ${label} / ${job.id.slice(0, 8)}`);
+            option.value = job.id;
+            select.append(option);
+          }
         }
       }
-      $("job-select").value = state.jobId;
-      $("job-select").disabled = Boolean(state.busy || !state.jobs.length);
+      for (const select of selects) {
+        select.value = state.jobId;
+        select.disabled = Boolean(state.busy || !state.jobs.length);
+      }
       $("job-detail").hidden = !item;
       $("job-empty").hidden = Boolean(item);
       $("preview-section").hidden = !(item?.kind === "train" && item.status === "completed");
@@ -458,6 +550,8 @@
       $("cancel-job").hidden = !item || !ACTIVE.has(item.status);
       $("retry-job").hidden = !item || !["failed", "cancelled"].includes(item.status);
       $("restart-job").hidden = !item || !["failed", "cancelled"].includes(item.status) || !item.checkpoint || item.kind !== "train";
+      $("variant-job").hidden = !(item?.kind === "train" && item.status === "completed");
+      $("variant-note").hidden = !(item?.kind === "train" && item.status === "completed");
       $("cancel-note").hidden = !item || !ACTIVE.has(item.status);
       if (item) {
         $("job-status").textContent = item.status === "completed" && preview?.confirmed ? "训练完成，已确认试听" : STATUS[item.status] || item.status;
@@ -489,6 +583,7 @@
         $("retry-job").textContent = item.kind === "train" && item.checkpoint ? "从检查点恢复" : "重新尝试";
         $("cancel-job").disabled = Boolean(state.busy || item.status === "cancelling" || !state.connected);
         $("retry-job").disabled = $("restart-job").disabled = Boolean(state.busy || state.capabilities?.active_job || !state.connected);
+        $("variant-job").disabled = Boolean(state.busy || state.capabilities?.active_job || !state.connected);
         $("publish").disabled = Boolean(state.busy || state.capabilities?.active_job || !state.connected);
         if ($("voice-name").dataset.job !== item.id) {
           $("voice-name").dataset.job = item.id;
@@ -504,6 +599,8 @@
       if (published) {
         $("published-name").textContent = published.name;
         $("published-id").value = published.id;
+        const link = $("start-realtime");
+        if (link) link.href = `/realtime/?voice_id=${encodeURIComponent(published.id)}`;
       }
     }
 
@@ -511,7 +608,9 @@
       renderLibrary();
       const item = dataset(), cap = state.capabilities;
       $("welcome").hidden = Boolean(item);
-      $("dataset-workspace").hidden = !item;
+      $("workspace-heading").hidden = !item;
+      $("import-content").hidden = !item;
+      renderView();
       $("connection-dot").className = `dot ${!state.connected ? "failed" : cap?.available ? "ready" : ""}`;
       $("connection").textContent = state.busy || (!state.connected ? "未连接本机服务" : cap?.active_job ? `本机任务：${STATUS[activeJob()?.status] || "正在执行"}` : cap?.available ? "本机模型就绪" : "模型加载中、忙碌或不可用");
       $("refresh").disabled = Boolean(state.busy);
@@ -722,7 +821,7 @@
           $("upload-status").textContent = `正在上传第 ${index + 1} / ${list.length} 个文件：${file.name}`;
           const entry = {name: file.name, failed: false, message: "已上传"};
           try {
-            if (!/\.(mp3|mp4)$/i.test(file.name)) throw new Error("仅支持 MP3 / MP4");
+            if (!/\.(mp3|mp4|wav)$/i.test(file.name)) throw new Error("仅支持 MP3 / MP4 / WAV");
             if (file.size > 200 * 1024 ** 2) throw new Error("超过 200 MiB");
             if (!file.size) throw new Error("空文件");
             const body = new win.FormData();
@@ -772,6 +871,33 @@
       });
     }
 
+    function variantKey(jobId, steps) {
+      const fingerprint = JSON.stringify([jobId, steps]);
+      let previous;
+      try { previous = JSON.parse(storageGet(win.sessionStorage, "voice-variant-request")); } catch { previous = null; }
+      if (previous?.fingerprint === fingerprint && previous.key) return previous.key;
+      const key = win.crypto.randomUUID();
+      storageSet(win.sessionStorage, "voice-variant-request", JSON.stringify({fingerprint, key}));
+      return key;
+    }
+
+    async function createVariant() {
+      const job = currentJob();
+      if (!job || job.kind !== "train" || job.status !== "completed" || state.busy) return;
+      const raw = win.prompt("对照训练的目标步数（1–1000），原快照与其余参数保持不变：", String(job.config?.steps || 20));
+      if (raw === null) return;
+      const steps = Number(raw);
+      if (!Number.isInteger(steps) || steps < 1 || steps > 1000) { notice("步数必须是 1 到 1000 的整数。", true); return; }
+      if (!win.confirm("对照训练会复制原任务的数据快照与参数，仅改步数，从同一基座重新训练。确定继续吗？")) return;
+      await perform("正在提交对照训练", async () => {
+        const created = await api(`${path("jobs", job.id)}/variants`, json("POST", {steps}, {"Idempotency-Key": variantKey(job.id, steps)}));
+        storageRemove(win.sessionStorage, "voice-variant-request");
+        state.jobs.unshift(created);
+        state.jobId = created.id;
+        notice("对照训练已提交。它与原任务使用同一不可变快照，只改变步数。");
+      });
+    }
+
     async function jobAction(action, resume = true) {
       const job = currentJob();
       if (!job || state.busy) return;
@@ -815,6 +941,19 @@
     }
 
     function start() {
+      for (const view of views) {
+        const tab = $(`tab-${view}`);
+        tab.addEventListener("click", () => setView(view));
+        tab.addEventListener("keydown", event => {
+          if (!["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+          event.preventDefault();
+          const available = views.filter(name => !$(`tab-${name}`).disabled);
+          const index = available.indexOf(view);
+          const next = event.key === "Home" ? 0 : event.key === "End" ? available.length - 1 :
+            (index + (event.key === "ArrowRight" ? 1 : -1) + available.length) % available.length;
+          setView(available[next], true);
+        });
+      }
       $("new-dataset").addEventListener("click", openCreate);
       $("welcome-create").addEventListener("click", openCreate);
       $("close-create").addEventListener("click", () => $("create-dialog").close());
@@ -833,6 +972,7 @@
           const created = await api("/api/training/datasets", json("POST", {name, speaker_confirmed: false}));
           state.datasets.unshift(created);
           state.selected = created.id;
+          state.view = "import";
           state.jobId = "";
           state.offset = 0;
           state.segments = [];
@@ -857,6 +997,7 @@
           const job = await api(`${path("datasets", selected)}/prepare`, {method: "POST"});
           state.jobs.unshift(job);
           state.jobId = job.id;
+          state.view = "training";
           notice("素材处理已开始。转写完成后，请逐片试听和审核。");
         });
       });
@@ -882,7 +1023,9 @@
         const config = Object.fromEntries(Array.from(new win.FormData($("train-form")), ([key, value]) => [key, Number(value)]));
         train(config);
       });
-      $("job-select").addEventListener("change", event => { state.jobId = event.target.value; renderJob(); renderComparison(); void refreshMetrics(); });
+      for (const id of ["job-select", "comparison-job-select"]) {
+        $(id).addEventListener("change", event => { state.jobId = event.target.value; renderJob(); renderComparison(); void refreshMetrics(); });
+      }
       $("dataset-metrics-action").addEventListener("click", () => postMetric("dataset", state.selected, state.selected));
       $("job-metrics-action").addEventListener("click", () => {
         const job = currentJob();
@@ -891,6 +1034,7 @@
       $("cancel-job").addEventListener("click", () => jobAction("cancel"));
       $("retry-job").addEventListener("click", () => jobAction("retry", true));
       $("restart-job").addEventListener("click", () => jobAction("retry", false));
+      $("variant-job").addEventListener("click", createVariant);
       $("preview-check").addEventListener("change", renderJob);
       $("confirm-preview").addEventListener("click", () => confirmPreview());
       $("publish-form").addEventListener("submit", event => {
@@ -914,7 +1058,7 @@
     }
 
     function dispose() { disposed = true; win.clearTimeout(pollTimer); }
-    return {state, start, dispose, refresh, refreshMetrics, selectDataset, loadSegments, uploadFiles, saveSegment, train, jobAction, confirmPreview, publish, canTrain};
+    return {state, start, dispose, refresh, refreshMetrics, selectDataset, loadSegments, uploadFiles, saveSegment, train, createVariant, jobAction, confirmPreview, publish, canTrain};
   }
 
   if (typeof module !== "undefined" && module.exports) module.exports = {createWorkbench, formatDuration, errorMessage};

@@ -16,12 +16,12 @@ SCHEMAS = {
     "training_datasets": "id TEXT PRIMARY KEY, name TEXT NOT NULL, version INTEGER NOT NULL DEFAULT 1, status TEXT NOT NULL DEFAULT 'new', approved_duration REAL NOT NULL DEFAULT 0, speaker_confirmed INTEGER NOT NULL DEFAULT 0",
     "training_sources": "id TEXT PRIMARY KEY, dataset_id TEXT NOT NULL REFERENCES training_datasets(id), extension TEXT NOT NULL, size INTEGER NOT NULL, duration REAL NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'uploaded', metadata TEXT NOT NULL DEFAULT '{}'",
     "training_segments": "id TEXT PRIMARY KEY, dataset_id TEXT NOT NULL REFERENCES training_datasets(id), source_id TEXT NOT NULL REFERENCES training_sources(id), start REAL NOT NULL, end REAL NOT NULL, audio_id TEXT NOT NULL, transcript TEXT NOT NULL DEFAULT '', review_status TEXT NOT NULL DEFAULT 'pending', quality_hints TEXT NOT NULL DEFAULT '[]'",
-    "training_jobs": "id TEXT PRIMARY KEY, dataset_id TEXT NOT NULL REFERENCES training_datasets(id), kind TEXT NOT NULL CHECK(kind IN ('prepare','train')), snapshot TEXT, digest TEXT, config TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'queued', attempt INTEGER NOT NULL DEFAULT 1, stage TEXT NOT NULL DEFAULT 'queued', segments_done INTEGER NOT NULL DEFAULT 0, segments_total INTEGER NOT NULL DEFAULT 0, steps_done INTEGER NOT NULL DEFAULT 0, steps_total INTEGER NOT NULL DEFAULT 0, checkpoint TEXT, error_code TEXT, request_key TEXT, created_at TEXT NOT NULL, UNIQUE(dataset_id, request_key)",
+    "training_jobs": "id TEXT PRIMARY KEY, dataset_id TEXT NOT NULL REFERENCES training_datasets(id), kind TEXT NOT NULL CHECK(kind IN ('prepare','train')), snapshot TEXT, digest TEXT, config TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'queued', attempt INTEGER NOT NULL DEFAULT 1, stage TEXT NOT NULL DEFAULT 'queued', segments_done INTEGER NOT NULL DEFAULT 0, segments_total INTEGER NOT NULL DEFAULT 0, steps_done INTEGER NOT NULL DEFAULT 0, steps_total INTEGER NOT NULL DEFAULT 0, checkpoint TEXT, error_code TEXT, request_key TEXT, parent_job_id TEXT, created_at TEXT NOT NULL, UNIQUE(dataset_id, request_key)",
     "voice_models": "id TEXT PRIMARY KEY, job_id TEXT NOT NULL REFERENCES training_jobs(id), base_model TEXT NOT NULL, config TEXT NOT NULL, reference_segment_id TEXT NOT NULL REFERENCES training_segments(id), created_at TEXT NOT NULL",
 }
 JSON_FIELDS = {"metadata", "quality_hints", "snapshot", "config"}
 FIELDS = {table: {part.strip().split()[0] for part in schema.split(', ') if not part.startswith('UNIQUE')} for table, schema in SCHEMAS.items()}
-IMMUTABLE = {"id", "dataset_id", "source_id", "audio_id", "snapshot", "digest", "config", "request_key", "created_at", "kind", "job_id"}
+IMMUTABLE = {"id", "dataset_id", "source_id", "audio_id", "snapshot", "digest", "config", "request_key", "created_at", "kind", "job_id", "parent_job_id"}
 
 
 def canonical(value):
@@ -65,7 +65,10 @@ class TrainingStore:
         with closing(self.chat.connect()) as db:
             tables = {row[0] for row in db.execute("SELECT name FROM sqlite_master WHERE type='table'")}
             columns = {row[1] for row in db.execute('PRAGMA table_info(voices)')}
-            migration = not set(SCHEMAS).issubset(tables) or 'model_id' not in columns
+            job_columns = ({row[1] for row in db.execute('PRAGMA table_info(training_jobs)')}
+                           if 'training_jobs' in tables else set())
+            migration = (not set(SCHEMAS).issubset(tables) or 'model_id' not in columns
+                         or ('training_jobs' in tables and 'parent_job_id' not in job_columns))
             if migration:
                 with closing(sqlite3.connect(self.directory / f'before-training-{uuid4()}.sqlite3')) as backup:
                     db.backup(backup)
@@ -75,6 +78,8 @@ class TrainingStore:
                     db.execute(f'CREATE TABLE IF NOT EXISTS {table} ({schema})')
                 if 'model_id' not in columns:
                     db.execute('ALTER TABLE voices ADD COLUMN model_id TEXT REFERENCES voice_models(id)')
+                if 'training_jobs' in tables and 'parent_job_id' not in job_columns:
+                    db.execute('ALTER TABLE training_jobs ADD COLUMN parent_job_id TEXT')
                 db.execute("UPDATE training_jobs SET status='failed', stage='interrupted', error_code='interrupted' WHERE status IN ('queued','preparing','transcribing','training','validating','cancelling')")
                 db.commit()
             except Exception:
@@ -166,7 +171,7 @@ class TrainingStore:
     def add_source(self, dataset_id, source_id, extension, size, metadata):
         self._id(source_id)
         extension = extension.lower().lstrip('.')
-        if extension not in {'mp3', 'mp4'} or not isinstance(size, int) or size < 0:
+        if extension not in {'mp3', 'mp4', 'wav'} or not isinstance(size, int) or size < 0:
             raise HTTPException(422, '素材格式或大小无效。')
         metadata = dict(metadata or {})
         metadata.setdefault('audio', 0)
@@ -264,4 +269,33 @@ class TrainingStore:
                 digest = hashlib.sha256(canonical(snapshot).encode()).hexdigest()
             value = str(uuid4())
             db.execute('INSERT INTO training_jobs(id,dataset_id,kind,snapshot,digest,config,request_key,created_at,segments_total) VALUES(?,?,?,?,?,?,?,?,?)', (value, dataset_id, kind, canonical(snapshot) if snapshot is not None else None, digest, encoded_config, request_key, datetime.now(timezone.utc).isoformat(), len(snapshot['segments']) if snapshot else 0))
+            return self._one(db, 'training_jobs', value)
+
+    def create_variant_job(self, parent_id, steps, request_key=None):
+        from voice_app import identifier
+        parent_id = identifier(parent_id)
+        if not isinstance(steps, int) or isinstance(steps, bool) or not 1 <= steps <= 1000:
+            raise HTTPException(422, '训练步数无效。')
+        if request_key is not None:
+            request_key = identifier(request_key)
+        with closing(self.chat.connect()) as db, db:
+            db.execute('BEGIN IMMEDIATE')
+            parent = self._one(db, 'training_jobs', parent_id)
+            if parent['kind'] != 'train' or not parent.get('snapshot') or not parent.get('digest'):
+                raise HTTPException(422, '只能从已完成数据快照的训练任务创建对照实验。')
+            config = dict(parent['config'])
+            config['steps'] = steps
+            encoded = canonical(config)
+            if request_key is not None:
+                old = db.execute('SELECT * FROM training_jobs WHERE dataset_id=? AND request_key=?', (parent['dataset_id'], request_key)).fetchone()
+                if old:
+                    old = self._decode(old)
+                    if (old.get('parent_job_id') != parent_id or canonical(old['config']) != encoded
+                            or old['snapshot'] != parent['snapshot'] or old['digest'] != parent['digest']):
+                        raise HTTPException(409, '幂等键已用于其他对照配置。')
+                    return old
+            value = str(uuid4())
+            db.execute('INSERT INTO training_jobs(id,dataset_id,kind,snapshot,digest,config,request_key,parent_job_id,created_at,segments_total) VALUES(?,?,?,?,?,?,?,?,?,?)',
+                       (value, parent['dataset_id'], 'train', canonical(parent['snapshot']), parent['digest'], encoded,
+                        request_key, parent_id, datetime.now(timezone.utc).isoformat(), len(parent['snapshot'].get('segments', []))))
             return self._one(db, 'training_jobs', value)

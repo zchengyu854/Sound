@@ -62,6 +62,11 @@ class TrainingConfig(BaseModel):
         return self.model_dump()
 
 
+class VariantInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    steps: int = Field(ge=1, le=1000)
+
+
 class RetryInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
     resume: bool = True
@@ -288,7 +293,7 @@ class TrainingService:
         material = [{"id": entry["id"], "sha256": entry["sha256"], "transcript": entry["transcript"]}
                     for entry in entries]
         source = {"dataset_version": version, "material_digest": hashlib.sha256(canonical(material).encode()).hexdigest(),
-                  "material": material, "reference_kind": reference_kind, "reference_ids": [],
+                  "reference_kind": reference_kind, "reference_ids": [],
                   "preview_texts": texts, "preview_audio_sha256": evidence["preview_audio_sha256"] if evidence else {}}
         return entries, references, previews, source
 
@@ -322,8 +327,10 @@ class TrainingService:
         import gc
         import mlx.core as mx
         from voice_metrics import compute_speaker_similarity
+        released = False
         try:
             self.check(self.metrics_cancel)
+            released = True
             self.chat.engine.close()
             self.chat.transcriber.close()
             for name in ("model", "engine"):
@@ -338,22 +345,22 @@ class TrainingService:
             model.close()
             gc.collect()
             mx.clear_cache()
-            try:
-                self.chat.engine.load()
-                self.chat.model_status, self.chat.model_error = "ready", None
-            except BaseException:
-                self.chat.model_status = "failed"
-                self.chat.model_error = "音色分析后推理模型恢复失败，请重启应用。"
-            try:
-                self.chat.transcriber.load()
-                self.chat.stt_status, self.chat.stt_error = "ready", None
-            except BaseException:
-                self.chat.stt_status = "failed"
-                self.chat.stt_error = "音色分析后识别模型恢复失败，请重启应用。"
-
+            if released:
+                try:
+                    self.chat.engine.load()
+                    self.chat.model_status, self.chat.model_error = "ready", None
+                except BaseException:
+                    self.chat.model_status = "failed"
+                    self.chat.model_error = "音色分析后推理模型恢复失败，请重启应用。"
+                try:
+                    self.chat.transcriber.load()
+                    self.chat.stt_status, self.chat.stt_error = "ready", None
+                except BaseException:
+                    self.chat.stt_status = "failed"
+                    self.chat.stt_error = "音色分析后识别模型恢复失败，请重启应用。"
     def run_metrics(self, kind, value, path):
-        from voice_metrics import (SPEAKER_MODEL_ID, MIN_REFERENCE_SECONDS, SpeakerEmbeddingModel,
-                                   compute_dataset_metrics)
+        from voice_metrics import (SPEAKER_MODEL_ID, MIN_REFERENCE_SECONDS, MAX_REFERENCES,
+                                   SpeakerEmbeddingModel, compute_dataset_metrics)
         result = None
         try:
             self.check(self.metrics_cancel)
@@ -365,10 +372,10 @@ class TrainingService:
                       "quality": {"original": self.quality_view(original),
                                   "generated": self.quality_view(generated) if generated else None,
                                   "previews": per_preview},
-                      "features": {"status": "insufficient", "model": SPEAKER_MODEL_ID,
+                      "features": {"status": "pending", "model": SPEAKER_MODEL_ID,
                                    "revision": None, "algorithm": "speaker-cosine-v1",
                                    "reference_count": 0, "pair_count": 0, "original_index": None,
-                                   "generated_index": None, "previews": [], "message": "素材不足。"},
+                                   "generated_index": None, "previews": [], "message": ""},
                       "comparison_key": None}
             self.write_metrics(path, {"status": "running", "message": "音频质量已计算，正在分析音色。", "result": result})
             self.check(self.metrics_cancel)
@@ -376,6 +383,7 @@ class TrainingService:
             eligible = [entry for entry in references if
                         file_quality[str(entry["path"])]["status"] == "ok" and
                         file_quality[str(entry["path"])]["duration_seconds"] >= MIN_REFERENCE_SECONDS]
+            eligible = sorted(eligible, key=lambda entry: str(entry["path"]))[:MAX_REFERENCES]
             if eligible:
                 model = SpeakerEmbeddingModel()
                 try:
@@ -384,7 +392,7 @@ class TrainingService:
                     with self.model_slot(value, self.metrics_cancel):
                         scores = self.chat.worker.submit(
                             self.metrics_features_on_worker, model,
-                            [entry["path"] for entry in references], previews).result()
+                            [entry["path"] for entry in eligible], previews).result()
                     self.check(self.metrics_cancel)
                     consistency = scores["reference_consistency"]
                     aggregate = scores["generated_aggregate"]
@@ -406,6 +414,8 @@ class TrainingService:
                                      for index, item in enumerate(scores["generated"], 1)]})
                     if scores.get("model_error"):
                         feature.update(status="failed", message="音色模型加载失败，请检查模型缓存后重试。")
+                    elif count == 0:
+                        feature.update(status="failed", message="参考片段特征提取失败，请检查音频后重试。")
                     elif previews and aggregate["sample_count"] != 2:
                         feature["message"] = (feature["message"] + " 两条试听未能全部提取特征，请检查音频并重试。 ").strip()
                     if feature["revision"] and feature["generated_index"] is not None:
@@ -422,6 +432,8 @@ class TrainingService:
                     result["features"].update(status="failed", message="音色模型下载或加载失败，请检查网络与本机缓存后重试。")
                 finally:
                     model.close()
+            else:
+                result["features"].update(status="insufficient", message="没有足够长且非静音的参考片段。")
             self.verify_metrics_inputs(kind, value, entries)
             self.write_metrics(path, {"status": "completed", "message": "音频分析完成。", "result": result})
         except Cancelled:
@@ -454,9 +466,9 @@ class TrainingService:
         from voice_app import identifier
         identifier(dataset_id)
         extension = Path(upload.filename or "").suffix.lower().lstrip(".")
-        if extension not in ("mp3", "mp4"):
+        if extension not in ("mp3", "mp4", "wav"):
             await upload.close()
-            raise HTTPException(422, "仅支持 MP3、MP4 素材。")
+            raise HTTPException(422, "仅支持 MP3、MP4、WAV 素材。")
         source_id = str(uuid4())
         folder = self.store.dataset_dir(dataset_id) / "sources"
         folder.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -513,6 +525,22 @@ class TrainingService:
                     self.store.rows("training_sources", "dataset_id=?", (dataset_id,))):
                 raise HTTPException(409, "请先完成所有素材处理并审核，再启动训练。")
             job = self.store.create_job(dataset_id, kind, config or {}, request_key)
+            self._dispatch(job)
+            return job
+
+    def submit_variant(self, value, steps, request_key=None):
+        with self.lock, self.chat.admission:
+            if self.stopping or not self.chat.accepting_tasks:
+                raise HTTPException(503, "应用正在停止。")
+            if request_key:
+                from voice_app import identifier
+                identifier(request_key)
+            if self.control or self.uploading:
+                raise HTTPException(409, "已有训练或素材处理任务，请等待或取消。")
+            parent = self.store.one("training_jobs", value)
+            self._require_completed_train(parent)
+            self.verify_snapshot(parent)
+            job = self.store.create_variant_job(value, steps, request_key)
             self._dispatch(job)
             return job
 
@@ -732,11 +760,15 @@ class TrainingService:
         temporary.write_text(canonical(validation) + "\n")
         os.replace(temporary, path)
 
-    def preview_file(self, job, index):
-        if index not in (1, 2):
-            raise HTTPException(422, "试听样本编号必须是 1 或 2。")
+    def preview_file(self, job, index, variant="trained"):
+        if index not in (1, 2) or variant not in ("trained", "base"):
+            raise HTTPException(422, "试听样本编号或变体无效。")
         directory = self.job_directory(job)
-        path = (directory / f"validation-{index:02d}.wav").resolve()
+        if variant == "base":
+            if not (directory / f"validation-base-{index:02d}.wav").is_file():
+                raise HTTPException(404, "基座对照试听不可用。")
+        name = "validation" if variant == "trained" else "validation-base"
+        path = (directory / f"{name}-{index:02d}.wav").resolve()
         if path.parent != directory.resolve() or not path.is_file():
             raise HTTPException(404, "试听样本不可用。")
         return path
@@ -760,9 +792,27 @@ class TrainingService:
             if audio_hashes.get(key) != hashlib.sha256(path.read_bytes()).hexdigest():
                 raise HTTPException(409, "试听音频与记录不一致。")
             checked[key] = audio_hashes[key]
-        return {"adapter_sha256": adapter_hash,
-                "preview_texts_sha256": validation["preview_texts_sha256"],
-                "preview_audio_sha256": checked}
+        evidence = {"adapter_sha256": adapter_hash,
+                    "preview_texts_sha256": validation["preview_texts_sha256"],
+                    "preview_audio_sha256": checked}
+        if validation.get("ab", 0) >= 2:
+            base_hashes = validation.get("base_preview_audio_sha256")
+            if (not isinstance(base_hashes, dict)
+                    or validation.get("base_preview_texts_sha256") != validation["preview_texts_sha256"]
+                    or not isinstance(validation.get("inference_config"), dict)
+                    or validation.get("snapshot_digest") != job.get("digest")
+                    or not validation.get("reference_digest")):
+                raise HTTPException(409, "A/B 验收记录不完整。")
+            base_checked = {}
+            for index in (1, 2):
+                key = f"{index:02d}"
+                path = self.preview_file(job, index, variant="base")
+                if base_hashes.get(key) != hashlib.sha256(path.read_bytes()).hexdigest():
+                    raise HTTPException(409, "基座对照音频与记录不一致。")
+                base_checked[key] = base_hashes[key]
+            evidence["base_preview_audio_sha256"] = base_checked
+            evidence["inference_config_sha256"] = hashlib.sha256(canonical(validation["inference_config"]).encode()).hexdigest()
+        return evidence
 
     def validation_view(self, job):
         validation = self._read_validation(job)
@@ -774,7 +824,10 @@ class TrainingService:
                 "note": confirmation.get("note", ""),
                 "confirmed_at": confirmation.get("confirmed_at"),
                 "summary": validation.get("training_summary"),
-                "validation_losses": validation.get("validation_losses")}
+                "validation_losses": validation.get("validation_losses"),
+                "ab": validation.get("ab", 0),
+                "preview_metrics": validation.get("preview_metrics"),
+                "train_losses": validation.get("train_losses")}
 
     def validate_checkpoint(self, job):
         try:
@@ -885,6 +938,7 @@ class TrainingService:
 
             gradient_fn = nn.value_and_grad(model, teacher_forcing_loss)
             self.stage(value, "training", steps_done=step)
+            loss_log = []
             while step < config["steps"]:
                 self.check(cancel)
                 accumulated = None
@@ -893,6 +947,8 @@ class TrainingService:
                     prompt, codes = example(training[index])
                     loss, gradients = gradient_fn(model, prompt, codes)
                     mx.eval(loss, gradients)
+                    if len(loss_log) < 200:
+                        loss_log.append(round(loss.item(), 6))
                     if not math.isfinite(loss.item()) or not all(bool(mx.all(mx.isfinite(g)).item()) for _, g in tree_flatten(gradients)):
                         raise ValueError("nonfinite_gradient")
                     scaled = tree_map(lambda g: g / config["accumulation_steps"], gradients)
@@ -922,17 +978,38 @@ class TrainingService:
             gradient_fn = optimizer = model = None
             gc.collect()
             mx.clear_cache()
+            # Versioned A/B evidence: same text, same reference, same inference
+            # config and reset seed; base and trained audio generated in order
+            # so only one model is resident at a time.
+            inference_config = {"max_tokens": 120, "seed": config["seed"]}
+            reference = snapshot["segments"][0]
+            model = load_model(self.base_model)
+            attach_lora(model, config["rank"])
+            mx.random.seed(config["seed"])
+            base_preview = self.validate_audio(model, job, cancel, variant="base")
+            model = None
+            gc.collect()
+            mx.clear_cache()
             model = load_model(self.base_model)
             attach_lora(model, config["rank"])
             load_adapter(model, root / "adapter.safetensors")
-            preview = self.validate_audio(model, job, cancel)
-            self._write_validation(job, {"adapter_loaded": True,
-                "validation_losses": validation_losses, "base_model": self.base_model,
+            mx.random.seed(config["seed"])
+            preview = self.validate_audio(model, job, cancel, variant="trained")
+            reference_digest = hashlib.sha256(canonical({"id": reference["id"],
+                "transcript": reference["transcript"], "audio_sha256": reference.get("audio_sha256", "")}).encode()).hexdigest()
+            self._write_validation(job, {"ab": 2, "adapter_loaded": True,
+                "validation_losses": validation_losses, "train_losses": loss_log,
+                "base_model": self.base_model,
                 "adapter_sha256": hashlib.sha256((root / "adapter.safetensors").read_bytes()).hexdigest(),
                 "warning": snapshot.get("validation_warning"), "base_digest": base_digest,
+                "snapshot_digest": job["digest"], "reference_digest": reference_digest,
+                "inference_config": inference_config,
                 "preview_texts": preview["texts"],
                 "preview_texts_sha256": preview["texts_sha256"],
                 "preview_audio_sha256": preview["audio_sha256"],
+                "preview_metrics": {"base": base_preview["metrics"], "trained": preview["metrics"]},
+                "base_preview_texts_sha256": base_preview["texts_sha256"],
+                "base_preview_audio_sha256": base_preview["audio_sha256"],
                 "training_summary": training_summary(job)})
             self.check(cancel)
             self.stage(value, "completed")
@@ -963,19 +1040,23 @@ class TrainingService:
             if not expected or hashlib.sha256(path.read_bytes()).hexdigest() != expected:
                 raise HTTPException(409, "训练音频快照已改变或不可用。")
 
-    def validate_audio(self, model, job, cancel):
+    def validate_audio(self, model, job, cancel, variant="trained"):
+        import time
         import numpy as np
         from breezetts2_mac_fast import pcm16_bytes
         from contextlib import closing
+        if variant not in ("trained", "base"):
+            raise HTTPException(422, "试听变体无效。")
         texts = select_preview_texts(job["snapshot"])
         reference = job["snapshot"]["segments"][0]
         reference_audio = str(self.store.segment_path(reference))
         root = self.job_directory(job)
-        audio_hashes = {}
+        prefix = "validation" if variant == "trained" else "validation-base"
+        audio_hashes, metrics = {}, {}
         for index, text in enumerate(texts, 1):
             self.check(cancel)
-            target = root / f"validation-{index:02d}.wav"
-            samples = 0
+            target = root / f"{prefix}-{index:02d}.wav"
+            samples, first_ms, started = 0, None, time.monotonic()
             with wave.open(str(target), "wb") as wav:
                 wav.setnchannels(1)
                 wav.setsampwidth(2)
@@ -984,6 +1065,8 @@ class TrainingService:
                                             ref_audio=reference_audio, ref_text=reference["transcript"])) as results:
                     for result in results:
                         self.check(cancel)
+                        if first_ms is None:
+                            first_ms = round((time.monotonic() - started) * 1000, 2)
                         audio = np.array(result.audio, dtype=np.float32).reshape(-1)
                         if not np.isfinite(audio).all():
                             raise ValueError("invalid_audio")
@@ -991,10 +1074,16 @@ class TrainingService:
                         wav.writeframes(pcm16_bytes(audio))
             if not samples:
                 raise ValueError("empty_audio")
+            elapsed = (time.monotonic() - started) * 1000
+            duration = samples / model.sample_rate
             audio_hashes[f"{index:02d}"] = hashlib.sha256(target.read_bytes()).hexdigest()
+            metrics[f"{index:02d}"] = {"duration": round(duration, 3),
+                                       "synthesis_ms": round(elapsed, 2),
+                                       "first_audio_ms": first_ms,
+                                       "rtf": round(elapsed / 1000 / duration, 4) if duration > 0 else None}
         return {"texts": texts,
                 "texts_sha256": hashlib.sha256(canonical(texts).encode()).hexdigest(),
-                "audio_sha256": audio_hashes}
+                "audio_sha256": audio_hashes, "metrics": metrics, "variant": variant}
 
     def confirm_preview(self, value, body):
         from voice_app import clean_text, timestamp
@@ -1169,10 +1258,14 @@ def training_router(service):
             record["preview"] = service.validation_view(record)
         return record
     @router.get("/jobs/{value}/preview/{index}")
-    def preview(value: str, index: int):
+    def preview(value: str, index: int, variant: str = Query("trained")):
         job = service.store.one("training_jobs", value)
         service._require_completed_train(job)
-        return FileResponse(service.preview_file(job, index), media_type="audio/wav")
+        return FileResponse(service.preview_file(job, index, variant), media_type="audio/wav")
+
+    @router.post("/jobs/{value}/variants", status_code=202)
+    def variant(value: str, body: VariantInput, idempotency_key: str | None = Header(default=None)):
+        return service.submit_variant(value, body.steps, idempotency_key)
 
     @router.post("/jobs/{value}/preview-confirm")
     def confirm_preview(value: str, body: PreviewInput):

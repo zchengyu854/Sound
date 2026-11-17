@@ -169,8 +169,10 @@ class TrainingServiceTests(unittest.TestCase):
         self.assertEqual(self.client.post(url).status_code, 202)
         self.wait(lambda: not self.service.metrics_pending)
         saved = self.client.get(url).json()
+        segment = job["snapshot"]["segments"][0]
+        material = [{"id": segment["id"], "sha256": segment["audio_sha256"], "transcript": segment["transcript"]}]
+        self.assertEqual(saved["result"]["source"]["material_digest"], hashlib.sha256(canonical(material).encode()).hexdigest())
         self.assertEqual(saved["status"], "completed")
-        self.assertEqual(saved["result"]["source"]["material"][0]["transcript"], "训练原文。")
         self.assertEqual(saved["result"]["source"]["reference_kind"], "training")
         self.assertEqual(saved["result"]["quality"]["generated"]["file_count"], 2)
         history = self.client.get(f"/api/training/datasets/{job['dataset_id']}/metrics/history").json()
@@ -589,6 +591,85 @@ class TrainingServiceTests(unittest.TestCase):
             self.assertFalse(self.service.capabilities()["available"])
         finally:
             self.service.uploading = False
+
+    def _ab_job(self, confirmed=False):
+        dataset, _ = self.approved()
+        job = self.job(dataset)
+        root = self.service.job_directory(job)
+
+        class PreviewModel:
+            sample_rate = 24000
+
+            def __init__(self, offset):
+                self.offset = offset
+
+            def generate(self, text, max_tokens, stream, ref_audio, ref_text):
+                sample = 0.1 + self.offset
+                yield SimpleNamespace(audio=[sample, -sample])
+
+        config = {"max_tokens": 120, "seed": 7}
+        base = self.service.validate_audio(PreviewModel(0.0), job, threading.Event(), variant="base")
+        trained = self.service.validate_audio(PreviewModel(0.2), job, threading.Event(), variant="trained")
+        adapter_hash = hashlib.sha256(b"adapter").hexdigest()
+        (root / "adapter.safetensors").write_bytes(b"adapter")
+        validation = {"ab": 2, "adapter_loaded": True, "base_model": self.service.base_model,
+            "base_digest": "base-hash", "adapter_sha256": adapter_hash,
+            "snapshot_digest": job["digest"], "reference_digest": "ref-hash",
+            "inference_config": config, "preview_texts": trained["texts"],
+            "preview_texts_sha256": trained["texts_sha256"],
+            "preview_audio_sha256": trained["audio_sha256"],
+            "base_preview_texts_sha256": base["texts_sha256"],
+            "base_preview_audio_sha256": base["audio_sha256"],
+            "preview_metrics": {"base": base["metrics"], "trained": trained["metrics"]},
+            "train_losses": [6.1, 5.9], "validation_losses": [1.0],
+            "training_summary": training_summary(job)}
+        self.service._write_validation(job, validation)
+        self.service.store.update("training_jobs", job["id"], status="completed")
+        return self.service.store.one("training_jobs", job["id"]), validation
+
+    def test_ab_uses_same_text_reference_and_config(self):
+        job, validation = self._ab_job()
+        root = self.service.job_directory(job)
+        base_files = sorted(p.name for p in root.glob("validation-base-*.wav"))
+        trained_files = sorted(p.name for p in root.glob("validation-[0-9]*.wav"))
+        self.assertEqual(base_files, ["validation-base-01.wav", "validation-base-02.wav"])
+        self.assertEqual(trained_files, ["validation-01.wav", "validation-02.wav"])
+        self.assertNotEqual(validation["preview_audio_sha256"], validation["base_preview_audio_sha256"])
+        self.assertEqual(validation["base_preview_texts_sha256"], validation["preview_texts_sha256"])
+        self.assertEqual(validation["inference_config"], {"max_tokens": 120, "seed": 7})
+        detail = self.client.get(f"/api/training/jobs/{job['id']}").json()
+        self.assertEqual(detail["preview"]["ab"], 2)
+        self.assertIn("base", detail["preview"]["preview_metrics"])
+        self.assertEqual(detail["preview"]["train_losses"], [6.1, 5.9])
+        base_response = self.client.get(f"/api/training/jobs/{job['id']}/preview/1?variant=base")
+        self.assertEqual(base_response.status_code, 200)
+        self.assertNotEqual(base_response.content,
+                            self.client.get(f"/api/training/jobs/{job['id']}/preview/1").content)
+
+    def test_ab_confirmation_binds_both_groups_and_invalidates_on_change(self):
+        job, validation = self._ab_job()
+        value = job["id"]
+        self.assertEqual(self.client.post(f"/api/training/jobs/{value}/publish",
+                         json={"name": "x"}).status_code, 409)
+        confirmed = self.client.post(f"/api/training/jobs/{value}/preview-confirm", json={"confirmed": True})
+        self.assertEqual(confirmed.status_code, 200, confirmed.text)
+        record = self.client.get(f"/api/training/jobs/{value}").json()
+        self.assertTrue(record["preview"]["confirmed"])
+        root = self.service.job_directory(job)
+        (root / "validation-base-01.wav").write_bytes(b"tampered")
+        published = self.client.post(f"/api/training/jobs/{value}/publish", json={"name": "x"})
+        self.assertEqual(published.status_code, 409)
+        self.assertIn("基座对照音频", published.json()["detail"])
+
+    def test_ab_config_change_invalidates_confirmation(self):
+        job, validation = self._ab_job()
+        value = job["id"]
+        self.client.post(f"/api/training/jobs/{value}/preview-confirm", json={"confirmed": True})
+        validation["inference_config"] = {"max_tokens": 130, "seed": 7}
+        self.service._write_validation(job, validation)
+        published = self.client.post(f"/api/training/jobs/{value}/publish", json={"name": "x"})
+        self.assertEqual(published.status_code, 409)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -998,5 +998,116 @@ class LLMSettingsTests(unittest.TestCase):
             self.assertEqual(self.client.get(endpoint, headers={"Sec-Fetch-Site": "cross-site"}).status_code, 403)
 
 
+class RealtimeMessageTests(unittest.TestCase):
+    # Reuse the fake engine, chat double and HTTP helpers without inheriting the
+    # parent test methods (inheritance would re-run every standard-chat test).
+    setUp = VoiceAppTests.setUp
+    tearDown = VoiceAppTests.tearDown
+    open_client = VoiceAppTests.open_client
+    reply = VoiceAppTests.reply
+    wait_for = VoiceAppTests.wait_for
+    voice = VoiceAppTests.voice
+    upload = VoiceAppTests.upload
+    conversation = VoiceAppTests.conversation
+    send = VoiceAppTests.send
+    finished = VoiceAppTests.finished
+
+    def send_mode(self, conversation, content="你好", mode="realtime", key=None):
+        headers = {"Idempotency-Key": key} if key else {}
+        response = self.client.post(f"/api/conversations/{conversation['id']}/messages",
+                                    json={"content": content, "mode": mode}, headers=headers)
+        self.assertEqual(response.status_code, 202, response.text)
+        return response.json()
+
+    def test_realtime_mode_persists_and_splits_sentences(self):
+        conversation = self.conversation()
+        with patch.object(self.app.state.service, "reply", return_value=("第一句。第二句！第三句？", "")):
+            task = self.send_mode(conversation)
+            self.assertEqual(task["mode"], "realtime")
+            done = self.finished(task)
+        self.assertEqual(done["status"], "complete")
+        self.assertEqual(done["mode"], "realtime")
+        synthesis_texts = [call[0] for call in self.engine.calls]
+        self.assertIn("第一句。", synthesis_texts)
+        self.assertIn("第二句！", synthesis_texts)
+        self.assertIn("第三句？", synthesis_texts)
+        timings = done["timings"]
+        for key in ("first_body_ms", "first_sentence_ms", "first_audio_ms", "llm_ms", "tts_ms"):
+            self.assertIn(key, timings)
+        # synthesize() reports seconds per sentence; duration must not be divided again.
+        self.assertAlmostEqual(done["duration"], 9.0, places=3)
+        self.assertIsNotNone(timings["rtf"])
+        self.assertLess(timings["rtf"], 10)
+
+    def test_realtime_idempotency_checks_mode(self):
+        conversation = self.conversation()
+        key = str(uuid4())
+        first = self.send_mode(conversation, key=key)
+        again = self.client.post(f"/api/conversations/{conversation['id']}/messages",
+                                 json={"content": "你好", "mode": "standard"},
+                                 headers={"Idempotency-Key": key})
+        self.assertEqual(again.status_code, 409)
+        self.assertEqual(self.send_mode(conversation, key=key)["id"], first["id"])
+        self.finished(first)
+
+    def test_realtime_barge_in_produces_interrupted_and_allows_next(self):
+        conversation = self.conversation()
+        self.reply_started.clear()
+        gate = threading.Event()
+        def slow_reply(history):
+            self.reply_started.set()
+            gate.wait(5)
+            return "不会播出的回复。", ""
+        with patch.object(self.app.state.service, "reply", side_effect=slow_reply):
+            first = self.send_mode(conversation)
+            self.wait_for(lambda: self.reply_started.is_set())
+            self.client.post(f"/api/messages/{first['id']}/cancel")
+            self.wait_for(lambda: self.client.get(f"/api/messages/{first['id']}").json()["status"] == "interrupted")
+            detail = self.client.get(f"/api/messages/{first['id']}").json()
+            self.assertEqual(detail["error_code"], "interrupted")
+            gate.set()
+            self.wait_for(lambda: not self.client.get("/api/health").json()["busy"])
+        with patch.object(self.app.state.service, "reply", return_value=("新一轮回复。", "")):
+            second = self.send_mode(conversation, content="重新开始")
+            self.assertEqual(self.finished(second)["status"], "complete")
+
+    def test_standard_cancel_keeps_legacy_terminal_state(self):
+        conversation = self.conversation()
+        self.reply_started.clear()
+        gate = threading.Event()
+        def slow_reply(history):
+            self.reply_started.set(); gate.wait(2); return "标准回复。", ""
+        with patch.object(self.app.state.service, "reply", side_effect=slow_reply):
+            task = self.send(conversation)
+            self.wait_for(lambda: self.reply_started.is_set())
+            cancel = self.client.post(f"/api/messages/{task['id']}/cancel").json()
+            self.assertTrue(cancel["cancel_requested"])
+            gate.set()
+            detail = self.wait_for(lambda: self.client.get(f"/api/messages/{task['id']}").json()
+                                   if self.client.get(f"/api/messages/{task['id']}").json()["status"] in
+                                   ("text_failed", "audio_failed", "interrupted") else None)
+            self.assertIn(detail["status"], ("text_failed", "audio_failed"))
+            self.wait_for(lambda: not self.client.get("/api/health").json()["busy"])
+
+    def test_realtime_synthesis_failure_is_audio_failed_and_unblocks_next(self):
+        conversation = self.conversation()
+        self.engine.fail = True
+        with patch.object(self.app.state.service, "reply", return_value=("一句话。", "")):
+            task = self.send_mode(conversation)
+            done = self.finished(task)
+        self.assertEqual(done["status"], "audio_failed")
+        self.assertNotEqual(done["status"], "text_failed")
+        self.engine.fail = False
+        with patch.object(self.app.state.service, "reply", return_value=("重新开始。", "")):
+            second = self.send_mode(conversation, content="再来一次")
+            self.assertEqual(self.finished(second)["status"], "complete")
+
+    def test_invalid_mode_rejected(self):
+        conversation = self.conversation()
+        response = self.client.post(f"/api/conversations/{conversation['id']}/messages",
+                                    json={"content": "你好", "mode": "bogus"})
+        self.assertEqual(response.status_code, 422)
+
+
 if __name__ == "__main__":
     unittest.main()

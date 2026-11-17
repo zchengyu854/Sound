@@ -275,6 +275,7 @@ class ChatService:
         self.db = self.directory / "chat.sqlite3"
         self.engine, self.reply = engine, reply or self.complete
         self.worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix="voice-inference")
+        self.io_worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix="voice-llm-io")
         self.gate = threading.Lock()
         self.admission = threading.RLock()
         self.active = None
@@ -346,7 +347,8 @@ class ChatService:
             """)
             columns = {row[1] for row in db.execute("PRAGMA table_info(messages)")}
             additions = {"reasoning": "TEXT NOT NULL DEFAULT ''", "request_key": "TEXT", "error_code": "TEXT", "attempt": "INTEGER NOT NULL DEFAULT 0",
-                         "started_at": "TEXT", "finished_at": "TEXT", "timings": "TEXT NOT NULL DEFAULT '{}'"}
+                         "started_at": "TEXT", "finished_at": "TEXT", "timings": "TEXT NOT NULL DEFAULT '{}'",
+                         "mode": "TEXT NOT NULL DEFAULT 'standard'"}
             missing = {key: value for key, value in additions.items() if key not in columns}
             if missing:
                 backup = self.directory / f"before-tasks-{uuid4()}.sqlite3"
@@ -464,6 +466,7 @@ class ChatService:
             self.worker.submit(self.engine.close).result()
             self.worker.submit(self.transcriber.close).result()
         finally:
+            self.io_worker.shutdown(wait=False, cancel_futures=True)
             self.worker.shutdown(wait=True)
             self.lease.close()
 
@@ -505,9 +508,11 @@ class ChatService:
         if not self.gate.acquire(blocking=False):
             raise HTTPException(409, "正在处理另一条回复，请完成后再试。")
 
-    def submit(self, conversation_id, content, request_key=None):
+    def submit(self, conversation_id, content, request_key=None, mode="standard"):
         if request_key is not None:
             identifier(request_key)
+        if mode not in ("standard", "realtime"):
+            raise HTTPException(422, "消息模式无效。")
         with self.admission:
             if request_key is not None:
                 existing = self.rows("SELECT a.*, u.content AS question FROM messages a JOIN messages u ON a.reply_to=u.id WHERE a.conversation_id=? AND a.request_key=?", (conversation_id, request_key))
@@ -515,10 +520,12 @@ class ChatService:
                     task = existing[0]
                     if task.pop("question") != content:
                         raise HTTPException(409, "同一幂等键不能用于不同消息。")
+                    if task.get("mode") != mode:
+                        raise HTTPException(409, "同一幂等键不能用于不同消息模式。")
                     return task
-            return self._submit(conversation_id, content, request_key)
+            return self._submit(conversation_id, content, request_key, mode)
 
-    def _submit(self, conversation_id, content, request_key):
+    def _submit(self, conversation_id, content, request_key, mode="standard"):
         conversation = self.one("conversations", conversation_id)
         self.reserve(True)
         try:
@@ -528,7 +535,7 @@ class ChatService:
             user_id, task_id = str(uuid4()), str(uuid4())
             with closing(self.connect()) as db, db:
                 db.execute("INSERT INTO messages(id,conversation_id,role,content,status) VALUES(?,?,'user',?,'complete')", (user_id, conversation_id, content))
-                db.execute("INSERT INTO messages(id,conversation_id,role,status,reply_to,request_key) VALUES(?,?,'assistant','queued',?,?)", (task_id, conversation_id, user_id, request_key))
+                db.execute("INSERT INTO messages(id,conversation_id,role,status,reply_to,request_key,mode) VALUES(?,?,'assistant','queued',?,?,?)", (task_id, conversation_id, user_id, request_key, mode))
                 db.execute("UPDATE conversations SET title=CASE WHEN title='新的对话' THEN ? ELSE title END, updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE id=?", (content[:24], conversation_id))
         except BaseException as error:
             self.gate.release()
@@ -581,7 +588,9 @@ class ChatService:
             self.update(value, status="queued", error=None, error_code=None, attempt=control.attempt,
                         started_at=timestamp(), finished_at=None, timings="{}")
             task = self.one("messages", value)
-            future = self.worker.submit(self.run, control, voice_id, text_needed)
+            mode = task.get("mode") or "standard"
+            runner = self.realtime_run if mode == "realtime" else self.run
+            future = self.worker.submit(runner, control, voice_id, text_needed)
         except BaseException as error:
             self.finish(control, error)
             raise HTTPException(503, "任务投递失败，请查询任务状态后重试。") from None
@@ -606,16 +615,22 @@ class ChatService:
                     if task["status"] == "complete" and task["duration"] and control.timings["tts_ms"] is not None else None)
                 fields = {"finished_at": timestamp(), "timings": json.dumps(control.timings)}
                 if error is not None:
-                    text_failed = control.stage in ("dispatch", "llm") or not task["content"]
                     code = (error.code if isinstance(error, TaskStopped) else
                             "dispatch_failed" if control.stage == "dispatch" else
                             "storage_error" if isinstance(error, (sqlite3.Error, OSError)) else
                             "provider_timeout" if isinstance(error, httpx.TimeoutException) else
-                            "provider_http" if isinstance(error, httpx.HTTPStatusError) else
-                            "text_generation_failed" if text_failed else "audio_generation_failed")
-                    fields.update(status="text_failed" if text_failed else "audio_failed", error_code=code,
-                                  error={"cancelled": "任务已取消，可以重试。", "timeout": "任务已超时，可以重试。",
-                                         "dispatch_failed": "任务投递失败，可以重试。"}.get(code, "生成失败，请检查服务及配置后重试。"))
+                            "provider_http" if isinstance(error, httpx.HTTPStatusError) else None)
+                    if (code == "cancelled" and (task.get("mode") or "standard") == "realtime"):
+                        # Realtime barge-in: a self-contained terminal state. The
+                        # pair stays in history but is excluded from next context.
+                        fields.update(status="interrupted", error_code="interrupted",
+                                      error="本轮已被打断。")
+                    else:
+                        text_failed = control.stage in ("dispatch", "llm") or not task["content"]
+                        code = code or ("text_generation_failed" if text_failed else "audio_generation_failed")
+                        fields.update(status="text_failed" if text_failed else "audio_failed", error_code=code,
+                                      error={"cancelled": "任务已取消，可以重试。", "timeout": "任务已超时，可以重试。",
+                                             "dispatch_failed": "任务投递失败，可以重试。"}.get(code, "生成失败，请检查服务及配置后重试。"))
                 self.update(control.id, **fields)
                 if isinstance(error, (sqlite3.Error, OSError)):
                     self.accepting_tasks = False
@@ -862,6 +877,156 @@ class ChatService:
 
         return emit
 
+    def realtime_run(self, control, voice_id, text_needed):
+        """Realtime message: overlap LLM streaming with per-sentence synthesis.
+
+        The network read runs on the dedicated I/O executor; all MLX work stays
+        on this (model) thread. Sentences flow through a bounded queue so text
+        generation applies backpressure when synthesis falls behind.
+        """
+        from realtime_runtime import BoundedSegments, SentenceSplitter
+        import wave as _wave
+
+        value = control.id
+        temp = None
+        segments = BoundedSegments(maxsize=4)
+        splitter = SentenceSplitter()
+        llm_state = {"text": "", "reasoning": "", "warning": "", "error": None, "first_body_ms": None,
+                     "first_sentence_ms": None}
+
+        def llm_emit(kind, delta):
+            if kind == "reasoning":
+                if delta:
+                    llm_state["reasoning"] += delta
+                    self.update(value, reasoning=llm_state["reasoning"][:4000])
+                return
+            if not delta:
+                return
+            if llm_state["first_body_ms"] is None:
+                llm_state["first_body_ms"] = round((time.monotonic() - control.started) * 1000, 3)
+            llm_state["text"] += delta
+            for sentence in splitter.feed(delta):
+                if sentence and segments.put(sentence) and llm_state["first_sentence_ms"] is None:
+                    llm_state["first_sentence_ms"] = round((time.monotonic() - control.started) * 1000, 3)
+            # Throttled content update so SSE shows growing text.
+            if len(llm_state["text"]) % 8 == 0 or len(llm_state["text"]) < 8:
+                self.update(value, content=llm_state["text"][:4000], status="replying")
+
+        def llm_job():
+            started = time.monotonic()
+            try:
+                control.check()
+                history = self.history(self.one("messages", value))
+                if self.streaming:
+                    text, warning, reasoning = self.stream_reply(history, llm_emit)
+                else:
+                    text, warning = self.reply(history)
+                    reasoning = ""
+                    for sentence in splitter.feed(text):
+                        if sentence:
+                            segments.put(sentence)
+                    llm_state["text"] = text
+                    llm_state["reasoning"] = reasoning
+                llm_state["text"] = clean_text(text, 4000, "回复")
+                llm_state["warning"] = warning
+                llm_state["reasoning"] = reasoning
+            except BaseException as error:
+                llm_state["error"] = error
+            finally:
+                control.timings["llm_ms"] = round((time.monotonic() - started) * 1000, 3)
+                tail = splitter.flush()
+                if tail and llm_state["error"] is None:
+                    segments.put(tail)
+                segments.finish()
+                self.update(value, content=llm_state["text"][:4000],
+                            reasoning=llm_state["reasoning"][:4000])
+
+        try:
+            control.check()
+            target = self.path(self.audio, value)
+            temp = target.with_suffix(".tmp")
+            self.update(value, status="thinking", content="", reasoning="", warning="")
+            llm_future = self.io_worker.submit(llm_job)
+
+            live = PCMBuffer(control.attempt, self.engine.sample_rate)
+            self.live_audio = live
+            self.update(value, status="synthesizing")
+            task = self.one("messages", value)
+            voice = self.one("voices", voice_id)
+            if voice.get("model_id"):
+                self.training.store.one("voice_models", voice["model_id"])
+                folder = (self.directory / "voice_models" / identifier(voice["model_id"])).resolve()
+                if folder.parent != (self.directory / "voice_models").resolve():
+                    raise RuntimeError("声音模型路径无效。")
+                self.engine.select_adapter(folder)
+            elif hasattr(self.engine, "select_adapter"):
+                self.engine.select_adapter(None)
+
+            pcm_chunks = []
+            total_duration = 0.0
+            synth_ms = 0.0
+            control.timings["first_audio_ms"] = None
+            # Only this (model) thread owns the stage field; the I/O thread writes
+            # timings only, so the two never overwrite each other.
+            control.stage = "tts"
+            while True:
+                control.check()
+                sentence = segments.get(timeout=0.2)
+                if sentence is None:
+                    if llm_future.done():
+                        break
+                    continue
+                def emit_pcm(data):
+                    control.check()
+                    live.append(data)
+                    if control.timings["first_audio_ms"] is None:
+                        control.timings["first_audio_ms"] = round((time.monotonic() - control.started) * 1000, 3)
+                    pcm_chunks.append(data)
+                # synthesize() returns duration in seconds, not a sample count.
+                synth_started = time.monotonic()
+                part_duration, _warning = self.engine.synthesize(
+                    sentence, self.path(self.recordings, voice_id), voice["transcript"],
+                    temp, check=control.check, on_pcm=emit_pcm)
+                # RTF must reflect model synthesis only, not time spent waiting on
+                # the network reader for the next sentence.
+                synth_ms += (time.monotonic() - synth_started) * 1000
+                total_duration += float(part_duration or 0)
+            control.timings["tts_ms"] = round(synth_ms, 3)
+            control.timings["first_sentence_ms"] = llm_state["first_sentence_ms"]
+            control.timings["first_body_ms"] = llm_state["first_body_ms"]
+
+            # Surface LLM/network errors only after queued audio drains.
+            llm_future.result()
+            if llm_state["error"] is not None:
+                if not pcm_chunks:
+                    control.stage = "llm"  # no audio yet: classify as a text failure
+                raise llm_state["error"]
+            if not pcm_chunks or not llm_state["text"]:
+                raise ValueError("realtime_empty_output")
+
+            with self.admission, control.measure("publish"):
+                control.check()
+                with _wave.open(str(temp), "wb") as audio:
+                    audio.setnchannels(1)
+                    audio.setsampwidth(2)
+                    audio.setframerate(self.engine.sample_rate)
+                    for data in pcm_chunks:
+                        audio.writeframesraw(data)
+                duration = total_duration
+                temp.replace(target)
+                try:
+                    self.update(value, status="complete", duration=duration, error=None,
+                                warning=" ".join(filter(None, (task["warning"], llm_state["warning"]))))
+                except BaseException:
+                    target.unlink(missing_ok=True)
+                    raise
+        finally:
+            segments.close()
+            if self.live_audio is not None:
+                self.live_audio.close()
+            if temp is not None:
+                temp.unlink(missing_ok=True)
+
     def run(self, control, voice_id, text_needed):
         value = control.id
         temp = None
@@ -923,11 +1088,19 @@ class ChatService:
 
 class MessageInput(BaseModel):
     content: str = Field(min_length=1, max_length=2000)
+    mode: str = "standard"
 
     @field_validator("content")
     @classmethod
     def trim(cls, value):
         return clean_text(value, 2000, "消息")
+
+    @field_validator("mode")
+    @classmethod
+    def check_mode(cls, value):
+        if value not in ("standard", "realtime"):
+            raise ValueError("消息模式无效。")
+        return value
 
 
 class ConversationInput(BaseModel):
@@ -1126,7 +1299,7 @@ def create_app(directory=None, engine=None, reply=None, transcriber=None):
 
     @app.post("/api/conversations/{value}/messages", status_code=202)
     def send_message(value: str, body: MessageInput, idempotency_key: str | None = Header(default=None)):
-        return service.submit(value, body.content, idempotency_key)
+        return service.submit(value, body.content, idempotency_key, body.mode)
 
     @app.get("/api/messages/{value}")
     def message(value: str):
@@ -1147,7 +1320,7 @@ def create_app(directory=None, engine=None, reply=None, transcriber=None):
                     yield f"data: {json.dumps(row, ensure_ascii=False)}\n\n"
                     last = signature
                     last_ping = time.monotonic()
-                if row["status"] in ("complete", "text_failed", "audio_failed"):
+                if row["status"] in ("complete", "text_failed", "audio_failed", "interrupted"):
                     break
                 if await request.is_disconnected():
                     break
@@ -1237,7 +1410,13 @@ def create_app(directory=None, engine=None, reply=None, transcriber=None):
         from fastapi.responses import RedirectResponse
         return RedirectResponse("/training/")
 
+    @app.get("/realtime", include_in_schema=False)
+    def realtime_entry():
+        from fastapi.responses import RedirectResponse
+        return RedirectResponse("/realtime/")
+
     app.mount("/training", StaticFiles(directory=ROOT / "training_web", html=True), name="training-web")
+    app.mount("/realtime", StaticFiles(directory=ROOT / "realtime_web", html=True), name="realtime-web")
     app.mount("/", StaticFiles(directory=ROOT / "web", html=True), name="web")
     return app
 

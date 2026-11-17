@@ -23,9 +23,11 @@ class MediaTests(unittest.TestCase):
         cls.root = Path(cls.temporary.name)
         cls.mp3 = cls.root / "sample.mp3"
         cls.mp4 = cls.root / "sample.mp4"
+        cls.wav = cls.root / "sample.wav"
         cls.mute = cls.root / "mute.mp4"
         commands = [
             ["-f", "lavfi", "-i", "sine=frequency=220:duration=4", str(cls.mp3)],
+            ["-f", "lavfi", "-i", "sine=frequency=220:duration=4", "-c:a", "pcm_s16le", str(cls.wav)],
             ["-f", "lavfi", "-i", "color=size=32x32:duration=4", "-f", "lavfi", "-i", "sine=frequency=220:duration=4", "-c:v", "mpeg4", "-c:a", "aac", "-shortest", str(cls.mp4)],
             ["-f", "lavfi", "-i", "color=size=32x32:duration=1", "-c:v", "mpeg4", str(cls.mute)],
         ]
@@ -69,6 +71,20 @@ class MediaTests(unittest.TestCase):
             with wave.open(clips[0]["path"]) as wav:
                 self.assertEqual((wav.getframerate(), wav.getnchannels(), wav.getsampwidth()), (24000, 1, 2))
 
+    def test_real_wav_probe_decode_and_codec_check(self):
+        metadata = media.probe_media(self.wav, "wav")
+        self.assertAlmostEqual(metadata["duration"], 4, delta=0.1)
+        destination = self.folder / "wav-decoded.wav"
+        media.decode_media(self.wav, destination, self.cancel)
+        clips = media.split_audio(destination, self.folder / "wav-clips", self.cancel)
+        self.assertEqual(len(clips), 1)
+        with wave.open(clips[0]["path"]) as wav:
+            self.assertEqual((wav.getframerate(), wav.getnchannels(), wav.getsampwidth()), (24000, 1, 2))
+        compressed = self.folder / "compressed.wav"
+        subprocess.run(["ffmpeg", "-nostdin", "-v", "error", "-y", "-f", "lavfi",
+                        "-i", "sine=frequency=220:duration=2", "-c:a", "flac", str(compressed)], check=True)
+        self.assert_code("unsupported_codec", media.probe_media, compressed, "wav")
+
     def test_corrupt_spoof_and_no_audio(self):
         corrupt = self.folder / "broken.mp3"
         corrupt.write_bytes(b"not media")
@@ -76,7 +92,7 @@ class MediaTests(unittest.TestCase):
         self.assert_code("container_mismatch", media.probe_media, self.mp3, "mp4")
         self.assert_code("container_mismatch", media.probe_media, self.mp4, "mp3")
         self.assert_code("no_audio_stream", media.probe_media, self.mute, "mp4")
-        self.assert_code("unsupported_format", media.probe_media, self.mp3, "wav")
+        self.assert_code("container_mismatch", media.probe_media, self.mp3, "wav")
 
     def test_source_duration_decoded_and_disk_limits(self):
         with patch.object(media, "MAX_SOURCE_BYTES", 10):

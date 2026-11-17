@@ -186,9 +186,11 @@ async function testMetrics() {
   f.data.jobs.push(selected, foreign);
   f.data.datasetMetrics.set(datasetId, metric(null, null));
   f.data.jobMetrics.set(selectedId, metric("same", 0.8));
-  const record = (id, steps, result) => ({id, created_at: "2026-02-03T04:05:06Z", config: {...config, steps, future_parameter: "完整参数"}, metrics: result});
+  const record = (id, steps, result, created_at = "2026-02-03T04:05:06Z") => ({id, created_at, config: {...config, steps, future_parameter: "完整参数"}, metrics: result});
+  const singleReference = metric("same", 0.8);
+  singleReference.result.features.status = "insufficient";
   f.data.history.set(datasetId, {jobs: [
-    record(selectedId, 20, metric("same", 0.8)), record(sameId, 50, metric("same", 0.9)),
+    record(selectedId, 20, singleReference, "2026-03-03T04:05:06Z"), record(sameId, 50, metric("same", 0.9)),
     record(b1, 20, metric("same-but-different", 0.4)), record(b2, 100, metric("same-but-different", 0.5)),
     record(unknown1, 30, metric(null, 0.2)), record(unknown2, 60, metric(null, 0.3)),
     record(staleId, 100, {...metric("same", 0.99), stale: true}),
@@ -205,7 +207,13 @@ async function testMetrics() {
   assert.match(original.textContent, /-19\.123456 dBFS/);
   assert.match(original.textContent, /低能量帧：0\.125%/);
   assert.match(original.textContent, /接近削波：0%/);
+  const meters = walk(original).filter(element => element.tagName === "METER");
+  assert.equal(meters.length, 3, "quality values are shown with comparable visual scales");
+  assert.deepEqual(meters.map(meter => [meter.min, meter.max]), [[-80, 0], [0, 100], [0, 100]]);
   assert.match(trained.textContent, /生成音色指数：0\.8/);
+  const indexMeters = walk(trained).filter(element => element.className === "index-meter");
+  assert.deepEqual(indexMeters.map(meter => [meter.min, meter.max, meter.value]), [[0, 100, 0.923456], [0, 100, 0.8]]);
+  assert.match(trained.textContent, /计算方式不同，不能直接相减/);
   assert.match(trained.textContent, /-21\.987654 dBFS/);
   assert.match(trained.textContent, /试听 1 · 指数：0\.812345/);
   assert.match(trained.textContent, /试听 2 · 指数：不可用/);
@@ -245,6 +253,9 @@ async function testMetrics() {
     assert.equal(circles.length, 2, "stale or differently keyed points are excluded");
     for (const id of ids) assert(circles.some(circle => circle.textContent.includes(id)));
   }
+  const chronologicalPoints = walk(same).filter(item => item.tagName === "CIRCLE");
+  assert(chronologicalPoints[0].textContent.includes(sameId), "history follows time even when step counts decrease");
+  assert(chronologicalPoints[1].textContent.includes(selectedId), "a valid generated score is graphed with one reference");
   const unknownGroups = groups.filter(group => !group.attributes["data-comparison-key"]);
   assert.equal(unknownGroups.length, 3, "missing keys do not form a comparable group");
   assert(unknownGroups.every(group => !walk(group).some(item => item.tagName === "POLYLINE")));
@@ -260,16 +271,20 @@ async function testMetrics() {
   assert.equal(f.data.posts.at(-1).body, undefined);
   assert.match(f.doc.getElementById("metrics-history").textContent, /排队中/);
 
-  const jobSelect = f.doc.getElementById("job-select");
+  const jobSelect = f.doc.getElementById("job-select"), comparisonSelect = f.doc.getElementById("comparison-job-select");
+  assert.equal(comparisonSelect.value, selectedId);
   jobSelect.value = foreign.id;
   await jobSelect.emit("change");
+  assert.equal(comparisonSelect.value, foreign.id, "task selectors remain synchronized");
   assert.match(f.doc.getElementById("job-metrics-status").textContent, /不属于当前素材集/);
   assert.equal(f.doc.getElementById("job-metrics-action").disabled, true);
-  jobSelect.value = selectedId;
-  await jobSelect.emit("change");
+  comparisonSelect.value = selectedId;
+  await comparisonSelect.emit("change");
+  assert.equal(jobSelect.value, selectedId, "comparison selection also updates the task panel");
   await f.app.refreshMetrics();
   f.data.jobMetrics.set(selectedId, {status: "interrupted", stale: true, result: {features: {status: "insufficient", message: "参考太少"}}});
   await f.app.refreshMetrics();
+  assert.equal(walk(trained).filter(element => element.className === "index-meter").length, 0, "missing indices do not create fabricated bars");
   assert.match(f.doc.getElementById("job-metrics-status").textContent, /计算中断.*素材不足.*过期.*参考太少/);
   assert.equal(f.doc.getElementById("job-metrics-action").textContent, "重试计算");
   await f.doc.getElementById("job-metrics-action").emit("click");
@@ -312,6 +327,41 @@ async function testMetrics() {
   await pending;
   assert.match(race.doc.getElementById("dataset-metrics-status").textContent, /排队中/, "a late GET cannot overwrite a newer POST");
   race.app.dispose();
+}
+
+async function testNavigation() {
+  const f = fixture();
+  f.app.start();
+  await f.app.refresh();
+  const tab = name => f.doc.getElementById(`tab-${name}`), panel = name => f.doc.getElementById(`panel-${name}`);
+  assert.equal(panel("import").hidden, false);
+  assert.equal(panel("review").hidden, true);
+  await tab("review").emit("click");
+  const textarea = f.doc.querySelectorAll(".segment button, .segment textarea").find(item => item.tagName === "TEXTAREA");
+  textarea.value = "未保存的原文";
+  await textarea.emit("input");
+  await tab("comparison").emit("click");
+  assert.equal(panel("review").hidden, true);
+  assert.equal(panel("comparison").hidden, false);
+  assert.equal(tab("comparison").attributes["aria-selected"], "true");
+  await tab("comparison").emit("keydown", {key: "ArrowLeft"});
+  assert.equal(panel("training").hidden, false);
+  assert.equal(tab("training").focused, true);
+  await tab("review").emit("click");
+  assert.equal(f.app.state.drafts.get(f.data.segments[0].id), "未保存的原文");
+  assert.equal(f.doc.querySelectorAll(".segment button, .segment textarea").find(item => item.tagName === "TEXTAREA"), textarea);
+  assert.equal(textarea.value, "未保存的原文", "switching views keeps the editor and its draft");
+  f.app.dispose();
+
+  const empty = fixture();
+  empty.data.datasets = [];
+  empty.app.start();
+  await empty.app.refresh();
+  assert.equal(empty.doc.getElementById("tab-review").disabled, true);
+  assert.equal(empty.doc.getElementById("tab-comparison").disabled, true);
+  await empty.doc.getElementById("tab-import").emit("keydown", {key: "ArrowRight"});
+  assert.equal(empty.doc.getElementById("panel-training").hidden, false, "keyboard navigation skips unavailable views");
+  empty.app.dispose();
 }
 
 async function main() {
@@ -377,7 +427,7 @@ async function main() {
   await f.app.selectDataset(f.data.datasets[0].id);
 
   const beforeUpload = f.data.posts.length;
-  await f.app.uploadFiles([{name: "bad.wav", size: 1}, {name: "huge.mp3", size: 201 * 1024 ** 2}, {name: "empty.mp4", size: 0}, {name: "first.mp3", size: 100}, {name: "second.mp4", size: 200}]);
+  await f.app.uploadFiles([{name: "bad.flac", size: 1}, {name: "huge.mp3", size: 201 * 1024 ** 2}, {name: "empty.mp4", size: 0}, {name: "first.mp3", size: 100}, {name: "second.mp4", size: 200}]);
   const uploads = f.data.posts.slice(beforeUpload);
   assert.equal(uploads.length, 2, "invalid files are rejected before sending");
   assert.equal(uploads[0].body.values[0][1].name, "first.mp3");
@@ -499,6 +549,7 @@ async function main() {
   assert.match(race.doc.getElementById("notice").textContent, /无法连接/);
   race.app.dispose();
   await testMetrics();
+  await testNavigation();
   console.log("Training UI checks passed: safe rendering, review and publishing, analysis status and retries, comparison groups, history, and stale reads.");
 }
 main().catch(error => { console.error(error); process.exitCode = 1; });

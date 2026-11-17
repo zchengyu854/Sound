@@ -63,6 +63,32 @@ class TrainingPageTests(unittest.TestCase):
         self.assertNotIn(".innerHTML", source)
         self.assertIn("script-src 'self'", response.headers["content-security-policy"])
 
+    def test_realtime_page_has_separate_route_and_reachable_assets(self):
+        response = self.client.get("/realtime/")
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("声线对话", response.text)
+        self.assertIn("text/html", response.headers["content-type"])
+        self.assertEqual(self.client.get("/realtime").url.path, "/realtime/")
+        parser = PageParser()
+        parser.feed(response.text)
+        self.assertEqual(len(parser.ids), len(set(parser.ids)))
+        self.assertFalse(parser.inline_scripts)
+        self.assertEqual(set(parser.assets),
+                         {"/realtime/style.css", "/realtime/app.js", "/audio.js", "/vad.js"})
+        for asset in parser.assets:
+            result = self.client.get(asset)
+            self.assertEqual(result.status_code, 200, asset)
+            self.assertEqual(result.headers["x-content-type-options"], "nosniff")
+        source = (ROOT / "realtime_web" / "app.js").read_text()
+        referenced_ids = set(re.findall(r'\$\("([a-z-]+)"\)', source))
+        self.assertFalse(referenced_ids - set(parser.ids), referenced_ids - set(parser.ids))
+        self.assertNotIn(".innerHTML", source)
+        worklet = self.client.get("/realtime-worklet.js")
+        self.assertEqual(worklet.status_code, 200)
+        self.assertIn("realtime-capture", worklet.text)
+        for path in ("/realtime/data/chat.sqlite3", "/realtime/voice_app.py", "/realtime/%2e%2e/voice_app.py"):
+            self.assertEqual(self.client.get(path).status_code, 404, path)
+
     def test_chat_home_is_unchanged_and_has_no_training_entry(self):
         response = self.client.get("/")
         self.assertEqual(response.status_code, 200)
