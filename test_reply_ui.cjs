@@ -1,0 +1,14 @@
+const assert = require("node:assert/strict");
+require("./web/reply.js");
+const {paragraphs, tokens, blocks} = globalThis.VoiceReply;
+assert.deepEqual(paragraphs("你好。\n\n慢慢说。"), ["你好。", "慢慢说。"]);
+assert.equal(paragraphs(("这是一个句子。".repeat(30))).join(""), "这是一个句子。".repeat(30));
+assert.ok(paragraphs("短句。".repeat(60)).every(part => part.length <= 90));
+assert.deepEqual(tokens("1. **被看见**：听见你。"), [{text:"1. ",strong:false},{text:"被看见",strong:true},{text:"：听见你。",strong:false}]);
+assert.equal(tokens('<img src=x onerror="alert(1)">')[0].text, '<img src=x onerror="alert(1)">');
+assert.deepEqual(tokens("**未结束"), [{text:"**未结束",strong:false}]);
+assert.ok(paragraphs("字".repeat(300)).length > 2);
+assert.equal(paragraphs("字".repeat(300)).join(""), "字".repeat(300));
+assert.deepEqual(blocks("第一段。\n\n## 第二段"), ["第一段。", "第二段"]);
+assert.deepEqual(blocks("字".repeat(300)), ["字".repeat(300)]);
+console.log("Reply formatting checks passed");

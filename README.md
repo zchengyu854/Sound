@@ -1,5 +1,9 @@
 <a name="english"></a>
 
+## 本地声音聊天网页应用
+
+新增 FastAPI + 原生网页 + SQLite 应用，支持添加参考声音、独立会话、AI 文字回复和 Breeze 本地语音。安装、配置和启动见 [WEB_APP.md](WEB_APP.md)。原有命令行用法保持兼容。
+
 **[English](#english) | [中文](#chinese)**
 
 # breezetts2_mac_fast.py

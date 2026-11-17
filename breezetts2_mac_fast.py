@@ -622,7 +622,7 @@ class Player:
             self.stream.close()
 
 
-def pcm_chunks(model, args):
+def pcm_chunks(model, args, ref_audio=None, ref_text=None):
     """Yield fresh noncumulative PCM, materialized before crossing threads."""
     import mlx.core as mx
     import numpy as np
@@ -632,6 +632,7 @@ def pcm_chunks(model, args):
         text=args.text, instruct=args.instruct or None, cfg_scale=args.cfg_scale,
         max_tokens=args.max_tokens, seed=args.seed, stream=True,
         streaming_interval=args.streaming_interval,
+        ref_audio=ref_audio, ref_text=ref_text,
     )
     try:
         for result in results:

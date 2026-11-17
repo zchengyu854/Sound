@@ -1,0 +1,13 @@
+.venv/
+__pycache__/
+*.pyc
+.env
+data/
+web-test-artifacts/
+llm-settings.json
+.llm-settings-*.tmp
+*.wav
+*.mp3
+*.mp4
+deployment_test_*.json
+.DS_Store
