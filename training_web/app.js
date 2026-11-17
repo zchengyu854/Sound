@@ -23,7 +23,7 @@
   function createWorkbench(doc, win) {
     const $ = id => doc.getElementById(id);
     const state = {datasets: [], jobs: [], capabilities: null, health: null, selected: "", jobId: "", segments: [], offset: 0,
-      drafts: new Map(), uploads: [], published: new Map(), busy: "", connected: false, segmentsLoading: false, needsSegments: false, view: "import"};
+      drafts: new Map(), uploads: [], published: new Map(), busy: "", connected: false, segmentsLoading: false, needsSegments: false, view: "import", summary: null};
     let refreshing = null, segmentRequest = 0, pollTimer = null, disposed = false;
     let librarySignature = "", jobsSignature = "", previewSignature = "";
     const metricCache = new Map(), metricErrors = new Map(), metricRequests = new Map();
@@ -128,9 +128,9 @@
       return audio;
     }
 
-    function indexChart(features) {
+    function indexChart(features, status) {
       const chart = node("div", "index-chart");
-      chart.append(node("strong", "", "训练快照音色指数（0–100）"));
+      chart.append(node("strong", "", "训练快照音色指数（0–100）"), node("p", "muted", status));
       for (const [label, value] of [["任务快照原声指数", features.original_index], ["生成音色指数", features.generated_index]]) {
         const row = node("div", "index-row");
         row.append(node("span", "", `${label}：${metricNumber(value)}`));
@@ -152,8 +152,9 @@
       if (!result) return;
       const features = result.features || {}, source = result.source || {}, quality = result.quality || {};
       const details = node("div", "metrics-details");
-      if (job) details.append(indexChart(features));
-      else details.append(node("div", "metrics-value", `原声音色指数：${metricNumber(features.original_index)}`));
+      const selectedIndex = job ? features.generated_index : features.original_index;
+      details.append(node("div", "metrics-value", `${job ? "生成音色指数" : "原声音色指数"}：${metricNumber(selectedIndex)}`));
+      if (job) details.append(node("p", "", `任务快照原声指数：${metricNumber(features.original_index)}`));
       if (job) details.append(node("p", "", `有效生成试听：${metricNumber(features.generated_count)} / 2`));
       details.append(node("p", "", `参考数量：${metricNumber(features.reference_count)} · 配对数：${metricNumber(features.pair_count)}`));
       const kinds = {validation: "独立验证片段", training: "训练素材（没有独立验证片段）", current: "当前素材"};
@@ -328,6 +329,9 @@
         $("job-metrics-action").textContent = metricActionLabel(trained, "任务");
         $("job-metrics-action").disabled = !eligible || !state.connected || metricBusy(trained) || metricPosting.has(jobKey);
         renderMetricResult($("job-metrics-content"), trained, eligible ? job : null);
+        const result = metricResult(trained), status = $("job-metrics-status").textContent;
+        $("index-comparison").replaceChildren(result ? indexChart(result.features || {}, status) :
+          node("p", "muted", eligible ? `${status} 完成分析后显示指数图。` : status));
       }
       const originalResult = metricResult(original), trainedResult = metricResult(trained);
       const conditions = $("comparison-conditions");
@@ -335,16 +339,22 @@
       if (conditions.hidden !== hideConditions) conditions.hidden = hideConditions;
       if (!hideConditions) {
         const a = originalResult.source || {}, b = trainedResult.source || {};
-        const aKey = originalResult.comparison_key, bKey = trainedResult.comparison_key;
+        const af = originalResult.features || {}, bf = trainedResult.features || {};
+        const present = value => typeof value === "string" && Boolean(value);
+        const validRefs = refs => Array.isArray(refs) && refs.length > 0 && refs.every(present) && new Set(refs).size === refs.length;
+        const aRefs = validRefs(a.reference_ids), bRefs = validRefs(b.reference_ids);
+        const modelFields = ["model", "revision", "algorithm"];
+        const different = (a.dataset_version != null && b.dataset_version != null && a.dataset_version !== b.dataset_version) ||
+          (present(a.material_digest) && present(b.material_digest) && a.material_digest !== b.material_digest) ||
+          (aRefs && bRefs && (a.reference_ids.length !== b.reference_ids.length || a.reference_ids.some(id => !b.reference_ids.includes(id)))) ||
+          modelFields.some(field => present(af[field]) && present(bf[field]) && af[field] !== bf[field]);
         let message;
         if (original.stale || trained.stale) message = "分析结果已过期，不能直接比较；请先重新计算。";
-        else if ((a.dataset_version != null && b.dataset_version != null && a.dataset_version !== b.dataset_version) ||
-          (a.material_digest && b.material_digest && a.material_digest !== b.material_digest) ||
-          (typeof aKey === "string" && aKey && typeof bKey === "string" && bKey && aKey !== bKey)) {
-          message = "当前原声与任务快照的素材或分析条件不同，不能直接比较。";
-        } else if (typeof aKey !== "string" || !aKey || typeof bKey !== "string" || !bKey || a.dataset_version == null || b.dataset_version == null || !a.material_digest || !b.material_digest) {
-          message = "素材或分析条件信息不完整，无法确认是否可以直接比较。";
-        } else message = "素材版本和比较条件标识一致；仍请逐条试听发音、情绪和自然度。";
+        else if (different) message = "当前原声与任务快照的素材、参考片段或分析模型不同，不能直接比较。";
+        else if (a.dataset_version == null || b.dataset_version == null || !present(a.material_digest) || !present(b.material_digest) ||
+          !aRefs || !bRefs || modelFields.some(field => !present(af[field]) || !present(bf[field]))) {
+          message = "素材或分析条件信息不完整，无法确认参考条件是否一致。";
+        } else message = "素材版本、参考片段与分析模型一致；两项指数含义不同，仍请逐条试听。";
         if (conditions.textContent !== message) conditions.textContent = message;
       }
       const historySignature = JSON.stringify([selected, state.connected, history, signature(historyKey), [...metricPosting], [...metricErrors]]);
@@ -634,7 +644,12 @@
       $("draft-notice").textContent = state.needsSegments ? "素材处理有更新。保存原文后点击刷新片段查看。" : "有尚未保存的原文。刷新或切换素材集前，请先保存。";
       for (const control of doc.querySelectorAll(".segment button, .segment textarea")) control.disabled = editingBlocked();
       $("start-training").disabled = !canTrain();
-      $("training-readiness").textContent = !item ? "选择素材集后，先确认说话者并审核片段。" : state.drafts.size ? "请先保存或确认正在编辑的原文，再启动训练。" : !item.speaker_confirmed ? "请先确认素材属于同一位目标说话者。" : !(item.approved_duration > 0) ? "还没有确认的片段。先试听、校对并确认至少一条。" : !cap?.available ? "素材已具备审核条件，等待本机模型空闲且可用。" : `可训练：已确认 ${formatDuration(item.approved_duration)}。开始时会冻结当前原文与音频清单。`;
+      const readiness = !item ? "选择素材集后，先确认说话者并审核片段。" : state.drafts.size ? "请先保存或确认正在编辑的原文，再启动训练。" : !item.speaker_confirmed ? "请先确认素材属于同一位目标说话者。" : !(item.approved_duration > 0) ? "还没有确认的片段。先试听、校对并确认至少一条。" : !cap?.available ? "素材已具备审核条件，等待本机模型空闲且可用。" : `可训练：已确认 ${formatDuration(item.approved_duration)}。开始时会冻结当前原文与音频清单。`;
+      const summary = item ? state.summary : null;
+      const rollup = summary
+        ? `已确认 ${summary.approved_segments} 段（${formatDuration(summary.approved_seconds)}）· 待审核 ${summary.pending_segments} 段 · 独立验证：${summary.independent_validation ? "有" : "无，需用未训练文本试听"}`
+        : "";
+      $("training-readiness").textContent = rollup ? `${readiness} ${rollup}` : readiness;
       if (cap) $("environment").textContent = `FFmpeg：${cap.ffmpeg ? "可用" : "未安装"} / FFprobe：${cap.ffprobe ? "可用" : "未安装"}\n训练环境：${cap.compatible ? "版本兼容" : "不兼容，请检查固定依赖与 Apple Silicon"}\n${cap.hardware?.chip || "本机"}${cap.hardware?.memory_gib ? ` / ${cap.hardware.memory_gib} GiB` : ""}\n基座：${cap.base_model}\n${state.health?.model_error || state.health?.stt_error || "batch size 固定 1，原始模型权重冻结。"}`;
       renderJob();
       renderComparison();
@@ -701,9 +716,13 @@
       state.segmentsLoading = true;
       render();
       try {
-        const segments = await api(`${path("datasets", selected)}/segments?offset=${offset}&limit=${PAGE_SIZE}`);
+        const [segments, summary] = await Promise.all([
+          api(`${path("datasets", selected)}/segments?offset=${offset}&limit=${PAGE_SIZE}`),
+          api(`${path("datasets", selected)}/summary`).catch(() => null),
+        ]);
         if (request !== segmentRequest || selected !== state.selected || offset !== state.offset) return;
         state.segments = segments;
+        state.summary = summary;
         state.needsSegments = false;
         renderSegments();
       } catch (error) {

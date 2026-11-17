@@ -12,7 +12,7 @@
 - `web/`: chat frontend (native HTML/CSS/JS, no build step). `web/vad.js` and `web/realtime-worklet.js` are shared with the realtime page.
 - `training_web/`: standalone training workbench served at `/training/`. `realtime_web/`: standalone realtime voice page served at `/realtime/`.
 - `test_voice_app.py`: backend regression tests and fake inference/provider implementations. `test_realtime_runtime.py` covers splitting/queue/turn logic; `test_vad.cjs` and `test_realtime_ui.cjs` cover the realtime browser logic with DOM/API doubles.
-- `README.md` describes streaming inference; `WEB_APP.md` covers web configuration, APIs, training/realtime behavior, and the manual acceptance checklist. `fish_s2_mac_stream.py.py` is a separate Fish streaming script.
+- `README.md` describes streaming inference; `WEB_APP.md` covers web configuration, APIs, training/realtime behavior, and the manual acceptance checklist. `MANUAL_TESTS.md` is the human acceptance checklist (audio listening, microphone, barge-in, latency) with recording tables. `fish_s2_mac_stream.py.py` is a separate Fish streaming script.
 - Ignored `data/` holds private recordings, generated audio, SQLite state, and migration backups. Keep verification artifacts in ignored `web-test-artifacts/`.
 
 ## Build, Test, and Development Commands
@@ -23,12 +23,29 @@ Run from the repository root using native arm64 Python 3.12 on Apple Silicon:
 uv venv --python 3.12 .venv
 uv pip install --python .venv/bin/python -r requirements-web.txt
 .venv/bin/python voice_app.py
-.venv/bin/python -m unittest -v test_voice_app test_characters
-node --check web/app.js
-.venv/bin/python -m py_compile voice_app.py breezetts2_mac_fast.py
+.venv/bin/python -m unittest -v test_voice_app test_characters test_audio_runtime \
+  test_breeze_training test_media_processing test_training_store \
+  test_training_service test_training_web test_separate_vocals test_realtime_runtime
+node --check web/app.js && node --check training_web/app.js
+node --check web/vad.js && node --check web/realtime-worklet.js && node --check realtime_web/app.js
+node test_training_ui.cjs && node test_audio_ui.cjs && node test_reply_ui.cjs
+node test_vad.cjs && node test_realtime_ui.cjs
+.venv/bin/python -m py_compile voice_app.py breezetts2_mac_fast.py realtime_runtime.py \
+  media_processing.py training_store.py training_service.py separate_vocals.py
 ```
 
-These commands install dependencies, serve localhost port 8000, run tests, and check syntax. No build step is required. For real CLI verification:
+These commands install dependencies, serve localhost port 8000, run the 156 backend
+tests plus five Node suites, and check syntax. No build step is required. Optional
+vocal separation uses a separate environment (`.venv-separator`, git-ignored) so the
+pinned `mlx==0.32.2` / `mlx-audio==0.5.1` of `.venv` stays untouched:
+
+```sh
+uv venv --python 3.12 .venv-separator
+uv pip install --python .venv-separator/bin/python -r requirements-separator.txt
+.venv/bin/python separate_vocals.py /path/to/song.mp3 -o web-test-artifacts/sep/
+```
+
+For real CLI verification:
 
 ```sh
 .venv/bin/python breezetts2_mac_fast.py --no-play --runs 1 --text '你好' --output /tmp/breeze_check

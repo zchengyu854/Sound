@@ -64,6 +64,7 @@
         <section id="panel-comparison" class="comparison-section" role="tabpanel" aria-labelledby="tab-comparison" tabindex="0" hidden>
           <div class="section-heading"><div><h3 id="comparison-title">声音对照</h3><p class="muted">当前原声与所选已完成训练任务</p></div></div>
           <label class="comparison-select" for="comparison-job-select">选择训练任务<select id="comparison-job-select"><option value="">暂无任务</option></select></label>
+          <div id="index-comparison" class="index-comparison" aria-live="polite"><p class="muted">选择已完成的训练任务后，这里会显示指数图。</p></div>
           <p class="comparison-note">音色特征指数并非主观听感评分。请逐条试听发音、情绪和自然度，也留意失真；试听确认与发布仍按原流程进行。</p>
           <p class="footnote">质量图的响度显示范围为 −80 至 0 dBFS，两项占比为 0–100%；文字显示测量值。低能量不等于噪声或静音。</p>
           <div class="comparison-grid">
@@ -82,7 +83,7 @@
           <p class="footnote comparison-note">原声是当前素材集，任务结果使用训练时的素材快照；版本或分析条件变化时，不能直接比较。</p>
           <div class="comparison-history" aria-labelledby="history-title">
             <h3 id="history-title">历史趋势与记录</h3>
-            <p class="footnote">仅连接比较条件标识完全相同、未过期的记录。不同条件分开显示，不可直接比较；条件标识缺失时不连线。</p>
+            <p class="footnote">仅连接比较条件标识相同、未过期的记录；标识不包含训练及推理配置，比较时请核对训练参数和试听条件。标识缺失时不连线。</p>
             <div id="metrics-history" aria-live="off"><p class="muted">正在读取历史记录…</p></div>
           </div>
         </section>

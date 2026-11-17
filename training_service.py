@@ -814,6 +814,38 @@ class TrainingService:
             evidence["inference_config_sha256"] = hashlib.sha256(canonical(validation["inference_config"]).encode()).hexdigest()
         return evidence
 
+    def dataset_summary(self, dataset_id):
+        """Pre-training review rollup so the workbench can show what will train."""
+        dataset = self.store.one("training_datasets", dataset_id)
+        segments = self.store.rows("training_segments", "dataset_id=?", (dataset_id,))
+        sources = self.store.rows("training_sources", "dataset_id=?", (dataset_id,))
+        approved = [s for s in segments if s["review_status"] == "approved" and s["transcript"].strip()]
+        pending = [s for s in segments if s["review_status"] == "pending"]
+        excluded = [s for s in segments if s["review_status"] == "excluded"]
+        seconds = sum(max(0.0, float(s["end"]) - float(s["start"])) for s in approved)
+        # Mirror create_job's split so the summary cannot promise a validation set
+        # that training would not build.
+        approved_sources = {s["source_id"] for s in approved}
+        independent = False
+        if len(approved_sources) > 1:
+            independent = True
+        elif len(approved) > 1 and any(
+                approved[i]["end"] + 3 <= approved[-1]["start"] for i in range(len(approved) - 1)):
+            independent = True
+        return {
+            "dataset_version": dataset["version"],
+            "speaker_confirmed": bool(dataset["speaker_confirmed"]),
+            "sources": len(sources),
+            "sources_pending": sum(1 for s in sources if s["status"] != "completed"),
+            "approved_segments": len(approved),
+            "approved_seconds": round(seconds, 2),
+            "pending_segments": len(pending),
+            "excluded_segments": len(excluded),
+            "independent_validation": independent,
+            "validation_warning": None if independent else "insufficient_independent_validation",
+            "ready": bool(dataset["speaker_confirmed"] and approved),
+        }
+
     def validation_view(self, job):
         validation = self._read_validation(job)
         if validation is None:
@@ -1222,6 +1254,10 @@ def training_router(service):
     @router.post("/jobs/{value}/metrics", status_code=202)
     def analyze_job(value: str):
         return service.submit_metrics("job", value)
+
+    @router.get("/datasets/{value}/summary")
+    def summary(value: str):
+        return service.dataset_summary(value)
 
     @router.get("/datasets/{value}/segments")
     def segments(value: str, offset: int = Query(0, ge=0), limit: int = Query(50, ge=1, le=200)):

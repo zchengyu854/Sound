@@ -965,6 +965,7 @@ class ChatService:
             pcm_chunks = []
             total_duration = 0.0
             synth_ms = 0.0
+            sentence_ms = []
             control.timings["first_audio_ms"] = None
             # Only this (model) thread owns the stage field; the I/O thread writes
             # timings only, so the two never overwrite each other.
@@ -989,9 +990,14 @@ class ChatService:
                     temp, check=control.check, on_pcm=emit_pcm)
                 # RTF must reflect model synthesis only, not time spent waiting on
                 # the network reader for the next sentence.
-                synth_ms += (time.monotonic() - synth_started) * 1000
+                spent = (time.monotonic() - synth_started) * 1000
+                synth_ms += spent
+                if len(sentence_ms) < 20:
+                    sentence_ms.append(round(spent, 1))
                 total_duration += float(part_duration or 0)
             control.timings["tts_ms"] = round(synth_ms, 3)
+            control.timings["sentence_ms"] = sentence_ms
+            control.timings["sentences"] = len(sentence_ms)
             control.timings["first_sentence_ms"] = llm_state["first_sentence_ms"]
             control.timings["first_body_ms"] = llm_state["first_body_ms"]
 
@@ -1252,6 +1258,12 @@ def create_app(directory=None, engine=None, reply=None, transcriber=None):
     @app.get("/api/voices")
     def voices():
         return service.rows("SELECT * FROM voices ORDER BY rowid DESC")
+
+    @app.get("/api/voices/{value}")
+    def voice(value: str):
+        # Used by the realtime page to validate a voice_id taken from the URL
+        # server-side, instead of trusting it in the browser.
+        return service.one("voices", value)
 
     @app.post("/api/voices", status_code=201)
     async def add_voice(name: str = Form(max_length=60), transcript: str = Form(max_length=2000), recording: UploadFile = File()):

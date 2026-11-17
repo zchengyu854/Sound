@@ -148,6 +148,14 @@ class VoiceAppTests(unittest.TestCase):
         client_class = httpx.AsyncClient
         return patch("voice_app.httpx.AsyncClient", side_effect=lambda **kwargs: client_class(transport=transport, **kwargs))
 
+    def test_single_voice_lookup_validates_identifier(self):
+        voice = self.voice()
+        found = self.client.get(f"/api/voices/{voice['id']}")
+        self.assertEqual(found.status_code, 200)
+        self.assertEqual(found.json()["id"], voice["id"])
+        self.assertEqual(self.client.get(f"/api/voices/{uuid4()}").status_code, 404)
+        self.assertEqual(self.client.get("/api/voices/not-a-uuid").status_code, 422)
+
     def test_idempotent_submission(self):
         conversation = self.conversation()
         endpoint = f"/api/conversations/{conversation['id']}/messages"

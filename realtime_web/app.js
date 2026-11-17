@@ -51,8 +51,14 @@
       if (!state.voices.length) select.append(new win.Option("还没有声音，请先在训练工作台发布", ""));
       for (const voice of state.voices) select.append(new win.Option(voice.name, voice.id));
       const urlVoice = new win.URL(win.location.href).searchParams.get("voice_id");
-      const match = state.voices.find(v => v.id === urlVoice);
-      select.value = match ? urlVoice : (state.voices[0]?.id || "");
+      let match = null;
+      if (urlVoice) {
+        // Validate the voice id from the URL on the server: a browser-only lookup
+        // would trust whatever id the link happens to carry.
+        try { match = await api(`voices/${encodeURIComponent(urlVoice)}`); } catch { match = null; }
+        if (!match) notice("链接中的声音不存在或已不可用，已改用可用声音。");
+      }
+      select.value = match ? match.id : (state.voices[0]?.id || "");
       state.voiceId = select.value;
       const start = $("start"); if (start) start.disabled = !state.voiceId;
       const name = $("voice-name"); if (name) name.textContent = match ? `${match.name} · 实时语音` : "本地语音 · 选择声音";
@@ -68,18 +74,24 @@
     }
 
     async function end() {
+      const active = state.activeMessageId;
       state.ended = true;
       stopListening();
       if (player) player.stop();
       clearTimeout(pollTimer);
+      if (active) {
+        // Release the model instead of leaving a reply running after the page ends.
+        try { await api(`messages/${active}/cancel`, json("POST", {})); } catch (_) {}
+      }
       $("stage").hidden = true; $("setup").hidden = false;
       $("start").disabled = false;
       setStatus("已结束对话");
     }
 
     // ---- capture + VAD ----
-    async function startListening() {
-      if (state.listening || state.playing || state.busy || state.ended) return;
+    async function startListening(options = {}) {
+      const barge = Boolean(options.barge);
+      if (state.listening || state.busy || state.ended || (state.playing && !barge)) return;
       const vad = new win.VoiceVad.VoiceVad();
       const context = new win.AudioContext();
       await context.resume();
@@ -92,23 +104,69 @@
       media.connect(node);
       const sink = context.createGain(); sink.gain.value = 0;
       node.connect(sink).connect(context.destination);
-      const current = {context, stream, node, media, vad, aborted: false};
+      const current = {context, stream, node, media, vad, aborted: false, barge, interrupted: false};
       capture = current;
       state.listening = true;
       const toggle = $("mic-toggle"); if (toggle) toggle.textContent = "暂停监听";
-      setStatus("正在听…");
+      if (!barge) setStatus("正在听…");
       node.port.onmessage = event => {
-        if (capture !== current || current.aborted || state.playing || state.busy) return;
+        if (capture !== current || current.aborted || state.busy) return;
+        if (state.playing && !current.barge) return;
         const result = current.vad.push(event.data);
-        if (result === "start") setStatus("正在听…（检测到说话）");
+        if (result === "start") {
+          if (state.playing && current.barge) void bargeIn(current);
+          else setStatus("正在听…（检测到说话）");
+        }
         if (result === "end" || result === "timeout") {
           const samples = current.vad.samples();
           const rate = current.context.sampleRate;
+          const interrupted = current.interrupted;
           stopListening();
-          if (samples && samples.length) void submitUtterance(samples, rate);
+          if (!samples || !samples.length) return;
+          if (interrupted) void finishBarge(samples, rate);
+          else void submitUtterance(samples, rate);
         }
       };
     }
+
+    // Barge-in: stop local playback immediately, cancel the running reply, keep
+    // capturing so the user's sentence is not lost.
+    async function bargeIn(current) {
+      if (current.interrupted) return;
+      current.interrupted = true;
+      setStatus("检测到开口，正在停止播放…");
+      stopPlayback();
+      const active = state.activeMessageId;
+      if (active) {
+        try { await api(`messages/${active}/cancel`, json("POST", {})); } catch (_) {}
+      }
+      if (!state.ended) setStatus("正在打断…（说完会继续）");
+    }
+
+    async function finishBarge(samples, rate) {
+      state.busy = true;
+      setStatus("等待模型释放…");
+      try {
+        if (!(await waitIdle())) { setStatus("模型仍被占用，请稍后再试"); return; }
+        await submitUtterance(samples, rate);
+      } finally {
+        state.busy = false;
+      }
+    }
+
+    // Poll health until the previous task really released the model; transcription
+    // shares the same gate, so submitting too early would only fail.
+    async function waitIdle(attempts = 40) {
+      for (let index = 0; index < attempts; index++) {
+        try {
+          const health = await api("health");
+          if (!health.busy) return true;
+        } catch (_) { /* transient read failure: keep waiting */ }
+        await new Promise(resolve => win.setTimeout(resolve, 300));
+      }
+      return false;
+    }
+
 
     function stopListening() {
       const current = capture; capture = null; state.listening = false;
@@ -157,11 +215,13 @@
     // ---- send + SSE + playback ----
     async function send(text, round) {
       state.round = round;
+      state.interrupted = false;
       const key = uuid();
       setStatus("正在回复…");
       const created = await api(`conversations/${state.conversationId}/messages`,
         json("POST", {content: text, mode: "realtime"}, {"Idempotency-Key": key}));
       const messageId = created.id;
+      state.activeMessageId = messageId;
       const row = message("assistant", "", messageId);
       await follow(messageId, created.attempt || 1, row, round);
     }
@@ -183,7 +243,8 @@
             void playAudio(messageId, data.attempt || attempt, round);
           }
           if (!ACTIVE.has(data.status)) {
-            if (data.status === "interrupted") stopPlayback();
+            if (state.activeMessageId === messageId) state.activeMessageId = "";
+            if (data.status === "interrupted") { state.interrupted = true; stopPlayback(); }
             finish();
             if (!started) void afterReply(messageId, data.attempt || attempt, data.status, round);
           }
@@ -223,11 +284,18 @@
         const stop = $("stop-play"); if (stop) stop.hidden = false;
         player = new win.VoiceAudio.Player(() => {}, error => { if (error) setStatus(error); });
         player.play(messageId, attempt).then(() => finish()).catch(() => finish());
+        // Keep the microphone on while playing so the user can interrupt mid-reply.
+        void startListening({barge: true}).catch(() => {});
         function finish() {
           if (round !== state.round) { resolve(); return; }
           state.playing = false; player = null;
           const stop2 = $("stop-play"); if (stop2) stop2.hidden = true;
-          setStatus(state.ended ? "已结束对话" : "播放结束 · 点击监听继续");
+          if (state.interrupted) {
+            state.interrupted = false;
+            setStatus("本轮已打断，可以继续说");
+          } else {
+            setStatus(state.ended ? "已结束对话" : "播放结束 · 点击监听继续");
+          }
           resolve();
         }
       });

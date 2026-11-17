@@ -390,6 +390,48 @@ class TrainingServiceTests(unittest.TestCase):
         published = self.client.post(f"/api/training/jobs/{job['id']}/publish", json={"name": "已试听"})
         self.assertEqual(published.status_code, 201, published.text)
 
+    def test_dataset_summary_reports_review_rollup(self):
+        dataset, segment_id = self.approved()
+        service = self.service
+        second = str(uuid4())
+        source = service.store.rows("training_sources", "dataset_id=?", (dataset["id"],))[0]
+        service.store.add_segment(dataset["id"], source["id"], second, 4, 7, "待审核原文。")
+        summary = self.client.get(f"/api/training/datasets/{dataset['id']}/summary").json()
+        self.assertEqual(summary["approved_segments"], 1)
+        self.assertEqual(summary["pending_segments"], 1)
+        self.assertEqual(summary["approved_seconds"], 3)
+        self.assertTrue(summary["ready"])
+        self.assertEqual(summary["sources"], 1)
+        self.assertEqual(summary["sources_pending"], 0)
+        self.assertFalse(summary["independent_validation"])
+        self.assertEqual(summary["validation_warning"], "insufficient_independent_validation")
+        service.store.edit_segment(segment_id, review_status="excluded")
+        summary = self.client.get(f"/api/training/datasets/{dataset['id']}/summary").json()
+        self.assertEqual(summary["approved_segments"], 0)
+        self.assertEqual(summary["excluded_segments"], 1)
+        self.assertFalse(summary["ready"])
+
+    def test_dataset_summary_marks_independent_validation_across_sources(self):
+        dataset, _ = self.approved()
+        service = self.service
+        source_id, segment_id = str(uuid4()), str(uuid4())
+        service.store.add_source(dataset["id"], source_id, "wav", 200, {"duration": 3})
+        service.store.update("training_sources", source_id, status="completed")
+        folder = service.store.dataset_dir(dataset["id"]) / "segments"
+        folder.mkdir(parents=True, exist_ok=True)
+        (folder / f"{segment_id}.wav").write_bytes(wav_bytes())
+        service.store.add_segment(dataset["id"], source_id, segment_id, 0, 3, "第二来源。")
+        service.store.edit_segment(segment_id, review_status="approved")
+        summary = self.client.get(f"/api/training/datasets/{dataset['id']}/summary").json()
+        self.assertEqual(summary["approved_segments"], 2)
+        self.assertEqual(summary["sources"], 2)
+        self.assertTrue(summary["independent_validation"])
+        self.assertIsNone(summary["validation_warning"])
+
+    def test_dataset_summary_rejects_unknown_dataset(self):
+        self.assertEqual(self.client.get(f"/api/training/datasets/{uuid4()}/summary").status_code, 404)
+        self.assertEqual(self.client.get("/api/training/datasets/not-a-uuid/summary").status_code, 422)
+
     def test_training_preview_generates_greeting_even_when_in_training_data(self):
         dataset, segment_id = self.approved()
         self.service.store.edit_segment(segment_id, transcript="你好，好久不见。今天天气不错，我们周末去公园走走吧。", review_status="approved")
