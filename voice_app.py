@@ -380,13 +380,14 @@ class ChatService:
                     id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL REFERENCES conversations(id),
                     role TEXT NOT NULL, content TEXT NOT NULL DEFAULT '', reasoning TEXT NOT NULL DEFAULT '', status TEXT NOT NULL,
                     reply_to TEXT REFERENCES messages(id), error TEXT, warning TEXT NOT NULL DEFAULT '',
-                    duration REAL, created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')));
+                    duration REAL, text_finalized INTEGER NOT NULL DEFAULT 0,
+                    created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')));
                 CREATE INDEX IF NOT EXISTS message_conversation ON messages(conversation_id);
             """)
             columns = {row[1] for row in db.execute("PRAGMA table_info(messages)")}
             additions = {"reasoning": "TEXT NOT NULL DEFAULT ''", "request_key": "TEXT", "error_code": "TEXT", "attempt": "INTEGER NOT NULL DEFAULT 0",
                          "started_at": "TEXT", "finished_at": "TEXT", "timings": "TEXT NOT NULL DEFAULT '{}'",
-                         "mode": "TEXT NOT NULL DEFAULT 'standard'"}
+                         "mode": "TEXT NOT NULL DEFAULT 'standard'", "text_finalized": "INTEGER NOT NULL DEFAULT 0"}
             missing = {key: value for key, value in additions.items() if key not in columns}
             if missing:
                 backup = self.directory / f"before-tasks-{uuid4()}.sqlite3"
@@ -396,11 +397,13 @@ class ChatService:
                 for key, declaration in missing.items():
                     db.execute(f"ALTER TABLE messages ADD COLUMN {key} {declaration}")
                 db.execute("CREATE UNIQUE INDEX IF NOT EXISTS message_request_key ON messages(conversation_id,request_key)")
+                db.execute("""UPDATE messages SET text_finalized=1 WHERE text_finalized=0 AND (
+                    status='complete' OR (mode='standard' AND status='audio_failed' AND content!=''))""")
                 db.commit()
             self.characters.migrate(db)
             db.execute("UPDATE characters SET memory_status='failed',memory_error='上次提炼因退出中断，请手动重试。' WHERE memory_status='updating'")
-            db.execute("""UPDATE messages SET status=CASE WHEN content='' THEN 'text_failed'
-                ELSE 'audio_failed' END, error_code='interrupted', finished_at=strftime('%Y-%m-%dT%H:%M:%fZ','now'), error='上次生成因应用退出而中断，请重试。'
+            db.execute("""UPDATE messages SET status=CASE WHEN text_finalized=1 AND content!='' THEN 'audio_failed'
+                ELSE 'text_failed' END, error_code='interrupted', finished_at=strftime('%Y-%m-%dT%H:%M:%fZ','now'), error='上次生成因应用退出而中断，请重试。'
                 WHERE status IN ('queued','thinking','replying','synthesizing')""")
         for folder in (self.audio, self.recordings):
             for temp in folder.glob("*.tmp"):
@@ -535,6 +538,15 @@ class ChatService:
             db.execute(f"UPDATE messages SET {','.join(k+'=?' for k in fields)} WHERE id=?",
                        (*fields.values(), value))
 
+    def update_if(self, value, attempt, statuses, **fields):
+        with closing(self.connect()) as db, db:
+            assignments = ",".join(f"{key}=?" for key in fields)
+            placeholders = ",".join("?" for _ in statuses)
+            return db.execute(
+                f"UPDATE messages SET {assignments} WHERE id=? AND attempt=? AND status IN ({placeholders})",
+                (*fields.values(), value, attempt, *statuses),
+            ).rowcount
+
     def reserve(self, text_needed):
         self.check_training_busy()
         if not self.accepting_tasks:
@@ -594,7 +606,7 @@ class ChatService:
         message = self.one("messages", value)
         if message["role"] != "assistant" or message["status"] not in ("text_failed", "audio_failed"):
             raise HTTPException(409, "只有失败的回复可以重试。")
-        text_needed = message["status"] == "text_failed"
+        text_needed = message["status"] == "text_failed" or not message["text_finalized"]
         self.reserve(text_needed)
         try:
             message = self.one("messages", value)
@@ -624,7 +636,8 @@ class ChatService:
         try:
             control.attempt = self.one("messages", value)["attempt"] + 1
             self.update(value, status="queued", error=None, error_code=None, attempt=control.attempt,
-                        started_at=timestamp(), finished_at=None, timings="{}")
+                        started_at=timestamp(), finished_at=None, timings="{}",
+                        text_finalized=0 if text_needed else 1)
             task = self.one("messages", value)
             mode = task.get("mode") or "standard"
             runner = self.realtime_run if mode == "realtime" else self.run
@@ -664,7 +677,8 @@ class ChatService:
                         fields.update(status="interrupted", error_code="interrupted",
                                       error="本轮已被打断。")
                     else:
-                        text_failed = control.stage in ("dispatch", "llm") or not task["content"]
+                        text_failed = (control.stage in ("dispatch", "llm") or not task["content"]
+                                       or not task["text_finalized"])
                         code = code or ("text_generation_failed" if text_failed else "audio_generation_failed")
                         fields.update(status="text_failed" if text_failed else "audio_failed", error_code=code,
                                       error={"cancelled": "任务已取消，可以重试。", "timeout": "任务已超时，可以重试。",
@@ -753,7 +767,8 @@ class ChatService:
     def history(self, task):
         pairs = self.rows("""SELECT u.content AS question, a.content AS answer FROM messages a
             JOIN messages u ON a.reply_to=u.id WHERE a.conversation_id=? AND a.content!=''
-            AND a.status IN ('complete','audio_failed') AND a.rowid < (SELECT rowid FROM messages WHERE id=?)
+            AND a.status IN ('complete','audio_failed') AND a.text_finalized=1
+            AND a.rowid < (SELECT rowid FROM messages WHERE id=?)
             ORDER BY a.rowid DESC LIMIT 10""", (task["conversation_id"], task["id"]))
         rules = ("这是日常聊天，不是写文章或提供客服报告。每次只回1至3句，通常30至80个汉字，总计不得超过100字。整条回复只有一个自然段。"
                  "先接住对方刚说的话，再表达一个具体想法；允许有自己的看法，不一味附和。"
@@ -936,7 +951,8 @@ class ChatService:
             if kind == "reasoning":
                 if delta:
                     llm_state["reasoning"] += delta
-                    self.update(value, reasoning=llm_state["reasoning"][:4000])
+                    self.update_if(value, control.attempt, ACTIVE,
+                                   reasoning=llm_state["reasoning"][:4000])
                 return
             if not delta:
                 return
@@ -948,26 +964,44 @@ class ChatService:
                     llm_state["first_sentence_ms"] = round((time.monotonic() - control.started) * 1000, 3)
             # Throttled content update so SSE shows growing text.
             if len(llm_state["text"]) % 8 == 0 or len(llm_state["text"]) < 8:
-                self.update(value, content=llm_state["text"][:4000], status="replying")
+                fields = {"content": llm_state["text"][:4000]}
+                if self.live_audio is None:
+                    fields["status"] = "replying"
+                self.update_if(value, control.attempt, ACTIVE, **fields)
 
         def llm_job():
             started = time.monotonic()
+            succeeded = False
             try:
                 control.check()
-                history = self.history(self.one("messages", value))
-                if self.streaming:
-                    text, warning, reasoning = self.stream_reply(history, llm_emit)
-                else:
-                    text, warning = self.reply(history)
-                    reasoning = ""
-                    for sentence in splitter.feed(text):
-                        if sentence:
-                            segments.put(sentence)
-                    llm_state["text"] = text
+                if text_needed:
+                    history = self.history(self.one("messages", value))
+                    source = None
+                    if self.streaming:
+                        text, warning, reasoning = self.stream_reply(history, llm_emit)
+                    else:
+                        text, warning = self.reply(history)
+                        reasoning = ""
+                    llm_state["text"] = clean_text(text, 4000, "回复")
+                    llm_state["warning"] = warning
                     llm_state["reasoning"] = reasoning
-                llm_state["text"] = clean_text(text, 4000, "回复")
-                llm_state["warning"] = warning
-                llm_state["reasoning"] = reasoning
+                    self.update_if(value, control.attempt, ACTIVE,
+                                   content=llm_state["text"][:4000],
+                                   reasoning=reasoning[:4000], warning=warning,
+                                   text_finalized=1)
+                    if not self.streaming:
+                        source = llm_state["text"]
+                else:
+                    task = self.one("messages", value)
+                    llm_state["text"] = task["content"]
+                    llm_state["reasoning"] = task["reasoning"]
+                    llm_state["warning"] = task["warning"]
+                    source = task["content"]
+                if source:
+                    for sentence in splitter.feed(source):
+                        if sentence and segments.put(sentence) and llm_state["first_sentence_ms"] is None:
+                            llm_state["first_sentence_ms"] = round((time.monotonic() - control.started) * 1000, 3)
+                succeeded = True
             except BaseException as error:
                 llm_state["error"] = error
             finally:
@@ -976,20 +1010,26 @@ class ChatService:
                 if tail and llm_state["error"] is None:
                     segments.put(tail)
                 segments.finish()
-                self.update(value, content=llm_state["text"][:4000],
-                            reasoning=llm_state["reasoning"][:4000])
+                fields = {"content": llm_state["text"][:4000],
+                          "reasoning": llm_state["reasoning"][:4000]}
+                if succeeded:
+                    fields.update(warning=llm_state["warning"], text_finalized=1)
+                self.update_if(value, control.attempt, ACTIVE, **fields)
 
         try:
             control.check()
             target = self.path(self.audio, value)
             temp = target.with_suffix(".tmp")
-            self.update(value, status="thinking", content="", reasoning="", warning="")
+            if text_needed:
+                self.update(value, status="thinking", content="", reasoning="",
+                            warning="", text_finalized=0)
+            else:
+                self.update(value, status="thinking")
             llm_future = self.io_worker.submit(llm_job)
 
             live = PCMBuffer(control.attempt, self.engine.sample_rate)
             self.live_audio = live
             self.update(value, status="synthesizing")
-            task = self.one("messages", value)
             voice = self.one("voices", voice_id)
             if voice.get("model_id"):
                 self.training.store.one("voice_models", voice["model_id"])
@@ -1060,7 +1100,8 @@ class ChatService:
                 temp.replace(target)
                 try:
                     self.update(value, status="complete", duration=duration, error=None,
-                                warning=" ".join(filter(None, (task["warning"], llm_state["warning"]))))
+                                warning=llm_state["warning"],
+                                text_finalized=1)
                 except BaseException:
                     target.unlink(missing_ok=True)
                     raise
@@ -1080,7 +1121,8 @@ class ChatService:
             temp = target.with_suffix(".tmp")
             task = self.one("messages", value)
             if text_needed:
-                self.update(value, status="thinking", content="", reasoning="", warning="")
+                self.update(value, status="thinking", content="", reasoning="",
+                            warning="", text_finalized=0)
                 with control.measure("llm"):
                     history = self.history(task)
                     if self.streaming:
@@ -1090,7 +1132,8 @@ class ChatService:
                         reasoning = ""
                     text = clean_text(text, 4000, "回复")
                     control.check()
-                self.update(value, content=text, reasoning=reasoning, warning=warning)
+                self.update_if(value, control.attempt, ACTIVE, content=text,
+                               reasoning=reasoning, warning=warning, text_finalized=1)
                 self.characters.note(value)
             live = PCMBuffer(control.attempt, self.engine.sample_rate)
             self.live_audio = live
@@ -1119,7 +1162,8 @@ class ChatService:
                 temp.replace(target)
                 try:
                     self.update(value, status="complete", duration=duration, error=None,
-                                warning=" ".join(filter(None, (task["warning"], warning))))
+                                warning=" ".join(filter(None, (task["warning"], warning))),
+                                text_finalized=1)
                 except BaseException:
                     target.unlink(missing_ok=True)
                     raise

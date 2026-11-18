@@ -56,6 +56,12 @@ def transcription_audio(data):
         raise HTTPException(422, "请上传完整的 16kHz、单声道、PCM16 WAV。") from None
 
 
+class UnreliableTranscript(HTTPException):
+    def __init__(self, text):
+        super().__init__(422, "识别结果不可靠，请靠近麦克风、在安静环境重新录制。")
+        self.text = text
+
+
 class Whisper:
     def load(self):
         from mlx_audio.stt.utils import load_model
@@ -77,7 +83,7 @@ class Whisper:
         if segments and all(segment.get("no_speech_prob", 0) > 0.6 for segment in segments):
             return ""
         if any(segment.get("compression_ratio", 0) > 2.4 or segment.get("avg_logprob", 0) < -1 for segment in segments):
-            raise HTTPException(422, "识别结果不可靠，请靠近麦克风、在安静环境重新录制。")
+            raise UnreliableTranscript(result.text)
         return result.text
 
     def close(self):

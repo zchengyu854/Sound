@@ -15,7 +15,7 @@ import wave
 from fastapi import HTTPException, UploadFile
 from fastapi.testclient import TestClient
 
-from audio_runtime import PCMBuffer, Whisper, MAX_TRANSCRIPTION, transcription_audio
+from audio_runtime import PCMBuffer, UnreliableTranscript, Whisper, MAX_TRANSCRIPTION, transcription_audio
 from test_voice_app import Engine, Transcriber, create_app, wav_bytes
 
 
@@ -200,13 +200,14 @@ class AudioTests(unittest.TestCase):
             self.assertNotIn("private payload", response.text)
         self.assertFalse(self.service.gate.locked())
 
-    def test_whisper_rejects_unreliable_output(self):
+    def test_whisper_marks_unreliable_output(self):
         engine = Whisper()
         engine.model = SimpleNamespace(generate=lambda *args, **kwargs: SimpleNamespace(
             text="字幕字幕字幕", segments=[{"no_speech_prob": 0.1, "compression_ratio": 4.4, "avg_logprob": -0.2}]))
-        with self.assertRaises(HTTPException) as error:
+        with self.assertRaises(UnreliableTranscript) as error:
             engine.transcribe(b"\x01\x00" * 16000)
         self.assertEqual(error.exception.status_code, 422)
+        self.assertEqual(error.exception.text, "字幕字幕字幕")
         engine.model = SimpleNamespace(generate=lambda *args, **kwargs: SimpleNamespace(
             text="你好", segments=[{"no_speech_prob": 0.1, "compression_ratio": 1.0, "avg_logprob": -0.2}]))
         self.assertEqual(engine.transcribe(b"\x01\x00" * 16000), "你好")

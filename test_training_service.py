@@ -19,6 +19,7 @@ from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from test_voice_app import Engine, Transcriber, wav_bytes
+from audio_runtime import UnreliableTranscript
 from training_service import (TrainingConfig, TrainingService, PreviewInput, Cancelled, canonical,
                               deterministic_order, select_preview_texts, training_summary)
 from voice_app import create_app
@@ -592,6 +593,23 @@ class TrainingServiceTests(unittest.TestCase):
         self.assertEqual(audio.status_code, 200)
         with wave.open(io.BytesIO(audio.content)) as wav:
             self.assertEqual((wav.getframerate(), wav.getnchannels(), wav.getsampwidth()), (24000, 1, 2))
+
+    @unittest.skipUnless(shutil.which("ffmpeg") and shutil.which("ffprobe"), "FFmpeg required")
+    def test_unreliable_transcript_stays_for_review(self):
+        path = Path(self.temp.name) / "source.mp3"
+        subprocess.run(["ffmpeg", "-nostdin", "-v", "error", "-f", "lavfi", "-i", "sine=frequency=240:duration=4", str(path)], check=True)
+        dataset = self.dataset()
+        upload = self.client.post(f"/api/training/datasets/{dataset['id']}/sources",
+                                 files={"source": ("source.mp3", path.read_bytes(), "audio/mpeg")})
+        self.assertEqual(upload.status_code, 201, upload.text)
+        with patch.object(self.chat.transcriber, "transcribe", side_effect=UnreliableTranscript("测试歌词")):
+            result = self.client.post(f"/api/training/datasets/{dataset['id']}/prepare")
+            self.assertEqual(result.status_code, 202, result.text)
+            self.wait(lambda: self.service.control is None)
+        segment = self.client.get(f"/api/training/datasets/{dataset['id']}/segments").json()[0]
+        self.assertEqual(segment["transcript"], "测试歌词")
+        self.assertIn("low_confidence_transcript", segment["quality_hints"])
+        self.assertNotIn("transcription_failed_edit_required", segment["quality_hints"])
 
 
     def test_busy_check_reads_control_once_when_job_finishes(self):

@@ -375,12 +375,18 @@ class VoiceAppTests(unittest.TestCase):
 
     def test_old_database_migration_and_backup(self):
         voice = self.voice()
-        task = self.finished(self.send(self.conversation(voice)))
+        conversation = self.conversation(voice)
+        task = self.finished(self.send(conversation))
+        self.engine.fail = True
+        failed = self.finished(self.send(conversation))
+        self.engine.fail = False
+        self.assertEqual(failed["status"], "audio_failed")
         old = Path(self.temp.name)/"old"
         shutil.copytree(self.directory, old)
         db = sqlite3.connect(old/"chat.sqlite3")
         db.execute("DROP INDEX message_request_key")
-        for column in ("reasoning", "request_key", "error_code", "attempt", "started_at", "finished_at", "timings"):
+        for column in ("reasoning", "request_key", "error_code", "attempt", "started_at", "finished_at",
+                       "timings", "text_finalized"):
             db.execute(f"ALTER TABLE messages DROP COLUMN {column}")
         db.commit()
         db.close()
@@ -391,12 +397,15 @@ class VoiceAppTests(unittest.TestCase):
             self.assertEqual(client.get(f"/api/messages/{task['id']}").json()["content"], task["content"])
             self.assertEqual(client.get(f"/api/audio/{task['id']}").status_code, 200)
             self.assertEqual(client.get("/api/voices").json()[0]["id"], voice["id"])
+            self.assertEqual(client.get(f"/api/messages/{task['id']}").json()["text_finalized"], 1)
+            self.assertEqual(client.get(f"/api/messages/{failed['id']}").json()["text_finalized"], 1)
         backups = list(old.glob("before-tasks-*.sqlite3"))
         self.assertEqual(len(backups), 1)
         with closing(sqlite3.connect(backups[0])) as backup:
             columns = {r[1] for r in backup.execute("PRAGMA table_info(messages)")}
             self.assertNotIn("attempt", columns)
             self.assertNotIn("reasoning", columns)
+            self.assertNotIn("text_finalized", columns)
         with TestClient(create_app(old, Engine(), self.reply), base_url="http://127.0.0.1"):
             pass
         self.assertEqual(len(list(old.glob("before-tasks-*.sqlite3"))), 1)
@@ -442,7 +451,7 @@ class VoiceAppTests(unittest.TestCase):
         old = Path(self.temp.name)/"rollback"
         shutil.copytree(self.directory, old)
         with closing(sqlite3.connect(old/"chat.sqlite3")) as db:
-            for column in ("error_code", "attempt", "started_at", "finished_at", "timings"):
+            for column in ("error_code", "attempt", "started_at", "finished_at", "timings", "text_finalized"):
                 db.execute(f"ALTER TABLE messages DROP COLUMN {column}")
             db.commit()
         app = create_app(old, Engine(), self.reply)
@@ -1060,13 +1069,41 @@ class RealtimeMessageTests(unittest.TestCase):
         self.assertEqual(self.send_mode(conversation, key=key)["id"], first["id"])
         self.finished(first)
 
+    def test_slow_synthesis_does_not_drop_sentences(self):
+        conversation = self.conversation()
+        entered, release = threading.Event(), threading.Event()
+        self.addCleanup(release.set)
+        original = self.engine.synthesize
+        first = [True]
+
+        def blocked(*args, **kwargs):
+            if first[0]:
+                first[0] = False
+                entered.set()
+                release.wait(3)
+            return original(*args, **kwargs)
+
+        text = "".join(f"第{i}句。" for i in range(1, 10))
+        with patch.object(self.engine, "synthesize", blocked), \
+                patch.object(self.app.state.service, "reply", return_value=(text, "")):
+            task = self.send_mode(conversation)
+            self.assertTrue(entered.wait(3))
+            time.sleep(.1)
+            release.set()
+            done = self.finished(task)
+        self.assertEqual(done["status"], "complete")
+        self.assertEqual([call[0] for call in self.engine.calls],
+                         [f"第{i}句。" for i in range(1, 10)])
+
     def test_realtime_barge_in_produces_interrupted_and_allows_next(self):
         conversation = self.conversation()
         self.reply_started.clear()
         gate = threading.Event()
+        returned = threading.Event()
         def slow_reply(history):
             self.reply_started.set()
             gate.wait(5)
+            returned.set()
             return "不会播出的回复。", ""
         with patch.object(self.app.state.service, "reply", side_effect=slow_reply):
             first = self.send_mode(conversation)
@@ -1076,6 +1113,12 @@ class RealtimeMessageTests(unittest.TestCase):
             detail = self.client.get(f"/api/messages/{first['id']}").json()
             self.assertEqual(detail["error_code"], "interrupted")
             gate.set()
+            self.assertTrue(returned.wait(3))
+            for _ in range(30):
+                current = self.client.get(f"/api/messages/{first['id']}").json()
+                self.assertEqual((current["status"], current["content"]),
+                                 (detail["status"], detail["content"]))
+                time.sleep(.01)
             self.wait_for(lambda: not self.client.get("/api/health").json()["busy"])
         with patch.object(self.app.state.service, "reply", return_value=("新一轮回复。", "")):
             second = self.send_mode(conversation, content="重新开始")
@@ -1111,6 +1154,28 @@ class RealtimeMessageTests(unittest.TestCase):
         with patch.object(self.app.state.service, "reply", return_value=("重新开始。", "")):
             second = self.send_mode(conversation, content="再来一次")
             self.assertEqual(self.finished(second)["status"], "complete")
+
+    def test_realtime_audio_retry_reuses_finalized_text(self):
+        conversation = self.conversation()
+        calls = []
+
+        def reply(history):
+            calls.append(history)
+            return f"第{len(calls)}次正文。", ""
+
+        self.engine.fail = True
+        with patch.object(self.app.state.service, "reply", side_effect=reply):
+            task = self.send_mode(conversation)
+            done = self.finished(task)
+            self.assertEqual(done["status"], "audio_failed")
+            self.assertEqual(done["content"], "第1次正文。")
+            self.engine.fail = False
+            self.assertEqual(self.client.post(f"/api/messages/{task['id']}/retry").status_code, 202)
+            done = self.finished(task)
+        self.assertEqual(done["status"], "complete")
+        self.assertEqual(done["content"], "第1次正文。")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual({call[0] for call in self.engine.calls}, {"第1次正文。"})
 
     def test_invalid_mode_rejected(self):
         conversation = self.conversation()

@@ -35,13 +35,24 @@ class RealtimeRuntimeTests(unittest.TestCase):
         self.assertEqual(splitter.flush(), "未完")
         self.assertEqual(splitter.flush(), "")
 
-    def test_bounded_queue_applies_backpressure(self):
+    def test_bounded_queue_waits_for_space_instead_of_dropping(self):
         queue = BoundedSegments(maxsize=2)
         self.assertTrue(queue.put("一"))
         self.assertTrue(queue.put("二"))
-        self.assertFalse(queue.put("三"))
+        started, result = threading.Event(), []
+
+        def producer():
+            started.set()
+            result.append(queue.put("三"))
+
+        thread = threading.Thread(target=producer, daemon=True)
+        thread.start()
+        self.assertTrue(started.wait(1))
+        time.sleep(0.05)
+        self.assertTrue(thread.is_alive())
         self.assertEqual(queue.get(0.05), "一")
-        self.assertTrue(queue.put("三"))
+        thread.join(1)
+        self.assertEqual(result, [True])
         queue.finish()
         self.assertEqual(queue.get(0.05), "二")
         self.assertEqual(queue.get(0.05), "三")
@@ -49,9 +60,22 @@ class RealtimeRuntimeTests(unittest.TestCase):
 
     def test_queue_close_discards_and_unblocks(self):
         queue = BoundedSegments(maxsize=1)
-        queue.put("x")
+        self.assertTrue(queue.put("x"))
+        started, result = threading.Event(), []
+
+        def producer():
+            started.set()
+            result.append(queue.put("y"))
+
+        thread = threading.Thread(target=producer, daemon=True)
+        thread.start()
+        self.assertTrue(started.wait(1))
+        time.sleep(0.05)
+        self.assertTrue(thread.is_alive())
         queue.close()
+        thread.join(1)
         self.assertIsNone(queue.get(0.05))
+        self.assertEqual(result, [False])
         self.assertFalse(queue.put("y"))
 
     def test_queue_get_waits_for_item_then_finish(self):

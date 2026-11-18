@@ -9,8 +9,15 @@ const state = {
   listSignature: "", voiceSignature: "", online: false, pinned: true, stopping: null
 };
 const mobileQuery = matchMedia("(max-width: 900px)");
+// Adaptive polling: fast while work is in flight, slow when idle, paused while hidden.
+const POLL_ACTIVE = 1200;
+const POLL_IDLE = 4000;
+const POLL_OFFLINE = 6000;
 let renderFrame = 0;
+let healthFrame = 0;
 let toastTimer;
+let pollTimer = 0;
+let polling = false;
 const player = new VoiceAudio.Player(updatePlayback, toast);
 const recorder = new VoiceRecorder(renderHealth, text => {
   if (!state.current || $("message-input").value) return;
@@ -82,6 +89,21 @@ function setView(view) {
 function scheduleRender() {
   if (renderFrame) return;
   renderFrame = requestAnimationFrame(() => { renderFrame = 0; renderMessages(); });
+}
+function scheduleHealth() {
+  if (healthFrame) return;
+  healthFrame = requestAnimationFrame(() => { healthFrame = 0; renderHealth(); });
+}
+function hashText(value) {
+  const text = typeof value === "string" ? value : "";
+  let hash = 0;
+  for (let index = 0; index < text.length; index++) hash = (hash * 31 + text.charCodeAt(index)) | 0;
+  return hash;
+}
+function messageSignature(message) {
+  return [message.id, message.status, message.attempt ?? "", message.duration ?? "",
+    hashText(message.content), hashText(message.reasoning), hashText(message.warning), hashText(message.error),
+    state.thinking.get(message.id) ? 1 : 0].join("|");
 }
 function autosizeInput() {
   const input = $("message-input");
@@ -184,7 +206,7 @@ function thinkingBlock(message) {
   head.append(chev);
   head.addEventListener("click", () => {
     state.pinned = false;
-    state.thinking.set(message.id, !open);
+    state.thinking.set(message.id, !(state.thinking.get(message.id) ?? false));
     state.signatures.delete(message.id);
     renderMessages();
   });
@@ -193,6 +215,34 @@ function thinkingBlock(message) {
   body.append(copy);
   box.append(head, body);
   return box;
+}
+
+function replyParagraphs(content) {
+  const paragraphs = [];
+  for (const block of VoiceReply.blocks(content)) {
+    const paragraph = node("p", "reply-paragraph");
+    for (const token of VoiceReply.tokens(block)) paragraph.append(node(token.strong ? "strong" : "span", "", token.text));
+    paragraphs.push(paragraph);
+  }
+  return paragraphs;
+}
+function replyCard(content) {
+  const card = node("div", "reply-card");
+  card.dataset.contentHash = String(hashText(content));
+  card.append(...replyParagraphs(content));
+  return card;
+}
+function streamPreview(message) {
+  const preview = node("button", "stream-preview", player.playing(message.id) ? "停止试听" : "试听生成中的语音");
+  preview.type = "button";
+  preview.dataset.streamId = message.id;
+  preview.disabled = !(window.AudioContext && window.ReadableStream);
+  preview.addEventListener("click", () => {
+    if (player.playing(message.id)) { player.stop(); return; }
+    pauseAudio();
+    player.play(message.id, message.attempt);
+  });
+  return preview;
 }
 
 function renderMessage(message) {
@@ -205,15 +255,7 @@ function renderMessage(message) {
   if (!user && message.reasoning) body.append(thinkingBlock(message));
   if (message.content) {
     if (user) body.append(node("div", "bubble", message.content));
-    else {
-      const card = node("div", "reply-card");
-      for (const block of VoiceReply.blocks(message.content)) {
-        const paragraph = node("p", "reply-paragraph");
-        for (const token of VoiceReply.tokens(block)) paragraph.append(node(token.strong ? "strong" : "span", "", token.text));
-        card.append(paragraph);
-      }
-      body.append(card);
-    }
+    else body.append(replyCard(message.content));
   }
   if (ACTIVE.has(message.status)) {
     const labels = {queued: "等待处理…", thinking: "正在思考…", replying: "正在回复…", synthesizing: "正在合成语音…"};
@@ -237,16 +279,7 @@ function renderMessage(message) {
   }
   if (message.warning) body.append(node("p", "message-warning", message.warning));
   if (!user && (message.status === "synthesizing" || player.playing(message.id))) {
-    const preview = node("button", "stream-preview", player.playing(message.id) ? "停止试听" : "试听生成中的语音");
-    preview.type = "button";
-    preview.dataset.streamId = message.id;
-    preview.disabled = !(window.AudioContext && window.ReadableStream);
-    preview.addEventListener("click", () => {
-      if (player.playing(message.id)) { player.stop(); return; }
-      pauseAudio();
-      player.play(message.id, message.attempt);
-    });
-    body.append(preview);
+    body.append(streamPreview(message));
   }
   if (!user && message.status === "complete") {
     const card = node("div", "voice-card"), header = node("div", "voice-card-header");
@@ -269,7 +302,76 @@ function renderMessage(message) {
     body.append(card);
   }
   article.append(node("span", "avatar", user ? "我" : voiceName().slice(0, 1)), body);
+  article.dataset.status = message.status;
   return article;
+}
+
+function canPatchMessage(article, message) {
+  return ACTIVE.has(article.dataset.status) && ACTIVE.has(message.status);
+}
+function patchThinking(article, message) {
+  const block = article.querySelector(".thinking");
+  if (!message.reasoning) return !block;
+  if (!block) return false;
+  const open = state.thinking.get(message.id) ?? false;
+  const live = ACTIVE.has(message.status);
+  block.dataset.open = String(open);
+  block.dataset.live = String(live);
+  const head = block.querySelector(".thinking-head");
+  const copy = block.querySelector(".thinking-body p");
+  if (!head || !copy) return false;
+  head.setAttribute("aria-expanded", String(open));
+  head.setAttribute("aria-label", open ? "收起思考过程" : "展开思考过程");
+  const label = head.querySelector(".thinking-label"), hint = head.querySelector(".thinking-hint");
+  if (label) label.textContent = live ? "THINKING" : "THINKING · DONE";
+  if (hint) hint.textContent = open ? "收起" : "展开";
+  if (copy.textContent !== message.reasoning) copy.textContent = message.reasoning;
+  return true;
+}
+// Repaint one streaming message in place; rebuilding the whole article on
+// every token would drop focus and recreate controls dozens of times a second.
+function patchMessage(article, message) {
+  const body = article.querySelector(".message-body");
+  if (!body || !patchThinking(article, message)) return false;
+  const user = message.role === "user";
+  if (message.content) {
+    if (user) {
+      const bubble = body.querySelector(".bubble");
+      if (!bubble) return false;
+      if (bubble.textContent !== message.content) bubble.textContent = message.content;
+    } else {
+      const card = body.querySelector(".reply-card");
+      if (!card) return false;
+      const hash = String(hashText(message.content));
+      if (card.dataset.contentHash !== hash) {
+        card.dataset.contentHash = hash;
+        card.replaceChildren(...replyParagraphs(message.content));
+      }
+    }
+  } else if (body.querySelector(".bubble, .reply-card")) {
+    return false;
+  }
+  const status = body.querySelector(".message-state:not(.failed)");
+  if (!status) return false;
+  const labels = {queued: "等待处理…", thinking: "正在思考…", replying: "正在回复…", synthesizing: "正在合成语音…"};
+  const label = labels[message.status];
+  if (label && status.textContent !== label) status.textContent = label;
+  if (message.warning) {
+    let warning = body.querySelector(".message-warning");
+    if (!warning) {
+      warning = node("p", "message-warning", message.warning);
+      body.insertBefore(warning, body.querySelector(".stream-preview"));
+    } else if (warning.textContent !== message.warning) {
+      warning.textContent = message.warning;
+    }
+  } else if (body.querySelector(".message-warning")) {
+    return false;
+  }
+  if (!user && message.status === "synthesizing" && !body.querySelector(".stream-preview")) {
+    body.append(streamPreview(message));
+  }
+  article.dataset.status = message.status;
+  return true;
 }
 
 function renderMessages() {
@@ -295,9 +397,14 @@ function renderMessages() {
     }
   }
   for (const message of state.messages) {
-    const signature = JSON.stringify(message) + (state.thinking.get(message.id) ?? "");
+    const signature = messageSignature(message);
     if (state.signatures.get(message.id) === signature) continue;
-    const rendered = renderMessage(message), existing = $(`message-${message.id}`);
+    const existing = $(`message-${message.id}`);
+    if (existing && canPatchMessage(existing, message) && patchMessage(existing, message)) {
+      state.signatures.set(message.id, signature);
+      continue;
+    }
+    const rendered = renderMessage(message);
     if (existing) existing.replaceWith(rendered); else $("messages").append(rendered);
     state.signatures.set(message.id, signature);
   }
@@ -565,7 +672,7 @@ $("stop").addEventListener("click", async () => {
   try { await post(`messages/${message.id}/cancel`, {}); await refresh(); }
   catch (error) { state.stopping = null; renderHealth(); toast(error.message); }
 });
-$("message-input").addEventListener("input", () => { autosizeInput(); renderHealth(); });
+$("message-input").addEventListener("input", () => { autosizeInput(); scheduleHealth(); });
 let recordingPointer = null;
 function beginRecording() {
   if ($("record").disabled || recorder.phase !== "idle") return;
@@ -593,7 +700,7 @@ $("record").addEventListener("keyup", event => {
   event.preventDefault(); recorder.finish();
 });
 addEventListener("blur", () => { recordingPointer = null; recorder.cancel(); });
-addEventListener("pagehide", () => { recorder.cancel(); pauseAudio(); });
+addEventListener("pagehide", () => { clearTimeout(pollTimer); pollTimer = 0; recorder.cancel(); pauseAudio(); });
 $("timeline").addEventListener("scroll", () => {
   const timeline = $("timeline");
   state.pinned = timeline.scrollHeight - timeline.scrollTop - timeline.clientHeight < 90;
@@ -603,6 +710,31 @@ $("message-input").addEventListener("keydown", event => {
     event.preventDefault(); $("composer").requestSubmit();
   }
 });
+function pollDelay() {
+  if (!state.online) return POLL_OFFLINE;
+  return state.health?.busy || activeMessage() || recorder.phase !== "idle" ? POLL_ACTIVE : POLL_IDLE;
+}
+function schedulePoll(delay = pollDelay()) {
+  clearTimeout(pollTimer);
+  pollTimer = document.hidden ? 0 : setTimeout(poll, delay);
+}
+async function poll() {
+  pollTimer = 0;
+  if (document.hidden || polling) return;
+  polling = true;
+  try { await refresh(); } finally { polling = false; }
+  if (!document.hidden && !pollTimer) schedulePoll();
+}
+function startPolling() {
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) { clearTimeout(pollTimer); pollTimer = 0; }
+    else if (!pollTimer && !polling) void poll();
+  });
+  addEventListener("pageshow", event => {
+    if (event.persisted && !pollTimer && !polling) void poll();
+  });
+  schedulePoll();
+}
 async function start() {
   await refresh();
   let saved;
@@ -610,8 +742,7 @@ async function start() {
   const conversation = state.conversations.find(c => c.id === saved) || state.conversations[0];
   if (conversation) await selectConversation(conversation.id);
   else setView("list");
-  async function poll() { await refresh(); setTimeout(poll, 1200); }
-  setTimeout(poll, 1200);
+  startPolling();
 }
 
 let editingCharacter = null, memoryCharacter = null, editingMemory = null, memorySignature = "";

@@ -5,7 +5,7 @@
   const ACTIVE = new Set(["queued", "preparing", "transcribing", "training", "validating", "cancelling"]);
   const STATUS = {queued: "排队等待", preparing: "准备素材与模型", transcribing: "逐片转写", review_required: "等待人工审核", training: "正在训练", validating: "验证训练产物", completed: "训练完成，待试听确认", failed: "任务失败", cancelling: "正在取消", cancelled: "已取消"};
   const REVIEW = {pending: "待审核", approved: "已确认", excluded: "已排除"};
-  const HINTS = {forced_split_check_words: "强制切分，请检查断词", short_segment: "片段偏短，请检查内容", low_volume_or_silence: "低音量或静音", possible_clipping: "可能削波失真", no_speech: "未识别到人声，请人工核对", transcription_failed_edit_required: "转写失败，请手动填写原文", one_character_text: "只有 1 个字，请核对原文与音频", trimmed_edges: "已修剪首尾停顿，请试听确认没有切掉轻声", low_voiced_ratio: "有声占比偏低，请确认是否为有效语音"};
+  const HINTS = {forced_split_check_words: "强制切分，请检查断词", short_segment: "片段偏短，请检查内容", low_volume_or_silence: "低音量或静音", possible_clipping: "可能削波失真", no_speech: "未识别到人声，请人工核对", transcription_failed_edit_required: "转写失败，请手动填写原文", low_confidence_transcript: "转写可靠性低，请逐字校对", one_character_text: "只有 1 个字，请核对原文与音频", trimmed_edges: "已修剪首尾停顿，请试听确认没有切掉轻声", low_voiced_ratio: "有声占比偏低，请确认是否为有效语音"};
   const ERRORS = {interrupted: "上次任务因应用退出而中断，请显式重试或恢复。", training_failed: "任务执行失败。请检查素材、可用内存和模型状态，再重试。", dispatch_failed: "任务未能投递，请重试。", cancelled: "任务已取消。可在退出后显式恢复或重试。", media_timeout: "媒体工具处理超时。请缩短素材后重新上传。", invalid_media: "素材损坏或无法解码，请重新导出 MP3、MP4 或 WAV。", unsupported_codec: "WAV 必须使用未压缩 PCM 编码，不能是压缩或浮点格式。", disk_space: "磁盘剩余空间不足，请清理空间后重试。", decoded_size_limit: "解码音频超过限制，请先缩短素材。", duration_limit: "媒体实际时长超限，请缩短素材。", container_mismatch: "扩展名与实际容器不一致，请正确导出素材。", no_audio_stream: "视频没有可用音轨。", media_tool_unavailable: "未找到 FFmpeg 或 FFprobe，请安装后重试。"};
 
   function formatDuration(value) {

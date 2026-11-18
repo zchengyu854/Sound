@@ -82,7 +82,7 @@ node test_reply_ui.cjs
 
 消息状态为 `queued`、`thinking`、`replying`、`synthesizing`、`complete`、`text_failed` 或 `audio_failed`。消息行的 `reasoning` 字段保存模型思考，`content` 在流式生成中逐步增长。音频通过消息 UUID 定位，不接收文件路径。声音 UUID 和任务 UUID 不通用。
 
-`/api/health` 的 `stt_status`、`stt_error` 和 `active_kind` 报告识别状态与占用类型。转写和聊天共享单个推理线程及任务锁，忙碌时返回 409；转写超时为 60 秒，底层模型退出前不会释放锁。`timings.first_audio_ms` 表示任务开始到首块音频的毫秒数。
+`/api/health` 的 `stt_status`、`stt_error` 和 `active_kind` 报告识别状态与占用类型。转写和聊天共享单个推理线程及任务锁，忙碌时返回 409；转写超时为 60 秒，底层模型退出前不会释放锁。`busy=false` 表示模型占用已释放（gate 不再锁定），不表示单线程 LLM I/O worker 已空闲；打断后旧 LLM 请求若仍未退出，新一轮 LLM 调用仍可能在该 worker 排队。`timings.first_audio_ms` 表示任务开始到首块音频的毫秒数。
 
 尚未实现微调、按句并行合成、自动打断、账号或安装包。音色相似度需要真人录音试听验证，不承诺复刻效果。
 
@@ -102,7 +102,7 @@ node test_reply_ui.cjs
 - 聊天阶段上限 120 秒，受剩余总预算限制；连接超时 10 秒。请求支持取消，不自动重发。
 - `POST /api/messages/{uuid}/cancel` 无需请求体。活动回复接受取消返回 202 和 `cancel_requested: true`；重复取消不额外执行。已结束回复返回 200，不撤回已经完成的音频；未知 UUID 返回 404，用户消息返回 409。
 - 接受取消不等于已经停止：在模型开始前、PCM 块之间和发布前检查。工作线程实际退出及清理之前，`busy` 仍为 true，继续拒绝新任务。**无法强制打断卡死的 GPU 调用，必要时需重启。**
-- 没有保存文字时，取消或超时保存为 `text_failed`；有文字时为 `audio_failed`，保留文字并清理未发布音频。调用原 `/retry` 可再次执行，使用相同消息 UUID、新的尝试次数和预算；音频重试不会再次调用聊天服务。
+- 没有已确认文字时，取消或超时保存为 `text_failed`；有已确认文字时为 `audio_failed`，保留文字并清理未发布音频。调用原 `/retry` 可再次执行，使用相同消息 UUID、新的尝试次数和预算；已确认正文的音频重试不会再次调用聊天服务，实时回复若正文尚未确认则从文字阶段重试。
 - 应用停服时拒绝新任务并请求取消，等待后台实际退出后关闭模型、释放目录锁；GPU 卡住仍可能导致等待。
 
 ### 查询、诊断和故障恢复
@@ -116,6 +116,7 @@ node test_reply_ui.cjs
 | `started_at` / `finished_at` | 最近一次尝试的 UTC 起止时间 |
 | `error_code` | 成功时 null；可为 `cancelled`、`timeout`、`dispatch_failed`、`interrupted`、`storage_error`、`provider_timeout`、`provider_http`、`text_generation_failed`、`audio_generation_failed` |
 | `timings` | 最近一次尝试的 `llm_ms`、`tts_ms`、`publish_ms`、`total_ms` 和 `rtf`；未执行阶段为 null，历史记录为 `{}` |
+| `text_finalized` | 正文是否已确认完整；历史 `complete`、标准模式的 `audio_failed` 和正文已确认的实时 `audio_failed` 为 1，实时未完成/中断/未确认正文为 0；只有确认正文进入后续上下文 |
 
 `duration` 仍然是音频秒数；RTF 为合成耗时除以音频时长，不含聊天与发布。失败也记录已执行阶段耗时。日志使用现有 logging，包含 UUID、尝试次数、阶段、结果、错误码、耗时及白名单诊断（异常类型、HTTP 状态码、系统错误号和调用位置），不包含原始异常字符串、正文、录音原文、密钥或响应正文。数据库只保存最近一次尝试的指标，逐次诊断由日志保留；使用本文启动命令时会输出成功和失败的结构化记录；嵌入其他启动器时需由启动方开启 `voice_app` 的 INFO 日志。
 
@@ -367,9 +368,9 @@ uv pip install --python .venv-separator/bin/python -r requirements-separator.txt
 新增独立页面 **`/realtime/`**（`/realtime` 跳转）。选择已发布声音或普通参考声音，点击开始后才请求麦克风并解锁 AudioContext，创建仅绑定 `voice_id` 的会话；切换声音新建会话，刷新不自动恢复。URL 中的 `voice_id` 由服务端 `GET /api/voices/{id}` 校验，无效时提示并改用可用声音。浏览器端 `web/vad.js` 用约 20 ms 帧、自适应阈值、约 150 ms 起始、约 700 ms 静音结束、约 200 ms 前置缓冲、最长 30 秒、短于 0.5 秒不提交；音频采集经 `web/realtime-worklet.js` 以约 20 ms 帧送入。说完自动识别，空文本/低可信不发送；自动发送用 `Idempotency-Key`，失败先查原任务不重复调用聊天服务。识别失败可用文字输入入口；点「结束对话」会取消在途回复，确保模型真正释放。
 
 ### 阶段 3 · 分句合成与打断
-实时页发送的消息带 `mode: realtime`（默认 `standard`，持久化并用于重试；升级备份回滚）。`realtime_runtime.py` 提供增量断句、有界队列（≤4 段）与轮次控制：LLM 网络读取在独立 I/O 执行器，仅正文入分句器（思考不进语音）；中文句末标点/换行优先，无标点约 80 字在合理边界切分。模型线程逐句合成，PCM 顺序写入同一 live buffer 与临时 WAV，成功后原子发布完整 WAV；每段失败不重试。SSE 在文字仍增长时即可报告音频开始，实时页收到 `synthesizing` 便开始播放；音频流按当前任务/attempt/live buffer/mode 判断可读。分别记录 LLM 首正文、首句就绪、首 PCM、分句与总耗时。
+实时页发送的消息带 `mode: realtime`（默认 `standard`，持久化并用于重试；升级备份回滚）。`realtime_runtime.py` 提供增量断句、有界队列（≤4 段，满时反压等待、不丢句）与轮次控制：LLM 网络读取在独立 I/O 执行器，仅正文入分句器（思考不进语音）；中文句末标点/换行优先，无标点约 80 字在合理边界切分。模型线程逐句合成，PCM 顺序写入同一 live buffer 与临时 WAV，成功后原子发布完整 WAV；每段失败不重试。SSE 在文字仍增长时即可报告音频开始，实时页收到 `synthesizing` 便开始播放；音频流按当前任务/attempt/live buffer/mode 判断可读。分别记录 LLM 首正文、首句就绪、首 PCM、分句与总耗时。
 
-播放时保留麦克风检测（建议耳机验收，浏览器回声消除开启）：检测到用户讲话即停播放器、请求取消、停 LLM 读取并清队列，页面随后轮询 `/api/health`，等旧任务真正释放 gate 再识别新一轮；只允许一段待处理录音、等待有界（约 12 秒后放弃并提示）。异步回调核对会话/消息/attempt/轮次，过期数据不进当前界面。实时主动打断产生新终态 `interrupted`：历史与数据库保留并标注，但下一轮上下文排除被打断的整轮配对；标准聊天的取消与重试规则保持兼容。逐句合成耗时写入 `timings.sentence_ms`（最多 20 条）与 `timings.sentences`；`timings.tts_ms` 只统计模型合成，不含等待下一句的网络时间，RTF 因此可比。
+播放时保留麦克风检测（建议耳机验收，浏览器回声消除开启）：检测到用户讲话即停播放器、请求取消、停 LLM 读取并清队列，页面随后轮询 `/api/health`，等旧任务真正释放 gate 再识别新一轮；`busy=false` 只代表 gate 释放，旧 LLM I/O 请求仍可能让下一轮 LLM 调用排队。只允许一段待处理录音、等待有界（约 12 秒后放弃并提示）。异步回调核对会话/消息/attempt/轮次，过期数据不进当前界面。实时主动打断产生新终态 `interrupted`：历史与数据库保留并标注，但下一轮上下文排除被打断的整轮配对；标准聊天的取消与重试规则保持兼容。逐句合成耗时写入 `timings.sentence_ms`（最多 20 条）与 `timings.sentences`；`timings.tts_ms` 只统计模型合成，不含等待下一句的网络时间，RTF 因此可比。
 
 ### 限制与验收
 - 人声分离仍是独立工具，独立环境**不是**资源隔离；先完成分离再启动模型服务，避免与训练/推理争用 GPU。

@@ -18,6 +18,7 @@ from fastapi import APIRouter, File, Header, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict, Field
 
+from audio_runtime import UnreliableTranscript
 from training_store import TrainingStore, canonical, select_reference
 
 log = logging.getLogger(__name__)
@@ -844,7 +845,9 @@ class TrainingService:
                     self.stage(value, "transcribing")
                     with self.model_slot(value, cancel):
                         try:
-                            text = self.chat.worker.submit(self.transcribe_clip, destination, cancel).result()
+                            text, reliable = self.chat.worker.submit(self.transcribe_clip, destination, cancel).result()
+                            if not reliable:
+                                hints.append("low_confidence_transcript")
                             if not text:
                                 hints.append("no_speech")
                             elif len("".join(text.split())) <= 1:
@@ -880,9 +883,13 @@ class TrainingService:
         # 24 kHz -> 16 kHz for Whisper; resampling is bounded to one <=12s clip.
         positions = np.arange(int(len(raw) * 2 / 3)) * 1.5
         samples = np.interp(positions, np.arange(len(raw)), raw).clip(-32768, 32767).astype("<i2").tobytes()
-        text = self.chat.transcriber.transcribe(samples)
+        reliable = True
+        try:
+            text = self.chat.transcriber.transcribe(samples)
+        except UnreliableTranscript as error:
+            text, reliable = error.text, False
         self.check(cancel)
-        return text.strip()[:2000] if isinstance(text, str) else ""
+        return (text.strip()[:2000] if isinstance(text, str) else ""), reliable
 
     def job_directory(self, job):
         from voice_app import identifier

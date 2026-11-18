@@ -84,20 +84,12 @@ class BoundedSegments:
         self._lock = threading.Lock()
         self._not_empty = threading.Condition(self._lock)
         self._done = False
-        self._dropped = 0
 
     def put(self, item):
         with self._not_empty:
+            while not self._done and len(self._items) >= self.maxsize:
+                self._not_empty.wait()
             if self._done:
-                return False
-            if len(self._items) >= self.maxsize:
-                # Backpressure: do not block the network reader indefinitely;
-                # bounded waiting gives the model thread a chance to drain.
-                self._not_empty.wait(timeout=0.2)
-            if self._done:
-                return False
-            if len(self._items) >= self.maxsize:
-                self._dropped += 1
                 return False
             self._items.append(item)
             self._not_empty.notify_all()
@@ -110,7 +102,9 @@ class BoundedSegments:
                 if not self._items and not self._done:
                     return None
             if self._items:
-                return self._items.pop(0)
+                item = self._items.pop(0)
+                self._not_empty.notify_all()
+                return item
             return None
 
     def finish(self):
@@ -123,11 +117,6 @@ class BoundedSegments:
             self._done = True
             self._items.clear()
             self._not_empty.notify_all()
-
-    @property
-    def dropped(self):
-        with self._lock:
-            return self._dropped
 
 
 class TurnControl:
