@@ -1,25 +1,25 @@
-"""Opt-in real Breeze integration. Never opens the application's private data.
+"""Opt-in Mac → Ubuntu → Mac Breeze integration with generated system speech.
 
-RUN_BREEZE_TRAINING_HARDWARE=1 HF_HUB_OFFLINE=1 .venv/bin/python -m unittest -v test_training_hardware
+BREEZE_TRAINING_SSH=user@ubuntu HF_HUB_OFFLINE=1 .venv/bin/python -m unittest -v test_training_hardware
 Whisper is replaced with a deterministic transcript; transcription quality is not measured.
 """
 import json
 import os
 from pathlib import Path
+import shlex
 import subprocess
 import tempfile
 import time
 import unittest
-from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 from test_voice_app import Transcriber
 from voice_app import Breeze, create_app
 
 
-@unittest.skipUnless(os.getenv("RUN_BREEZE_TRAINING_HARDWARE") == "1", "opt-in real Apple Silicon training")
+@unittest.skipUnless(os.getenv("BREEZE_TRAINING_SSH"), "opt-in Ubuntu CUDA and Mac integration")
 class HardwareTrainingTests(unittest.TestCase):
-    def test_prepare_cancel_resume_publish_and_restore(self):
+    def test_export_train_import_publish_and_restore(self):
         import mlx.core as mx
         started = time.perf_counter()
         artifacts = Path(__file__).resolve().parent / "web-test-artifacts"
@@ -57,31 +57,46 @@ class HardwareTrainingTests(unittest.TestCase):
                     reviewed = client.patch(f"/api/training/segments/{clip['id']}", json={
                         "transcript": "Hello.", "review_status": "approved"})
                     self.assertEqual(reviewed.status_code, 200, reviewed.text)
-                original = training.save_checkpoint
-                interrupted = []
+                submitted = client.post(f"/api/training/datasets/{dataset['id']}/jobs", json={"steps": 1})
+                self.assertEqual(submitted.status_code, 202, submitted.text)
+                value = submitted.json()["id"]
+                self.assertEqual(submitted.json()["status"], "awaiting_result")
+                task = client.get(f"/api/training/jobs/{value}/export")
+                self.assertEqual(task.status_code, 200)
+                (root / "task.zip").write_bytes(task.content)
+                self.assertIsNone(training.control)
 
-                def checkpoint(job, model, optimizer, step, base_digest):
-                    original(job, model, optimizer, step, base_digest)
-                    if not interrupted:
-                        interrupted.append(step)
-                        training.control[1].set()
-
-                with patch.object(training, "save_checkpoint", side_effect=checkpoint):
-                    submitted = client.post(f"/api/training/datasets/{dataset['id']}/jobs", json={
-                        "steps": 2, "checkpoint_every": 1})
-                    self.assertEqual(submitted.status_code, 202, submitted.text)
-                    value = submitted.json()["id"]
-                    wait_for(lambda: training.control is None)
-                job = training.store.one("training_jobs", value)
-                self.assertEqual(job["status"], "cancelled", job)
-                self.assertEqual(job["steps_done"], 1)
-                self.assertEqual(service.model_status, "ready")
-                retried = client.post(f"/api/training/jobs/{value}/retry", json={"resume": True})
-                self.assertEqual(retried.status_code, 202, retried.text)
+                host = os.environ["BREEZE_TRAINING_SSH"]
+                connection = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=15"]
+                ssh = ["ssh", *connection, host]
+                scp = ["scp", "-C", *connection]
+                remote = subprocess.check_output(ssh + ["mktemp -d"], text=True, timeout=45).strip()
+                try:
+                    files = ["ubuntu_training.py", "training_exchange.py", "breeze_training.py"]
+                    subprocess.run(scp + files + [str(root / "task.zip"), f"{host}:{remote}/"], check=True, timeout=120)
+                    base = os.getenv("BREEZE_TRAINING_REMOTE_BASE")
+                    command = ("cd " + shlex.quote(remote) + " && ~/.local/bin/uv run --python 3.12 "
+                               "--with 'mlx[cuda13]==0.32.2' --with mlx-audio==0.5.1 --with pydantic "
+                               "python ubuntu_training.py task.zip result.zip")
+                    if base:
+                        command += " --base-dir " + shlex.quote(base)
+                    subprocess.run(ssh + [command], check=True, timeout=600)
+                    subprocess.run(scp + [f"{host}:{remote}/result.zip", str(root / "result.zip")], check=True, timeout=300)
+                finally:
+                    subprocess.run(ssh + ["rm -r -- " + shlex.quote(remote)], check=True, timeout=45)
+                imported = client.post(f"/api/training/jobs/{value}/result", files={
+                    "result": ("result.zip", (root / "result.zip").read_bytes(), "application/zip")})
+                self.assertEqual(imported.status_code, 202, imported.text)
                 wait_for(lambda: training.control is None)
                 job = training.store.one("training_jobs", value)
                 self.assertEqual(job["status"], "completed", job)
-                self.assertEqual(job["steps_done"], 2)
+                self.assertEqual(job["steps_done"], 1)
+                for variant in ("base", "trained"):
+                    for index in (1, 2):
+                        self.assertEqual(client.get(
+                            f"/api/training/jobs/{value}/preview/{index}?variant={variant}").status_code, 200)
+                confirmed = client.post(f"/api/training/jobs/{value}/preview-confirm", json={"confirmed": True})
+                self.assertEqual(confirmed.status_code, 200, confirmed.text)
                 published = client.post(f"/api/training/jobs/{value}/publish", json={"name": "真实训练验收版本"})
                 self.assertEqual(published.status_code, 201, published.text)
                 voice = published.json()
@@ -100,11 +115,11 @@ class HardwareTrainingTests(unittest.TestCase):
                 self.assertEqual(service.model_status, "ready")
                 self.assertEqual(service.stt_status, "ready")
                 self.assertFalse(service.gate.locked())
-                report = {"status": "passed", "cancel_resume": True, "completed_steps": 2,
+                report = {"status": "passed", "ubuntu_cuda": True, "completed_steps": 1,
                           "publish": True, "trained_chat_audio": True,
                           "adapter_base_switch": True, "whisper": "test double",
                           "peak_mlx_bytes": mx.get_peak_memory(), "elapsed_seconds": time.perf_counter() - started}
-                (artifacts / "training-service-hardware.json").write_text(json.dumps(report, indent=2) + "\n")
+                (artifacts / "training-exchange-hardware.json").write_text(json.dumps(report, indent=2) + "\n")
                 print(json.dumps(report), flush=True)
 
 

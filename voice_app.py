@@ -708,7 +708,7 @@ class ChatService:
         if control:
             job = self.training.store.one("training_jobs", control[0])
             if job["kind"] == "train" or self.active_kind in ("training", "training_publish"):
-                raise HTTPException(409, {"message": "训练正在占用模型，请稍候。", "stage": job["stage"]})
+                raise HTTPException(409, {"message": "正在生成训练试听，请稍候。", "stage": job["stage"]})
 
     def start_transcription(self, samples, duration):
         with self.admission:

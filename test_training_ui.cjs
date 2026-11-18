@@ -161,25 +161,29 @@ function fixture(sharedSession = storage()) {
         const key = options.headers["Idempotency-Key"];
         let job = data.keys.get(key);
         if (!job) {
-          job = {id: randomUUID(), dataset_id: id, kind: "train", status: "training", attempt: 1,
+          job = {id: randomUUID(), dataset_id: id, kind: "train", status: "awaiting_result", attempt: 1,
             config: body, steps_done: 0, steps_total: body.steps, snapshot: {validation_warning: "insufficient_independent_validation"},
             preview: {texts: ["你好，好久不见", "试听句二。"], confirmed: false, note: "",
               summary: {training_seconds: 34, approx_passes: .5, unique_segments_seen: 5,
                 training_segments: 10, independent_validation: true}}};
           data.jobs.unshift(job); data.keys.set(key, job);
         }
-        data.cap.active_job = job.id; data.cap.available = false;
         if (data.loseTrainResponse) { data.loseTrainResponse = false; throw new Error("Lost response"); }
         return response(job, 202);
       }
       const job = data.jobs.find(entry => url.includes(`/jobs/${entry.id}/`));
       if (method === "POST" && job && url.endsWith("/cancel")) {
-        job.status = "cancelling";
+        job.status = job.status === "awaiting_result" ? "cancelled" : "cancelling";
         return response(job);
       }
       if (method === "POST" && job && url.endsWith("/retry")) {
-        job.status = "queued"; job.attempt++;
+        job.status = job.kind === "train" ? "awaiting_result" : "queued"; job.attempt++;
         return response(job);
+      }
+      if (method === "POST" && job && url.endsWith("/result")) {
+        job.status = "validating";
+        data.cap.active_job = job.id;
+        return response(job, 202);
       }
       if (method === "POST" && job && url.endsWith("/preview-confirm")) {
         job.preview = {...job.preview, confirmed: body.confirmed, note: body.note || "", confirmed_at: "2026-01-01T00:00:00+00:00"};
@@ -606,12 +610,23 @@ async function main() {
   f.data.jobs[0].status = "failed"; f.data.jobs[0].checkpoint = "checkpoint-test";
   f.data.cap.active_job = null;
   await f.app.refresh();
-  assert.equal(f.doc.getElementById("retry-job").textContent, "从检查点恢复");
+  assert.equal(f.doc.getElementById("retry-job").textContent, "重新创建训练任务包");
   const postsBeforeRead = f.data.posts.length;
   await f.app.refresh();
   assert.equal(f.data.posts.length, postsBeforeRead, "failed tasks are never automatically retried");
   await f.app.jobAction("retry", false);
   assert.deepEqual(JSON.parse(f.data.posts.findLast(entry => entry.url.endsWith("/retry")).body), {resume: false});
+  assert.equal(f.doc.getElementById("exchange-actions").hidden, false);
+  const jobId = f.data.jobs[0].id;
+  assert.equal(f.doc.getElementById("export-task").href, `/api/training/jobs/${jobId}/export`);
+  const resultFile = f.doc.getElementById("result-file");
+  const result = {name: "result.zip"};
+  resultFile.files = [result];
+  await resultFile.emit("change");
+  const imported = f.data.posts.findLast(entry => entry.url.endsWith("/result"));
+  assert.equal(imported.url, `/api/training/jobs/${jobId}/result`);
+  assert.deepEqual(imported.body.values, [["result", result]]);
+  assert.equal(f.doc.getElementById("exchange-actions").hidden, true);
   f.app.dispose();
 
   const forms = fixture();

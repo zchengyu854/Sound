@@ -1,6 +1,7 @@
-"""Bounded local training jobs; all MLX work uses the chat inference thread."""
+"""Dataset review, Ubuntu training exchange, and local A/B synthesis."""
 from __future__ import annotations
 
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from contextlib import closing, contextmanager
@@ -10,16 +11,21 @@ import logging
 import os
 from pathlib import Path
 import shutil
+import tempfile
 import threading
 from uuid import uuid4
 import wave
+from zipfile import BadZipFile, ZipFile
 
 from fastapi import APIRouter, File, Header, HTTPException, Query, UploadFile
-from fastapi.responses import FileResponse
-from pydantic import BaseModel, ConfigDict, Field
+from fastapi.responses import FileResponse, StreamingResponse
+from pydantic import BaseModel, ConfigDict, Field, FiniteFloat
+from starlette.background import BackgroundTask
 
 from audio_runtime import UnreliableTranscript
-from training_store import TrainingStore, canonical, select_reference
+from training_exchange import (MAX_ADAPTER, MAX_CLIP, MAX_MANIFEST, PACKAGE_VERSION, RECIPE_VERSION,
+                               TrainingConfig, canonical, read_member, sha256)
+from training_store import TrainingStore, select_reference
 
 log = logging.getLogger(__name__)
 MAX_SOURCE = 200 * 1024**2
@@ -54,19 +60,35 @@ class ReferenceInput(BaseModel):
     segment_id: str | None = Field(default=None, max_length=64)
 
 
-class TrainingConfig(BaseModel):
-    model_config = ConfigDict(extra="forbid")
-    rank: int = Field(default=4)
-    steps: int = Field(default=20, ge=1, le=1000)
-    learning_rate: float = Field(default=0.0001, ge=0.000001, le=0.001, allow_inf_nan=False)
-    accumulation_steps: int = Field(default=1, ge=1, le=8)
-    checkpoint_every: int = Field(default=5, ge=1, le=100)
-    seed: int = Field(default=42, ge=0, le=2**31 - 1)
+class StepResult(BaseModel):
+    step: int = Field(ge=1, le=1000)
+    loss: FiniteFloat
+    gradient_norm: FiniteFloat = Field(ge=0)
+    learning_rate: FiniteFloat
+    epoch: int = Field(ge=1)
 
-    def checked(self):
-        if self.rank not in (1, 2, 4, 8):
-            raise HTTPException(422, "rank 必须为 1、2、4 或 8。")
-        return self.model_dump()
+
+class ValidationTrend(BaseModel):
+    step: int = Field(ge=1, le=1000)
+    losses: list[FiniteFloat]
+    mean: FiniteFloat
+
+
+class BestCheckpoint(BaseModel):
+    step: int = Field(ge=1, le=1000)
+    validation_loss: FiniteFloat
+
+
+class TrainingResult(BaseModel):
+    base_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
+    initial_adapter_digest: str = Field(pattern=r"^[a-f0-9]{64}$")
+    adapter_sha256: str = Field(pattern=r"^[a-f0-9]{64}$")
+    steps: int = Field(ge=1, le=1000)
+    step_log: list[StepResult] = Field(max_length=1000)
+    validation_losses: list[FiniteFloat]
+    validation_trend: list[ValidationTrend] = Field(max_length=1000)
+    best_checkpoint: BestCheckpoint | None
+    sampling: dict[str, int]
 
 
 class VariantInput(BaseModel):
@@ -88,6 +110,14 @@ class PreviewInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
     confirmed: bool
     note: str = Field(default="", max_length=300)
+
+
+class IncompatibleBase(ValueError):
+    code = "base_mismatch"
+
+
+class IncompatibleAdapter(ValueError):
+    code = "adapter_mismatch"
 
 
 class Cancelled(Exception):
@@ -135,9 +165,7 @@ def training_summary(job):
     }
 
 
-RECIPE_VERSION = "breeze-lora-recipe-2"
 EVALUATION_VERSION = "voice-metrics-2"
-STEP_LOG_LIMIT = 1000
 REFERENCE_LABELS = {
     "independent_source": "按来源留出验证",
     "same_recording": "同录音留出验证",
@@ -158,13 +186,6 @@ def reference_segment(job):
                 return segment
         raise HTTPException(409, "训练快照的试听参考片段无效。")
     return segments[0] if segments else None
-
-
-def deterministic_order(size, seed, epoch):
-    """Reproducible shuffle of the training subset for one epoch."""
-    import numpy as np
-    generator = np.random.default_rng([int(seed), int(epoch), 0x5EED])
-    return [int(value) for value in generator.permutation(size)]
 
 
 class TrainingService:
@@ -686,6 +707,8 @@ class TrainingService:
                     self.store.rows("training_sources", "dataset_id=?", (dataset_id,))):
                 raise HTTPException(409, "请先完成所有素材处理并审核，再启动训练。")
             job = self.store.create_job(dataset_id, kind, config or {}, request_key)
+            if job["kind"] == "train":
+                return self.await_result(job)
             self._dispatch(job)
             return job
 
@@ -702,14 +725,89 @@ class TrainingService:
             self._require_completed_train(parent)
             self.verify_snapshot(parent)
             job = self.store.create_variant_job(value, steps, request_key)
-            self._dispatch(job)
+            return self.await_result(job)
+
+    def await_result(self, job):
+        if job["status"] == "queued":
+            return self.store.update("training_jobs", job["id"], status="awaiting_result",
+                                     stage="awaiting_result", steps_total=job["config"]["steps"])
+        return job
+
+    def task_identity(self, job):
+        return {"format": PACKAGE_VERSION, "recipe_version": RECIPE_VERSION, "job_id": job["id"],
+                "attempt": job["attempt"], "base_model": self.base_model,
+                "snapshot_digest": job["digest"], "config": job["config"]}
+
+    def export_task(self, value):
+        with self.lock:
+            job = self.store.one("training_jobs", value)
+            if job["kind"] != "train" or job["status"] != "awaiting_result":
+                raise HTTPException(409, "只有等待 Ubuntu 结果的训练任务可以下载。")
+        payload = tempfile.TemporaryFile()
+        try:
+            manifest = canonical({"identity": self.task_identity(job), "snapshot": job["snapshot"]}).encode()
+            if len(manifest) > MAX_MANIFEST or sha256(canonical(job["snapshot"]).encode()) != job["digest"]:
+                raise HTTPException(409, "训练快照大小或摘要无效。")
+            with ZipFile(payload, "w") as archive:
+                archive.writestr("task.json", manifest)
+                for index, segment in enumerate(job["snapshot"]["segments"]):
+                    with self.store.segment_path(segment).open("rb") as source:
+                        audio = source.read(MAX_CLIP + 1)
+                    if len(audio) > MAX_CLIP or sha256(audio) != (segment.get("sha256") or segment.get("audio_sha256")):
+                        raise HTTPException(409, "训练音频快照已改变或大小无效。")
+                    archive.writestr(f"audio/{index}.wav", audio)
+            size = payload.tell()
+            payload.seek(0)
+        except BaseException as exc:
+            payload.close()
+            if isinstance(exc, OSError):
+                raise HTTPException(409, "读取训练音频或写入任务包失败。") from None
+            raise
+        return StreamingResponse(iter(lambda: payload.read(1024**2), b""), media_type="application/zip",
+                                 headers={"Content-Length": str(size), "Cache-Control": "no-store",
+                                          "Content-Disposition": f'attachment; filename="breeze-{value}-{job["attempt"]}.zip"'},
+                                 background=BackgroundTask(payload.close))
+
+    def import_result(self, value, package):
+        with self.lock, self.chat.admission:
+            if self.stopping or not self.chat.accepting_tasks:
+                raise HTTPException(503, "应用正在停止。")
+            job = self.store.one("training_jobs", value)
+            if self.control or self.uploading or job["kind"] != "train" or job["status"] != "awaiting_result":
+                raise HTTPException(409, "任务未在等待 Ubuntu 结果，或本机正在处理其他任务。")
+            try:
+                with ZipFile(package) as archive:
+                    if Counter(archive.namelist()) != {"result.json": 1, "adapter.safetensors": 1}:
+                        raise ValueError
+                    manifest = json.loads(read_member(archive, "result.json", MAX_MANIFEST))
+                    adapter = read_member(archive, "adapter.safetensors", MAX_ADAPTER)
+                if not isinstance(manifest, dict) or any(
+                    manifest.get(key) != expected for key, expected in self.task_identity(job).items()
+                ):
+                    raise HTTPException(409, "结果包与当前任务、快照、基座或尝试次数不匹配。")
+                result = TrainingResult.model_validate(manifest)
+                if (result.steps != job["config"]["steps"] or result.adapter_sha256 != sha256(adapter)
+                        or [entry.step for entry in result.step_log] != list(range(1, result.steps + 1))
+                        or set(result.sampling) != {"epoch", "position"} or min(result.sampling.values()) < 0):
+                    raise ValueError
+            except (BadZipFile, KeyError, ValueError, OSError, RuntimeError, EOFError, RecursionError):
+                raise HTTPException(422, "结果 ZIP、训练记录或 adapter 摘要无效。") from None
+            self.verify_snapshot(job)
+            root = self.job_directory(job)
+            with tempfile.TemporaryDirectory(dir=root) as temporary:
+                path = Path(temporary) / "adapter.safetensors"
+                path.write_bytes(adapter)
+                path.replace(root / path.name)
+            self.validation_path(job).unlink(missing_ok=True)
+            job = self.store.update("training_jobs", value, status="queued", stage="queued", error_code=None)
+            self._dispatch(job, result)
             return job
 
-    def _dispatch(self, job, resume=False):
+    def _dispatch(self, job, result=None):
         cancel = threading.Event()
         self.control = (job["id"], cancel)
         try:
-            self.executor.submit(self.run, job["id"], cancel, resume)
+            self.executor.submit(self.run, job["id"], cancel, result)
         except BaseException:
             self.control = None
             self.store.update("training_jobs", job["id"], status="failed", error_code="dispatch_failed")
@@ -718,25 +816,29 @@ class TrainingService:
     def cancel(self, value):
         with self.lock:
             job = self.store.one("training_jobs", value)
+            if job["status"] == "awaiting_result":
+                return self.store.update("training_jobs", value, status="cancelled", stage="cancelled", error_code="cancelled")
             if (self.control and self.control[0] == value
                     and job["status"] not in ("completed", "review_required", "failed", "cancelled")):
                 self.store.update("training_jobs", value, status="cancelling")
                 self.control[1].set()
             return self.store.one("training_jobs", value)
 
-    def retry(self, value, resume):
+    def retry(self, value):
         with self.lock, self.chat.admission:
             job = self.store.one("training_jobs", value)
             if self.control or self.uploading or job["status"] not in ("failed", "cancelled"):
                 raise HTTPException(409, "只能重试已经退出的失败或取消任务。")
             if self.stopping or not self.chat.accepting_tasks:
                 raise HTTPException(503, "应用正在停止。")
-            if resume and job["kind"] == "train" and job.get("checkpoint"):
-                self.validate_checkpoint(job)
             self.store.update("training_jobs", value, status="queued", stage="queued", error_code=None,
                               attempt=job["attempt"] + 1)
-            self._dispatch(self.store.one("training_jobs", value), resume)
-            return self.store.one("training_jobs", value)
+            job = self.store.one("training_jobs", value)
+            if job["kind"] == "train":
+                self.store.update("training_jobs", value, checkpoint=None, steps_done=0)
+                return self.await_result(self.store.one("training_jobs", value))
+            self._dispatch(job)
+            return job
 
     def stage(self, value, status, **fields):
         with self.lock:
@@ -765,23 +867,27 @@ class TrainingService:
                     self.chat.active_kind = None
                     self.chat.gate.release()
 
-    def run(self, value, cancel, resume):
+    def run(self, value, cancel, result):
         try:
             job = self.store.one("training_jobs", value)
             self.check(cancel)
             if job["kind"] == "prepare":
                 self.prepare(job, cancel)
             else:
+                if result is None:
+                    raise RuntimeError("Missing Ubuntu training result")
                 with self.model_slot(value, cancel):
-                    self.chat.worker.submit(self.train, job, cancel, resume).result()
+                    self.chat.worker.submit(self.validate_import, job, cancel, result).result()
         except Cancelled:
             self.stage(value, "cancelled", error_code="cancelled")
         except BaseException as exc:
             code = getattr(exc, "code", "training_failed")
-            if cancel.is_set():
-                self.stage(value, "cancelled", error_code="cancelled")
-            else:
-                self.stage(value, "failed", error_code=code)
+            with self.lock:
+                if cancel.is_set():
+                    self.stage(value, "cancelled", error_code="cancelled")
+                else:
+                    status = "awaiting_result" if result is not None else "failed"
+                    self.stage(value, status, error_code=code)
             log.error(json.dumps({"task_id": value, "stage": "failed", "error_type": type(exc).__name__}))
         finally:
             with self.lock:
@@ -899,16 +1005,6 @@ class TrainingService:
         if not directory.resolve().is_relative_to(self.chat.directory.resolve()):
             raise HTTPException(422, "任务路径无效。")
         return directory
-
-    def checkpoint_directory(self, job):
-        name = job.get("checkpoint")
-        if not name or Path(name).name != name:
-            raise HTTPException(409, "没有可恢复检查点。")
-        directory = self.job_directory(job)
-        path = (directory / name).resolve()
-        if path.parent != directory.resolve():
-            raise HTTPException(409, "检查点路径无效。")
-        return path
 
     @staticmethod
     def _require_completed_train(job):
@@ -1058,63 +1154,16 @@ class TrainingService:
                 "preview_metrics": validation.get("preview_metrics"),
                 "train_losses": validation.get("train_losses")}
 
-    def validate_checkpoint(self, job):
-        try:
-            path = self.checkpoint_directory(job)
-            metadata = json.loads((path / "metadata.json").read_text())
-            if any(metadata[key] != expected for key, expected in (
-                ("base_model", self.base_model), ("digest", job["digest"]), ("config", job["config"]))):
-                raise ValueError
-            if not all((path / name).is_file() for name in ("adapter.safetensors", "optimizer.safetensors", "random.safetensors")):
-                raise ValueError
-            return metadata
-        except (OSError, KeyError, ValueError):
-            raise HTTPException(409, "检查点与基座、数据或配置不兼容，不能恢复。") from None
-
-    def save_checkpoint(self, job, model, optimizer, step, base_digest, sampling=None,
-                        initial_adapter=None):
-        import mlx.core as mx
-        from mlx.utils import tree_flatten
-        from breeze_training import save_adapter
-        root = self.job_directory(job)
-        name = f"checkpoint-{step}-{uuid4()}"
-        temporary = root / (name + ".tmp")
-        temporary.mkdir(mode=0o700)
-        try:
-            save_adapter(model, temporary / "adapter.safetensors")
-            mx.save_safetensors(str(temporary / "optimizer.safetensors"), dict(tree_flatten(optimizer.state)))
-            mx.save_safetensors(str(temporary / "random.safetensors"), {str(i): a for i, a in enumerate(mx.random.state)})
-            metadata = {"base_model": self.base_model, "base_digest": base_digest, "digest": job["digest"],
-                        "config": job["config"], "step": step, "recipe_version": RECIPE_VERSION,
-                        "initial_adapter_digest": initial_adapter,
-                        # Records where the seeded order stopped so a resume
-                        # continues the same epoch instead of restarting it.
-                        "sampling": {key: sampling.get(key) for key in ("epoch", "position")} if sampling else None}
-            (temporary / "metadata.json").write_text(json.dumps(metadata, sort_keys=True))
-            temporary.replace(root / name)
-            self.store.update("training_jobs", job["id"], checkpoint=name, steps_done=step)
-        except BaseException:
-            shutil.rmtree(temporary, ignore_errors=True)
-            raise
-
-    def train(self, job, cancel, resume):
+    def validate_import(self, job, cancel, result):
         import gc
-        import math
-        import numpy as np
         import mlx.core as mx
-        import mlx.nn as nn
-        import mlx.optimizers as optim
-        from mlx.utils import tree_flatten, tree_map, tree_unflatten
         from mlx_audio.tts.utils import load_model
-        from breezetts2_mac_fast import SYNTHESIS_SEED
-        from breeze_training import (attach_lora, frozen_digest, load_adapter, parameter_digest,
-                                     save_adapter, teacher_forcing_loss, validate_example)
-        model = gradient_fn = optimizer = None
+        from breeze_training import attach_lora, frozen_digest, load_adapter
+        model = None
         config = job["config"]
         value = job["id"]
         try:
-            self.stage(value, "preparing", steps_total=config["steps"])
-            self.check(cancel)
+            self.stage(value, "validating", steps_done=result.steps)
             self.chat.engine.close()
             self.chat.transcriber.close()
             if hasattr(self.chat.engine, "model"):
@@ -1125,147 +1174,8 @@ class TrainingService:
             mx.clear_cache()
             mx.set_memory_limit(mx.device_info()["max_recommended_working_set_size"])
             mx.set_cache_limit(256 * 1024**2)
-            model = load_model(self.base_model)
-            # Seed before LoRA initialization: the adapter matrices are part of
-            # the experiment, so the same seed must reproduce the same start.
-            seed = int((config or {}).get("seed", SYNTHESIS_SEED))
-            mx.random.seed(seed)
-            attach_lora(model, config["rank"])
-            initial_adapter = parameter_digest(model.trainable_parameters())
-            base_digest = frozen_digest(model)
-            optimizer = optim.Adam(config["learning_rate"])
-            step = 0
-            sampling = {"epoch": 0, "position": 0}
-            if resume and job.get("checkpoint"):
-                metadata = self.validate_checkpoint(job)
-                if metadata["base_digest"] != base_digest:
-                    raise HTTPException(409, "基座权重与检查点不一致。")
-                directory = self.checkpoint_directory(job)
-                load_adapter(model, directory / "adapter.safetensors")
-                optimizer.state = tree_unflatten(list(mx.load(str(directory / "optimizer.safetensors")).items()))
-                random_state = mx.load(str(directory / "random.safetensors"))
-                mx.random.state = [random_state[str(i)] for i in range(len(random_state))]
-                step = metadata["step"]
-                saved = metadata.get("sampling") or {}
-                sampling = {"epoch": int(saved.get("epoch", 0)), "position": int(saved.get("position", 0))}
-            snapshot = job["snapshot"]
-            examples = snapshot["segments"]
-            training = [examples[i] for i in snapshot["train_indices"]]
-            if not training:
-                raise HTTPException(422, "没有可训练片段。")
-            self.verify_snapshot(job)
-            cache = self.job_directory(job) / "tokens"
-            cache.mkdir(exist_ok=True, mode=0o700)
-
-            def example(segment):
-                self.check(cancel)
-                target = cache / f"{segment['id']}.safetensors"
-                if target.is_file():
-                    arrays = mx.load(str(target))
-                    prompt, codes = arrays["prompt"], arrays["codes"]
-                else:
-                    path = self.store.segment_path(segment)
-                    with wave.open(str(path), "rb") as wav:
-                        audio = np.frombuffer(wav.readframes(wav.getnframes()), dtype="<i2").astype(np.float32) / 32768
-                    codes = mx.stop_gradient(model._encode_reference(mx.array(audio)))
-                    prompt = mx.stop_gradient(model._prompt_embeddings(segment["transcript"], voice=None,
-                                                    instruct=None, ref_audio=None, ref_text=None))
-                    mx.eval(prompt, codes)
-                    validate_example(model, prompt, codes)
-                    temp = target.with_suffix(".tmp.safetensors")
-                    mx.save_safetensors(str(temp), {"prompt": prompt, "codes": codes})
-                    temp.replace(target)
-                validate_example(model, prompt, codes)
-                return prompt, codes
-
-            order = {"epoch": sampling["epoch"], "position": sampling["position"], "order": []}
-            if order["epoch"] or order["position"]:
-                order["order"] = deterministic_order(len(training), seed, order["epoch"])
-
-            def next_index():
-                # Every epoch visits all training segments once, in a seeded order.
-                if order["position"] >= len(order["order"]):
-                    order["epoch"] += 1
-                    order["order"] = deterministic_order(len(training), seed, order["epoch"])
-                    order["position"] = 0
-                index = order["order"][order["position"]]
-                order["position"] += 1
-                return index
-
-            validation_segments = [examples[i] for i in snapshot["validation_indices"]]
-            validation_trend = []
-
-            def validation_losses():
-                values = []
-                for segment in validation_segments:
-                    prompt, codes = example(segment)
-                    score = teacher_forcing_loss(model, prompt, codes)
-                    mx.eval(score)
-                    if not math.isfinite(score.item()):
-                        raise ValueError("validation_nonfinite")
-                    values.append(round(score.item(), 6))
-                return values
-
-            def record_trend(step_number):
-                if not validation_segments:
-                    return None
-                values = validation_losses()
-                entry = {"step": step_number, "losses": values,
-                         "mean": round(sum(values) / len(values), 6)}
-                validation_trend.append(entry)
-                return entry
-
-            gradient_fn = nn.value_and_grad(model, teacher_forcing_loss)
-            self.stage(value, "training", steps_done=step)
-            step_log = []
-            while step < config["steps"]:
-                self.check(cancel)
-                accumulated = None
-                micro_losses = []
-                for micro in range(config["accumulation_steps"]):
-                    index = next_index()
-                    prompt, codes = example(training[index])
-                    loss, gradients = gradient_fn(model, prompt, codes)
-                    mx.eval(loss, gradients)
-                    micro_losses.append(loss.item())
-                    values = [g for _, g in tree_flatten(gradients)]
-                    if not math.isfinite(loss.item()) or not all(bool(mx.all(mx.isfinite(g)).item()) for g in values):
-                        raise ValueError("nonfinite_gradient")
-                    scaled = tree_map(lambda g: g / config["accumulation_steps"], gradients)
-                    accumulated = scaled if accumulated is None else tree_map(lambda a, b: a + b, accumulated, scaled)
-                    self.check(cancel)
-                gradient_norm = math.sqrt(sum(
-                    float(mx.sum(g.astype(mx.float32) ** 2).item())
-                    for _, g in tree_flatten(accumulated)))
-                optimizer.update(model, accumulated)
-                mx.eval(model.trainable_parameters(), optimizer.state)
-                step += 1
-                if len(step_log) < STEP_LOG_LIMIT:
-                    # Accumulated-gradient norm; the loss is the mean over the
-                    # micro-batches that produced this optimizer step.
-                    step_log.append({"step": step,
-                                     "loss": round(sum(micro_losses) / len(micro_losses), 6),
-                                     "gradient_norm": round(gradient_norm, 6),
-                                     "learning_rate": config["learning_rate"],
-                                     "epoch": order["epoch"]})
-                self.store.update("training_jobs", value, steps_done=step)
-                if step % config["checkpoint_every"] == 0 or step == config["steps"]:
-                    record_trend(step)
-                    self.save_checkpoint(job, model, optimizer, step, base_digest,
-                                         sampling=dict(order, order=[]), initial_adapter=initial_adapter)
-            self.check(cancel)
-            self.stage(value, "validating")
-            if frozen_digest(model) != base_digest:
-                raise ValueError("base_weights_changed")
-            if not validation_trend or validation_trend[-1]["step"] != step:
-                record_trend(step)
-            validation_losses_final = validation_trend[-1]["losses"] if validation_trend else []
-            best = min(validation_trend, key=lambda entry: entry["mean"]) if validation_trend else None
             root = self.job_directory(job)
-            save_adapter(model, root / "adapter.safetensors")
-            gradient_fn = optimizer = model = None
-            gc.collect()
-            mx.clear_cache()
+            snapshot = job["snapshot"]
             reference = reference_segment(job)
             if reference is None:
                 raise HTTPException(422, "没有可用的试听参考片段。")
@@ -1273,33 +1183,30 @@ class TrainingService:
             # validate_audio records the exact conditions it used.
             model = load_model(self.base_model)
             attach_lora(model, config["rank"])
-            mx.random.seed(config.get("seed", SYNTHESIS_SEED))
+            base_digest = frozen_digest(model)
+            if base_digest != result.base_digest:
+                raise IncompatibleBase()
             base_preview = self.validate_audio(model, job, cancel, variant="base")
-            model = None
-            gc.collect()
-            mx.clear_cache()
-            model = load_model(self.base_model)
-            attach_lora(model, config["rank"])
-            load_adapter(model, root / "adapter.safetensors")
-            mx.random.seed(config.get("seed", SYNTHESIS_SEED))
+            try:
+                load_adapter(model, root / "adapter.safetensors")
+            except (OSError, RuntimeError, ValueError) as exc:
+                raise IncompatibleAdapter() from exc
             preview = self.validate_audio(model, job, cancel, variant="trained")
             inference_config = preview["inference"]
             reference_digest = hashlib.sha256(canonical({"id": reference["id"],
                 "transcript": reference["transcript"], "audio_sha256": reference.get("audio_sha256", "")}).encode()).hexdigest()
             summary = training_summary(job)
             self._write_validation(job, {"ab": 2, "adapter_loaded": True,
-                "validation_losses": validation_losses_final,
-                "validation_trend": validation_trend,
-                "train_losses": [entry["loss"] for entry in step_log],
-                "step_log": step_log,
+                "validation_losses": result.validation_losses,
+                "validation_trend": [entry.model_dump() for entry in result.validation_trend],
+                "train_losses": [entry.loss for entry in result.step_log],
+                "step_log": [entry.model_dump() for entry in result.step_log],
                 "recipe_version": RECIPE_VERSION,
-                "initial_adapter_digest": initial_adapter,
-                "sampling": {"seed": seed, "epochs_completed": summary["full_epochs"],
-                             "epoch": order["epoch"], "position": order["position"],
-                             "order": "seeded per epoch", "recipe_version": RECIPE_VERSION},
-                "best_checkpoint": ({"step": best["step"], "validation_loss": best["mean"]}
-                                    if best else None),
-                "final_checkpoint_step": step,
+                "initial_adapter_digest": result.initial_adapter_digest,
+                "sampling": {"seed": config["seed"], "epochs_completed": summary["full_epochs"],
+                             **result.sampling, "order": "seeded per epoch", "recipe_version": RECIPE_VERSION},
+                "best_checkpoint": result.best_checkpoint.model_dump() if result.best_checkpoint else None,
+                "final_checkpoint_step": result.steps,
                 "base_model": self.base_model,
                 "adapter_sha256": hashlib.sha256((root / "adapter.safetensors").read_bytes()).hexdigest(),
                 "warning": snapshot.get("validation_warning"), "base_digest": base_digest,
@@ -1316,7 +1223,7 @@ class TrainingService:
             self.check(cancel)
             self.stage(value, "completed")
         finally:
-            gradient_fn = optimizer = model = None
+            model = None
             gc.collect()
             mx.clear_cache()
             try:
@@ -1324,22 +1231,26 @@ class TrainingService:
                 self.chat.model_status, self.chat.model_error = "ready", None
             except BaseException:
                 self.chat.model_status = "failed"
-                self.chat.model_error = "训练后推理模型恢复失败，请重启应用。"
+                self.chat.model_error = "试听验证后推理模型恢复失败，请重启应用。"
             try:
                 self.chat.transcriber.load()
                 self.chat.stt_status, self.chat.stt_error = "ready", None
             except BaseException:
                 self.chat.stt_status = "failed"
-                self.chat.stt_error = "训练后识别模型恢复失败，请重启应用。"
+                self.chat.stt_error = "试听验证后识别模型恢复失败，请重启应用。"
 
     def verify_snapshot(self, job):
-        canonical = json.dumps(job["snapshot"], ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-        if hashlib.sha256(canonical.encode()).hexdigest() != job["digest"]:
+        if sha256(canonical(job["snapshot"]).encode()) != job["digest"]:
             raise HTTPException(409, "训练数据快照摘要不匹配。")
         for segment in job["snapshot"]["segments"]:
             path = self.store.segment_path(segment)
             expected = segment.get("sha256") or segment.get("audio_sha256")
-            if not expected or hashlib.sha256(path.read_bytes()).hexdigest() != expected:
+            try:
+                with path.open("rb") as audio:
+                    actual = hashlib.file_digest(audio, "sha256").hexdigest()
+            except OSError:
+                actual = None
+            if not expected or actual != expected:
                 raise HTTPException(409, "训练音频快照已改变或不可用。")
         snapshot = job["snapshot"]
         reference_id = snapshot.get("reference_segment_id")
@@ -1602,6 +1513,16 @@ def training_router(service):
         if record["kind"] == "train":
             record["preview"] = service.validation_view(record)
         return record
+    @router.get("/jobs/{value}/export")
+    def export(value: str):
+        return service.export_task(value)
+
+    @router.post("/jobs/{value}/result", status_code=202)
+    def import_result(value: str, result: UploadFile = File()):
+        if result.size is None or result.size > MAX_MANIFEST + MAX_ADAPTER + 4096:
+            raise HTTPException(413, "训练结果包过大。")
+        return service.import_result(value, result.file)
+
     @router.get("/jobs/{value}/preview/{index}")
     def preview(value: str, index: int, variant: str = Query("trained")):
         job = service.store.one("training_jobs", value)
@@ -1622,7 +1543,7 @@ def training_router(service):
 
     @router.post("/jobs/{value}/retry", status_code=202)
     def retry(value: str, body: RetryInput = RetryInput()):
-        return service.retry(value, body.resume)
+        return service.retry(value)
 
     @router.post("/jobs/{value}/publish", status_code=201)
     def publish(value: str, body: PublishInput):

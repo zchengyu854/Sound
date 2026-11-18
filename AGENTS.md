@@ -7,7 +7,8 @@
 - `breezetts2_mac_fast.py`: streaming inference CLI and shared helpers such as `FastDepth`, `pcm_chunks`, and `pcm16_bytes`. Preserve existing CLI behavior when changing shared code.
 - `character_store.py`: character profiles, immutable conversation snapshots, and bounded memory extraction.
 - `media_processing.py`: bounded MP3/MP4/WAV probe, decode to 24 kHz mono PCM16, and silence-aware slicing.
-- `training_store.py`, `training_service.py`, `breeze_training.py`: dataset/snapshot review gates, LoRA training jobs, checkpoints, versioned A/B validation records, and publishing immutable voice versions.
+- `training_store.py`, `training_service.py`: review gates, frozen task ZIP export, result ZIP import, Mac A/B validation, and publishing immutable voice versions.
+- `training_exchange.py`, `ubuntu_training.py`, `breeze_training.py`: shared package format, CUDA LoRA worker with checkpoints, and adapter primitives.
 - `separate_vocals.py` + `requirements-separator.txt`: standalone vocal separation CLI that runs in its own `.venv-separator` and calls `demucs-mlx`; outputs a review WAV plus an uploadable MP3. Not part of the web service.
 - `benchmark_voice.py`: local TTS benchmark (cold/warm RTF, first-chunk latency, raw values + medians) written to ignored `web-test-artifacts/`. `--depth-mode {cached,compiled,native}` compares decoder modes, `--verify` checks numerical parity. Pure helpers `summarize`/`rtf` are unit-tested; the CLI loads the real engine, so stop the app first to avoid two GPU processes. The app reads `BREEZE_DEPTH_MODE` (default `cached`).
 - `web/`: chat frontend (native HTML/CSS/JS, no build step). `web/vad.js` and `web/realtime-worklet.js` are shared with the realtime page.

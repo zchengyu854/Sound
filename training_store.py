@@ -11,6 +11,8 @@ from uuid import uuid4
 
 from fastapi import HTTPException
 
+from training_exchange import canonical
+
 
 SCHEMAS = {
     "training_datasets": "id TEXT PRIMARY KEY, name TEXT NOT NULL, version INTEGER NOT NULL DEFAULT 1, status TEXT NOT NULL DEFAULT 'new', approved_duration REAL NOT NULL DEFAULT 0, speaker_confirmed INTEGER NOT NULL DEFAULT 0, preferred_reference_id TEXT",
@@ -23,10 +25,6 @@ JSON_FIELDS = {"metadata", "quality_hints", "quality_stats", "snapshot", "config
 FIELDS = {table: {part.strip().split()[0] for part in schema.split(', ') if not part.startswith('UNIQUE')} for table, schema in SCHEMAS.items()}
 IMMUTABLE = {"id", "dataset_id", "source_id", "audio_id", "snapshot", "digest", "config", "request_key",
              "created_at", "kind", "job_id", "parent_job_id", "preferred_reference_id"}
-
-
-def canonical(value):
-    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(',', ':'), allow_nan=False)
 
 
 def reference_rank(segment):

@@ -14,6 +14,7 @@ from unittest.mock import patch
 from types import SimpleNamespace
 from uuid import uuid4
 import wave
+from zipfile import ZipFile
 
 from fastapi import HTTPException
 from fastapi.testclient import TestClient
@@ -21,7 +22,8 @@ from fastapi.testclient import TestClient
 from test_voice_app import Engine, Transcriber, wav_bytes
 from audio_runtime import UnreliableTranscript
 from training_service import (TrainingConfig, TrainingService, PreviewInput, Cancelled, canonical,
-                              deterministic_order, select_preview_texts, training_summary)
+                              select_preview_texts, training_summary)
+from training_exchange import deterministic_order
 from voice_app import create_app
 
 
@@ -96,6 +98,24 @@ class TrainingServiceTests(unittest.TestCase):
 
     def job(self, dataset):
         return self.service.store.create_job(dataset["id"], "train", TrainingConfig(steps=1).checked())
+    def result_package(self, job, *, adapter=b"adapter", **overrides):
+        result = {**self.service.task_identity(job), "base_digest": "a" * 64,
+                  "initial_adapter_digest": "b" * 64, "steps": 1,
+                  "adapter_sha256": hashlib.sha256(adapter).hexdigest(),
+                  "validation_losses": [], "validation_trend": [], "best_checkpoint": None,
+                  "step_log": [{"step": 1, "loss": 2, "gradient_norm": 1,
+                                "learning_rate": job["config"]["learning_rate"], "epoch": 1}],
+                  "sampling": {"epoch": 1, "position": 1}, **overrides}
+        output = io.BytesIO()
+        with ZipFile(output, "w") as archive:
+            archive.writestr("result.json", json.dumps(result))
+            archive.writestr("adapter.safetensors", adapter)
+        return output.getvalue()
+
+    def import_result(self, job, **overrides):
+        return self.client.post(f"/api/training/jobs/{job['id']}/result", files={
+            "result": ("result.zip", self.result_package(job, **overrides), "application/zip")})
+
     def completed_job(self, note="", confirmed=False):
         dataset, _ = self.approved()
         job = self.job(dataset)
@@ -242,18 +262,19 @@ class TrainingServiceTests(unittest.TestCase):
             release.wait(5)
             raise ValueError("mock failure")
 
-        def train(job, cancel, resume):
+        def validate(job, cancel, result):
             thread_ids.append(threading.get_ident())
             training_entered.set()
             self.service.stage(job["id"], "cancelled")
 
         with patch("voice_metrics.SpeakerEmbeddingModel.download"), \
                 patch.object(self.service, "metrics_features_on_worker", side_effect=features), \
-                patch.object(self.service, "train", side_effect=train):
+                patch.object(self.service, "validate_import", side_effect=validate):
             try:
                 self.client.post(f"/api/training/jobs/{job['id']}/metrics")
                 self.assertTrue(entered.wait(5))
                 pending = self.service.submit(job["dataset_id"], "train", TrainingConfig(steps=1).checked())
+                self.assertEqual(self.import_result(pending).status_code, 202)
                 self.assertFalse(training_entered.wait(0.1))
                 self.assertTrue(self.chat.gate.locked())
                 release.set()
@@ -305,33 +326,54 @@ class TrainingServiceTests(unittest.TestCase):
         with self.assertRaises(HTTPException):
             self.service.verify_snapshot(job)
 
-    def test_wait_cancel_and_resource_ownership(self):
-        dataset, _ = self.approved()
+    def test_export_uses_frozen_review_and_never_reserves_model(self):
+        dataset, segment = self.approved()
+        value = dataset["id"]
         self.chat.gate.acquire()
+        try:
+            job = self.service.submit(value, "train", TrainingConfig(steps=1).checked())
+            self.assertEqual(job["status"], "awaiting_result")
+            self.assertIsNone(self.service.control)
+            self.service.store.edit_segment(segment, transcript="修改后的原文。")
+            path = f"/api/training/jobs/{job['id']}"
+            exported = self.client.get(f"{path}/export")
+            self.assertEqual(exported.status_code, 200, exported.text if not exported.is_success else "")
+            with ZipFile(io.BytesIO(exported.content)) as package:
+                manifest = json.loads(package.read("task.json"))
+                self.assertEqual(manifest["identity"]["snapshot_digest"], job["digest"])
+                self.assertEqual(manifest["snapshot"]["segments"][0]["transcript"], "训练原文。")
+                self.assertEqual(package.read("audio/0.wav"), wav_bytes())
+            self.assertEqual(self.client.post(f"{path}/cancel").json()["status"], "cancelled")
+            self.assertTrue(self.chat.gate.locked())  # The previous owner still owns it.
+        finally:
+            self.chat.gate.release()
+
+    def test_result_rejects_cross_job_and_stale_attempt_and_tampering(self):
+        dataset, _ = self.approved()
         job = self.service.submit(dataset["id"], "train", TrainingConfig(steps=1).checked())
-        with self.assertRaises(HTTPException) as busy:
-            self.chat.reserve(False)
-        self.assertEqual(busy.exception.status_code, 409)
-        with self.assertRaises(HTTPException):
-            self.chat.start_transcription(b"\0" * 16000, 0.5)
+        self.assertEqual(self.import_result(job, job_id=str(uuid4())).status_code, 409)
+        self.assertEqual(self.import_result(job, snapshot_digest="c" * 64).status_code, 409)
+        self.assertEqual(self.import_result(job, adapter_sha256="c" * 64).status_code, 422)
         self.service.cancel(job["id"])
-        self.wait(lambda: self.service.control is None)
-        self.assertEqual(self.service.store.one("training_jobs", job["id"])["status"], "cancelled")
-        self.assertTrue(self.chat.gate.locked())  # The previous owner still owns it.
-        self.chat.gate.release()
+        retried = self.service.retry(job["id"])
+        self.assertEqual(retried["attempt"], job["attempt"] + 1)
+        self.assertEqual(self.import_result(job).status_code, 409)
+        self.assertIsNone(self.service.control)
+        self.assertEqual(self.service.store.one("training_jobs", job["id"])["status"], "awaiting_result")
 
     def test_cancel_does_not_release_running_model_early(self):
         dataset, _ = self.approved()
         entered, release = threading.Event(), threading.Event()
 
-        def running(job, cancel, resume):
+        def running(job, cancel, result):
             self.service.stage(job["id"], "training")
             entered.set()
             release.wait(5)
             self.service.check(cancel)
 
-        with patch.object(self.service, "train", side_effect=running):
+        with patch.object(self.service, "validate_import", side_effect=running):
             job = self.service.submit(dataset["id"], "train", TrainingConfig(steps=1).checked())
+            self.assertEqual(self.import_result(job).status_code, 202)
             self.assertTrue(entered.wait(5))
             self.service.cancel(job["id"])
             self.assertTrue(self.chat.gate.locked())
@@ -341,23 +383,21 @@ class TrainingServiceTests(unittest.TestCase):
         self.assertFalse(self.chat.gate.locked())
         self.assertEqual(self.service.store.one("training_jobs", job["id"])["status"], "cancelled")
 
-    def test_checkpoint_roundtrip_and_incompatible_resume(self):
+    def test_ubuntu_checkpoint_roundtrip(self):
         import mlx.core as mx
         import mlx.optimizers as optim
         from mlx.utils import tree_unflatten
         from breeze_training import attach_lora, train_step, load_adapter, parameter_digest
         from test_breeze_training import TinyBreeze
-        dataset, _ = self.approved()
-        job = self.job(dataset)
+        from ubuntu_training import save_checkpoint
+        work = Path(self.temp.name)
         model = TinyBreeze()
         attach_lora(model)
         optimizer = optim.Adam(1e-4)
         train_step(model, optimizer, mx.ones((1, 2, 64)), mx.array([[[1, 2, 3]]]))
-        self.service.save_checkpoint(job, model, optimizer, 1, "base-hash")
-        job = self.service.store.one("training_jobs", job["id"])
-        metadata = self.service.validate_checkpoint(job)
-        self.assertEqual(metadata["step"], 1)
-        folder = self.service.checkpoint_directory(job)
+        save_checkpoint(work, model, optimizer, 1, {"step": 1})
+        folder = work / "checkpoint-0001"
+        self.assertEqual(json.loads((folder / "metadata.json").read_text()), {"step": 1})
         restored = TinyBreeze()
         attach_lora(restored)
         load_adapter(restored, folder / "adapter.safetensors")
@@ -365,12 +405,7 @@ class TrainingServiceTests(unittest.TestCase):
         restored_optimizer.state = tree_unflatten(list(mx.load(str(folder / "optimizer.safetensors")).items()))
         self.assertEqual(parameter_digest(optimizer.state), parameter_digest(restored_optimizer.state))
         self.assertEqual(parameter_digest(model.trainable_parameters()), parameter_digest(restored.trainable_parameters()))
-        metadata["digest"] = "wrong"
-        (folder / "metadata.json").write_text(json.dumps(metadata))
-        self.service.store.update("training_jobs", job["id"], status="failed")
-        response = self.client.post(f"/api/training/jobs/{job['id']}/retry", json={"resume": True})
-        self.assertEqual(response.status_code, 409)
-        self.assertIsNone(self.service.control)
+
     def test_publish_requires_confirmed_preview(self):
         job, _, texts = self.completed_job()
         detail = self.client.get(f"/api/training/jobs/{job['id']}").json()

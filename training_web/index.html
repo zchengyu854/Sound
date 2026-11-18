@@ -13,7 +13,7 @@
 <body>
   <a class="skip" href="#workspace">跳到训练工作区</a>
   <header class="masthead">
-    <div class="identity"><span class="mark" aria-hidden="true">声</span><div><h1>声线研习室</h1><p>本地角色声音训练</p></div></div>
+    <div class="identity"><span class="mark" aria-hidden="true">声</span><div><h1>声线研习室</h1><p>Ubuntu 训练 · Mac 试听</p></div></div>
     <div class="connection"><span id="connection-dot" class="dot" aria-hidden="true"></span><span id="connection">正在连接本机服务</span><button id="refresh" class="quiet" type="button">刷新状态</button></div>
   </header>
   <div id="notice" class="notice" role="status" aria-live="polite" hidden></div>
@@ -22,7 +22,7 @@
       <div class="section-heading"><h2>声音素材集</h2><button id="new-dataset" type="button" class="small">新建</button></div>
       <p class="muted">每个素材集，只保留一位说话者。</p>
       <div id="datasets" class="dataset-list"><p class="muted">正在读取素材集…</p></div>
-      <div class="local-note"><span class="dot steady" aria-hidden="true"></span><div>素材留在本机<p>独立训练页，不改动聊天首页。仅使用本人或已获授权的声音。</p></div></div>
+      <div class="local-note"><span class="dot steady" aria-hidden="true"></span><div>录音在 Mac 审核<p>任务包包含已审核的音频和原文。仅使用本人或已获授权的声音。</p></div></div>
     </aside>
     <main id="workspace" tabindex="-1">
       <nav class="workbench-nav" role="tablist" aria-label="训练工作区">
@@ -102,9 +102,9 @@
             <label>每几步保存<input name="checkpoint_every" type="number" value="1" min="1" max="100" step="1" required></label>
             <label>随机种子<input name="seed" type="number" value="42" min="0" max="2147483647" step="1" required></label>
           </div></details>
-          <button id="start-training" class="primary full" type="submit" disabled>开始本地训练</button>
+          <button id="start-training" class="primary full" type="submit" disabled>创建 Ubuntu 训练任务</button>
         </form>
-        <p class="footnote">训练会暂时占用模型，期间聊天合成与识别不可用。默认 20 步仅是短跑；用未训练文本对照 20、50、100 步，数据不足时先补清晰、单人、逐字校对素材。</p>
+        <p class="footnote">Ubuntu 训练期间可继续使用 Mac 聊天。导入结果后，生成 A/B 试听时会短暂占用 Mac 模型。默认 20 步仅是短跑；用未训练文本对照 20、50、100 步，数据不足时先补清晰、单人、逐字校对素材。</p>
       </section>
       <section class="job-section" aria-labelledby="job-title">
         <div class="section-heading"><h2 id="job-title">任务记录</h2><span class="muted">最近 50 条</span></div>
@@ -114,9 +114,10 @@
           <div class="job-status"><strong id="job-status"></strong><span id="job-attempt" class="muted"></span></div>
           <p id="job-progress-text" class="muted"></p><progress id="job-progress" aria-labelledby="job-progress-text" hidden></progress>
           <p id="job-error" class="job-error" hidden></p><p id="validation-warning" class="footnote" hidden></p><p id="job-summary" class="footnote" hidden></p>
-          <div class="job-actions"><button id="cancel-job" class="danger" type="button" hidden>取消任务</button><button id="retry-job" type="button" hidden>重新尝试</button><button id="restart-job" class="quiet small" type="button" hidden>放弃检查点重训</button><button id="variant-job" class="quiet small" type="button" hidden>按原快照做对照训练</button></div>
+          <div id="exchange-actions" class="job-actions" hidden><a class="button" id="export-task">下载训练任务包</a><label for="result-file">导入 Ubuntu 结果包</label><input id="result-file" type="file" accept=".zip,application/zip"></div>
+          <div class="job-actions"><button id="cancel-job" class="danger" type="button" hidden>取消任务</button><button id="retry-job" type="button" hidden>重新尝试</button><button id="variant-job" class="quiet small" type="button" hidden>按原快照做对照训练</button></div>
           <p id="variant-note" class="footnote" hidden>对照训练复制原任务的数据快照与全部参数，只改步数，从同一基座和随机种子重新训练；与“从检查点恢复”不同，且不共享检查点。</p>
-          <p id="cancel-note" class="footnote" hidden>取消将在当前片段或训练步骤退出后生效，不会提前释放模型。</p>
+          <p id="cancel-note" class="footnote" hidden>取消会在当前素材处理或试听操作退出后生效。</p>
           <section id="preview-section" class="preview-section" hidden>
             <div class="section-heading"><h3>试听验收</h3><span class="tag">发布前必做</span></div>
             <p class="muted">每条文本按“基座 / 训练后”成对试听，使用同一文本、同一参考片段、同一推理配置与随机种子。逐条检查音色、发音、断句和失真；RTF 等指数不是音色相似度。有效 WAV 与低损失也不代表音色相似。</p>
@@ -135,7 +136,7 @@
       </section>
     </main>
   </div>
-  <footer class="page-footer">训练只在本机进行。请用未参与训练的句子试听，确认音色、发音与失真情况。</footer>
+  <footer class="page-footer">Ubuntu 训练完成后，把结果包导入 Mac 生成 A/B 试听。请用未参与训练的句子试听，确认音色、发音与失真情况。</footer>
   <dialog id="create-dialog" aria-labelledby="create-title"><form id="create-form"><div class="section-heading"><h2 id="create-title">新建声音素材集</h2><button id="close-create" class="quiet small" type="button" aria-label="关闭新建素材集">关闭</button></div><p class="muted">为一位目标说话者建立独立素材集。</p><label>素材集名称<input id="dataset-name" maxlength="60" required placeholder="例如：角色一的声音" autocomplete="off"></label><p id="create-error" class="job-error" role="alert" hidden></p><button id="create-dataset" class="primary full" type="submit">创建素材集</button></form></dialog>
   <noscript>此训练工作台需要启用 JavaScript。也可以通过本机 /docs 操作训练 API。</noscript>
 </body>

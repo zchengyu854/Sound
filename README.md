@@ -1,10 +1,11 @@
 # BreezeTTS2 Mac Streaming
 
-面向 Apple Silicon 的本地语音项目：用 Breeze-TTS-2 做流式语音合成，并提供网页聊天与本地声音训练工作台。
+面向 Apple Silicon 的本地语音项目：用 Breeze-TTS-2 做流式语音合成，并提供网页聊天与跨机声音训练工作台。
 
 - `breezetts2_mac_fast.py`：重写 Breeze-TTS-2 流式生成循环，减少重复计算并输出 RTF / underflow 诊断。
 - `voice_app.py` + `web/`：FastAPI + 原生网页 + SQLite 的本地语音聊天，支持参考声音、独立会话和 AI 文字回复。
-- `training_service.py` + `training_web/`：本地声音训练工作台，支持 MP3 / MP4 预处理、切片转写、试听对照与发布。
+- `training_service.py` + `training_web/`：Mac 工作台，负责素材审核、任务包导出、结果导入、A/B 试听与发布。
+- `ubuntu_training.py`：Ubuntu CUDA LoRA 训练，读取冻结任务 ZIP 并生成结果 ZIP。
 
 ## 快速开始
 
@@ -22,4 +23,4 @@ uv pip install --python .venv/bin/python -r requirements-web.txt
 uv run --python 3.12 breezetts2_mac_fast.py
 ```
 
-训练功能还需要本机安装 `ffmpeg` 和 `ffprobe`。更多配置与 API 见 [WEB_APP.md](WEB_APP.md)。
+Mac 的素材预处理需要 `ffmpeg` 和 `ffprobe`。跨机操作步骤见 [Ubuntu CUDA 训练命令](WEB_APP.md#ubuntu-cuda-训练命令)。

@@ -3,10 +3,10 @@
 (() => {
   const PAGE_SIZE = 20;
   const ACTIVE = new Set(["queued", "preparing", "transcribing", "training", "validating", "cancelling"]);
-  const STATUS = {queued: "排队等待", preparing: "准备素材与模型", transcribing: "逐片转写", review_required: "等待人工审核", training: "正在训练", validating: "验证训练产物", completed: "训练完成，待试听确认", failed: "任务失败", cancelling: "正在取消", cancelled: "已取消"};
+  const STATUS = {awaiting_result: "等待 Ubuntu 训练结果", queued: "排队等待", preparing: "准备素材与模型", transcribing: "逐片转写", review_required: "等待人工审核", training: "正在训练", validating: "验证训练产物", completed: "训练完成，待试听确认", failed: "任务失败", cancelling: "正在取消", cancelled: "已取消"};
   const REVIEW = {pending: "待审核", approved: "已确认", excluded: "已排除"};
   const HINTS = {forced_split_check_words: "强制切分，请检查断词", short_segment: "片段偏短，请检查内容", low_volume_or_silence: "低音量或静音", possible_clipping: "可能削波失真", no_speech: "未识别到人声，请人工核对", transcription_failed_edit_required: "转写失败，请手动填写原文", low_confidence_transcript: "转写可靠性低，请逐字校对", one_character_text: "只有 1 个字，请核对原文与音频", trimmed_edges: "已修剪首尾停顿，请试听确认没有切掉轻声", low_voiced_ratio: "有声占比偏低，请确认是否为有效语音"};
-  const ERRORS = {interrupted: "上次任务因应用退出而中断，请显式重试或恢复。", training_failed: "任务执行失败。请检查素材、可用内存和模型状态，再重试。", dispatch_failed: "任务未能投递，请重试。", cancelled: "任务已取消。可在退出后显式恢复或重试。", media_timeout: "媒体工具处理超时。请缩短素材后重新上传。", invalid_media: "素材损坏或无法解码，请重新导出 MP3、MP4 或 WAV。", unsupported_codec: "WAV 必须使用未压缩 PCM 编码，不能是压缩或浮点格式。", disk_space: "磁盘剩余空间不足，请清理空间后重试。", decoded_size_limit: "解码音频超过限制，请先缩短素材。", duration_limit: "媒体实际时长超限，请缩短素材。", container_mismatch: "扩展名与实际容器不一致，请正确导出素材。", no_audio_stream: "视频没有可用音轨。", media_tool_unavailable: "未找到 FFmpeg 或 FFprobe，请安装后重试。"};
+  const ERRORS = {adapter_mismatch: "结果包中的 adapter 与 Mac 推理模型不兼容。", base_mismatch: "Ubuntu 与 Mac 的基座权重不一致，请用相同基座重新训练。", interrupted: "上次任务因应用退出而中断，请显式重试或恢复。", training_failed: "任务执行失败。请检查素材、可用内存和模型状态，再重试。", dispatch_failed: "任务未能投递，请重试。", cancelled: "任务已取消。可在退出后显式恢复或重试。", media_timeout: "媒体工具处理超时。请缩短素材后重新上传。", invalid_media: "素材损坏或无法解码，请重新导出 MP3、MP4 或 WAV。", unsupported_codec: "WAV 必须使用未压缩 PCM 编码，不能是压缩或浮点格式。", disk_space: "磁盘剩余空间不足，请清理空间后重试。", decoded_size_limit: "解码音频超过限制，请先缩短素材。", duration_limit: "媒体实际时长超限，请缩短素材。", container_mismatch: "扩展名与实际容器不一致，请正确导出素材。", no_audio_stream: "视频没有可用音轨。", media_tool_unavailable: "未找到 FFmpeg 或 FFprobe，请安装后重试。"};
 
   function formatDuration(value) {
     const seconds = Math.max(0, Math.round(Number(value) || 0));
@@ -473,7 +473,7 @@
 
     function canTrain() {
       const item = dataset();
-      return Boolean(item?.speaker_confirmed && item.approved_duration > 0 && state.capabilities?.available
+      return Boolean(item?.speaker_confirmed && item.approved_duration > 0 && !state.capabilities?.active_job
         && state.connected && !state.busy && !state.drafts.size);
     }
 
@@ -588,9 +588,12 @@
       $("job-empty").hidden = Boolean(item);
       $("preview-section").hidden = !(item?.kind === "train" && item.status === "completed");
       $("publish-form").hidden = !(item?.kind === "train" && item.status === "completed" && preview?.confirmed);
-      $("cancel-job").hidden = !item || !ACTIVE.has(item.status);
+      const awaitingResult = item?.kind === "train" && item.status === "awaiting_result";
+      $("exchange-actions").hidden = !awaitingResult;
+      if (awaitingResult) $("export-task").href = `${path("jobs", item.id)}/export`;
+      $("result-file").disabled = Boolean(state.busy || state.capabilities?.active_job || !state.connected);
+      $("cancel-job").hidden = !item || !(awaitingResult || ACTIVE.has(item.status));
       $("retry-job").hidden = !item || !["failed", "cancelled"].includes(item.status);
-      $("restart-job").hidden = !item || !["failed", "cancelled"].includes(item.status) || !item.checkpoint || item.kind !== "train";
       $("variant-job").hidden = !(item?.kind === "train" && item.status === "completed");
       $("variant-note").hidden = !(item?.kind === "train" && item.status === "completed");
       $("cancel-note").hidden = !item || !ACTIVE.has(item.status);
@@ -635,9 +638,9 @@
           $("job-summary").textContent = parts.join("；");
         }
         renderPreview(item, preview);
-        $("retry-job").textContent = item.kind === "train" && item.checkpoint ? "从检查点恢复" : "重新尝试";
+        $("retry-job").textContent = item.kind === "train" ? "重新创建训练任务包" : "重新尝试";
         $("cancel-job").disabled = Boolean(state.busy || item.status === "cancelling" || !state.connected);
-        $("retry-job").disabled = $("restart-job").disabled = Boolean(state.busy || state.capabilities?.active_job || !state.connected);
+        $("retry-job").disabled = Boolean(state.busy || state.capabilities?.active_job || !state.connected);
         $("variant-job").disabled = Boolean(state.busy || state.capabilities?.active_job || !state.connected);
         $("publish").disabled = Boolean(state.busy || state.capabilities?.active_job || !state.connected);
         if ($("voice-name").dataset.job !== item.id) {
@@ -689,7 +692,7 @@
       $("draft-notice").textContent = state.needsSegments ? "素材处理有更新。保存原文后点击刷新片段查看。" : "有尚未保存的原文。刷新或切换素材集前，请先保存。";
       for (const control of doc.querySelectorAll(".segment button, .segment textarea")) control.disabled = editingBlocked();
       $("start-training").disabled = !canTrain();
-      const readiness = !item ? "选择素材集后，先确认说话者并审核片段。" : state.drafts.size ? "请先保存或确认正在编辑的原文，再启动训练。" : !item.speaker_confirmed ? "请先确认素材属于同一位目标说话者。" : !(item.approved_duration > 0) ? "还没有确认的片段。先试听、校对并确认至少一条。" : !cap?.available ? "素材已具备审核条件，等待本机模型空闲且可用。" : `可训练：已确认 ${formatDuration(item.approved_duration)}。开始时会冻结当前原文与音频清单。`;
+      const readiness = !item ? "选择素材集后，先确认说话者并审核片段。" : state.drafts.size ? "请先保存或确认正在编辑的原文，再启动训练。" : !item.speaker_confirmed ? "请先确认素材属于同一位目标说话者。" : !(item.approved_duration > 0) ? "还没有确认的片段。先试听、校对并确认至少一条。" : cap?.active_job ? "素材已具备审核条件，等待当前本机任务完成。" : `可训练：已确认 ${formatDuration(item.approved_duration)}。创建任务会冻结当前原文和已审核的音频。`;
       const summary = item ? state.summary : null;
       const rollup = summary
         ? `已确认 ${summary.approved_segments} 段（${formatDuration(summary.approved_seconds)}）· 待审核 ${summary.pending_segments} 段 · 独立验证：${summary.independent_validation ? "有" : "无，需用未训练文本试听"}`
@@ -699,7 +702,7 @@
       $("reference-note").textContent = !summary ? "" : summary.reference_segment_id
         ? `试听与应用推理共用的合成参考：${summary.reference_segment_id}（${summary.reference_source === "preferred" ? "人工选择" : "自动按质量选择"}）。可在下方已确认片段中另行选择。`
         : summary.reference_note || "至少确认一条带原文的片段后才能选择试听参考。";
-      if (cap) $("environment").textContent = `FFmpeg：${cap.ffmpeg ? "可用" : "未安装"} / FFprobe：${cap.ffprobe ? "可用" : "未安装"}\n训练环境：${cap.compatible ? "版本兼容" : "不兼容，请检查固定依赖与 Apple Silicon"}\n${cap.hardware?.chip || "本机"}${cap.hardware?.memory_gib ? ` / ${cap.hardware.memory_gib} GiB` : ""}\n基座：${cap.base_model}\n${state.health?.model_error || state.health?.stt_error || "batch size 固定 1，原始模型权重冻结。"}`;
+      if (cap) $("environment").textContent = `FFmpeg：${cap.ffmpeg ? "可用" : "未安装"} / FFprobe：${cap.ffprobe ? "可用" : "未安装"}\nMac 试听环境：${cap.compatible ? "版本兼容" : "不兼容，请检查固定依赖与 Apple Silicon"}\n${cap.hardware?.chip || "本机"}${cap.hardware?.memory_gib ? ` / ${cap.hardware.memory_gib} GiB` : ""}\n基座：${cap.base_model}\n${state.health?.model_error || state.health?.stt_error || "batch size 固定 1，原始模型权重冻结。"}`;
       renderJob();
       renderComparison();
     }
@@ -951,14 +954,13 @@
 
     async function train(config) {
       if (!canTrain()) return;
-      if (!win.confirm("开始训练会暂时占用本机模型，聊天合成与识别需要等待。确定开始吗？")) return;
       const selected = state.selected, key = trainingKey(config);
       await perform("正在提交训练任务", async () => {
         const job = await api(`${path("datasets", selected)}/jobs`, json("POST", config, {"Idempotency-Key": key}));
         storageRemove(win.sessionStorage, "voice-training-request");
         state.jobs.unshift(job);
         state.jobId = job.id;
-        notice("训练任务已提交。可以关闭页面，稍后回来查看进度；请勿退出后端应用。");
+        notice("快照已冻结。下载任务包，在 Ubuntu 训练后导入结果 ZIP。");
       });
     }
 
@@ -985,15 +987,29 @@
         storageRemove(win.sessionStorage, "voice-variant-request");
         state.jobs.unshift(created);
         state.jobId = created.id;
-        notice("对照训练已提交。它与原任务使用同一不可变快照，只改变步数。");
+        notice("对照任务已创建。下载任务包后在 Ubuntu 运行。");
+      });
+    }
+
+    async function importResult(event) {
+      const job = currentJob(), file = event.target.files[0];
+      event.target.value = "";
+      if (!file || job?.status !== "awaiting_result") return;
+      await perform("正在校验 Ubuntu 结果包", async () => {
+        const body = new win.FormData();
+        body.append("result", file);
+        await api(`${path("jobs", job.id)}/result`, {method: "POST", body});
+        notice("结果包已接收，Mac 将生成 A/B 试听。");
       });
     }
 
     async function jobAction(action, resume = true) {
       const job = currentJob();
       if (!job || state.busy) return;
-      if (action === "cancel" && !win.confirm("确定取消此任务吗？当前片段或训练步骤退出后才会释放资源。")) return;
-      if (action === "retry" && !win.confirm(resume ? "确定显式重试此任务吗？有兼容检查点时将恢复原任务。" : "确定放弃检查点，从原始快照重新训练吗？")) return;
+      if (action === "cancel" && !win.confirm(job.status === "awaiting_result"
+        ? "确定撤销此任务的导入资格吗？已在 Ubuntu 运行的进程需在 Ubuntu 停止。"
+        : "确定取消此任务吗？当前操作退出后会释放模型。")) return;
+      if (action === "retry" && !win.confirm(job.kind === "train" ? "确定从原快照生成新的任务包吗？" : "确定重试此任务吗？")) return;
       await perform(action === "cancel" ? "正在请求取消" : "正在请求重试", async () => {
         const updated = await api(`${path("jobs", job.id)}/${action}`, json("POST", action === "retry" ? {resume} : {}));
         state.jobs = state.jobs.map(entry => entry.id === updated.id ? updated : entry);
@@ -1122,9 +1138,9 @@
         const job = currentJob();
         if (job && job.dataset_id === state.selected && job.kind === "train" && job.status === "completed") return postMetric("job", job.id, state.selected);
       });
+      $("result-file").addEventListener("change", importResult);
       $("cancel-job").addEventListener("click", () => jobAction("cancel"));
       $("retry-job").addEventListener("click", () => jobAction("retry", true));
-      $("restart-job").addEventListener("click", () => jobAction("retry", false));
       $("variant-job").addEventListener("click", createVariant);
       $("preview-check").addEventListener("change", renderJob);
       $("confirm-preview").addEventListener("click", () => confirmPreview());
