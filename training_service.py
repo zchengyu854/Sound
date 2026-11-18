@@ -18,7 +18,7 @@ from fastapi import APIRouter, File, Header, HTTPException, Query, UploadFile
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, ConfigDict, Field
 
-from training_store import TrainingStore, canonical
+from training_store import TrainingStore, canonical, select_reference
 
 log = logging.getLogger(__name__)
 MAX_SOURCE = 200 * 1024**2
@@ -45,6 +45,12 @@ class SegmentInput(BaseModel):
 class DatasetReviewInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
     speaker_confirmed: bool
+
+
+class ReferenceInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    # None returns to the automatic quality-based choice.
+    segment_id: str | None = Field(default=None, max_length=64)
 
 
 class TrainingConfig(BaseModel):
@@ -108,6 +114,7 @@ def training_summary(job):
     training = [segments[i] for i in indices if 0 <= i < len(segments)]
     visits = int(config.get("steps", 0)) * int(config.get("accumulation_steps", 1))
     seconds = sum(max(0.0, segment.get("end", 0) - segment.get("start", 0)) for segment in training)
+    full_epochs, remainder = divmod(visits, len(training)) if training else (0, 0)
     return {
         "training_segments": len(training),
         "training_seconds": round(seconds, 2),
@@ -116,8 +123,47 @@ def training_summary(job):
         "sample_visits": visits,
         "unique_segments_seen": min(visits, len(training)),
         "approx_passes": round(visits / len(training), 2) if training else 0,
+        # Planned coverage: a short run only sees part of the shuffled material.
+        "full_epochs": full_epochs,
+        "partial_epoch_samples": remainder,
+        "coverage_complete": bool(training) and remainder == 0,
         "independent_validation": bool(snapshot.get("validation_indices")),
+        "validation_kind": snapshot.get("validation_kind"),
+        "reference_segment_id": snapshot.get("reference_segment_id"),
+        "reference_source": snapshot.get("reference_source"),
     }
+
+
+RECIPE_VERSION = "breeze-lora-recipe-2"
+EVALUATION_VERSION = "voice-metrics-2"
+STEP_LOG_LIMIT = 1000
+REFERENCE_LABELS = {
+    "independent_source": "按来源留出验证",
+    "same_recording": "同录音留出验证",
+}
+
+
+def reference_segment(job):
+    """The synthesis reference recorded in the snapshot, with a legacy fallback.
+
+    Old snapshots predate the explicit field and used the first array entry.
+    """
+    snapshot = job.get("snapshot") or {}
+    segments = snapshot.get("segments") or []
+    reference_id = snapshot.get("reference_segment_id")
+    if reference_id:
+        for segment in segments:
+            if segment.get("id") == reference_id:
+                return segment
+        raise HTTPException(409, "训练快照的试听参考片段无效。")
+    return segments[0] if segments else None
+
+
+def deterministic_order(size, seed, epoch):
+    """Reproducible shuffle of the training subset for one epoch."""
+    import numpy as np
+    generator = np.random.default_rng([int(seed), int(epoch), 0x5EED])
+    return [int(value) for value in generator.permutation(size)]
 
 
 class TrainingService:
@@ -250,6 +296,7 @@ class TrainingService:
                           "metrics": self.metrics_view("job", job["id"])} for job in jobs]}
 
     def metrics_inputs(self, kind, value):
+        base_previews, inference, reference_label, source_reference = [], None, None, None
         if kind == "dataset":
             with self.lock:
                 dataset = self.store.one("training_datasets", value)
@@ -259,6 +306,7 @@ class TrainingService:
             reference_segments, reference_kind = segments, "current"
             texts, previews, evidence = [], [], None
             version = dataset["version"]
+            source_reference = dataset.get("preferred_reference_id")
         else:
             job = self.store.one("training_jobs", value)
             self._require_completed_train(job)
@@ -274,8 +322,17 @@ class TrainingService:
                 raise HTTPException(409, "训练快照参考片段无效。")
             reference_segments = [segments[index] for index in indices]
             reference_kind = "validation" if snapshot.get("validation_indices") else "training"
+            reference_label = REFERENCE_LABELS.get(snapshot.get("validation_kind"))
+            reference = reference_segment(job)
+            source_reference = reference["id"] if reference else None
             texts = validation["preview_texts"]
             previews = [self.preview_file(job, index) for index in (1, 2)]
+            base_previews = [self.preview_file(job, index, variant="base") for index in (1, 2)
+                             if (self.job_directory(job) / f"validation-base-{index:02d}.wav").is_file()]
+            if validation.get("ab", 0) < 2:
+                base_previews = []
+            if isinstance(validation.get("inference_config"), dict):
+                inference = dict(validation["inference_config"])
             version = snapshot["version"]
         entries = []
         for segment in segments:
@@ -293,9 +350,11 @@ class TrainingService:
         material = [{"id": entry["id"], "sha256": entry["sha256"], "transcript": entry["transcript"]}
                     for entry in entries]
         source = {"dataset_version": version, "material_digest": hashlib.sha256(canonical(material).encode()).hexdigest(),
-                  "reference_kind": reference_kind, "reference_ids": [],
-                  "preview_texts": texts, "preview_audio_sha256": evidence["preview_audio_sha256"] if evidence else {}}
-        return entries, references, previews, source
+                  "reference_kind": reference_kind, "reference_label": reference_label,
+                  "reference_ids": [], "synthesis_reference_id": source_reference,
+                  "preview_texts": texts, "inference": inference,
+                  "preview_audio_sha256": evidence["preview_audio_sha256"] if evidence else {}}
+        return entries, references, previews, base_previews, source
 
     def verify_metrics_inputs(self, kind, value, entries):
         if kind == "job":
@@ -358,13 +417,118 @@ class TrainingService:
                 except BaseException:
                     self.chat.stt_status = "failed"
                     self.chat.stt_error = "音色分析后识别模型恢复失败，请重启应用。"
+    INDEX_NOTE = "0–100 是声纹余弦相似度的缩放指数：不等于克隆准确率，也不衡量发音正确率。"
+
+    @classmethod
+    def features_view(cls, scores, trained_count, base_count=0):
+        """Split speaker scores into independently meaningful parts.
+
+        Reference consistency needs at least two references; generated
+        similarity needs one. A single reference therefore limits one index
+        without hiding the other, and a base/trained pair is only compared when
+        both sides were fully scored on the same references.
+        """
+        from voice_metrics import (ALGORITHM, EVALUATION_VERSION, QUALITY_ALGORITHM,
+                                   SPEAKER_MODEL_ID, reason_message)
+        scores = scores if isinstance(scores, dict) else {}
+        records = list(scores.get("generated") or [])
+        trained = records[:trained_count]
+        base = records[trained_count:trained_count + base_count]
+        metadata = scores.get("model") if isinstance(scores.get("model"), dict) else {}
+        model_error = scores.get("model_error")
+        consistency = scores.get("reference_consistency") or {}
+        reference_count = consistency.get("reference_count")
+        if not isinstance(reference_count, int):
+            reference_count = records[0].get("reference_count", 0) if records else 0
+
+        def part(items, expected, empty_reason):
+            # Records without a numeric score are failures, not zeros.
+            scored = [item for item in items
+                      if item.get("status") == "ok" and isinstance(item.get("score"), (int, float))]
+            failed = [item for item in items if item not in scored]
+            if scored and expected and len(scored) == expected:
+                status, reason = "ok", None
+            elif scored:
+                status, reason = "partial", "partial_generated"
+            else:
+                status = "unavailable"
+                reason = model_error and "model_load_failed" or (failed[0].get("reason") if failed else empty_reason)
+            return {"status": status, "reason": reason,
+                    "message": reason_message(reason) if reason else "",
+                    "score": sum(item["score"] for item in scored) / len(scored) if scored else None,
+                    "sample_count": len(scored), "expected_count": max(expected, len(items)),
+                    "failed_count": len(failed), "reference_count": reference_count}
+
+        reason = consistency.get("reason")
+        consistency_part = {"status": consistency.get("status") or "unavailable", "reason": reason,
+                            "message": reason_message(reason) if reason else "",
+                            "score": consistency.get("score"),
+                            "reference_count": reference_count,
+                            "pair_count": consistency.get("pair_count", 0)}
+        if trained_count:
+            generated_part = part(trained, trained_count, "generated_audio_missing")
+        else:
+            # Dataset-level analysis has no generated audio to score.
+            generated_part = {"status": "not_applicable", "reason": None, "message": "",
+                              "score": None, "sample_count": 0, "expected_count": 0,
+                              "failed_count": 0, "reference_count": reference_count}
+        base_part = part(base, base_count, "generated_audio_missing") if base_count else None
+        training_effect = None
+        if base_part is not None:
+            complete = base_part["status"] == "ok" and generated_part["status"] == "ok"
+            training_effect = {
+                "status": "ok" if complete else "partial" if (
+                    base_part["score"] is not None and generated_part["score"] is not None) else "unavailable",
+                "base_index": base_part["score"], "trained_index": generated_part["score"],
+                "delta": (round(generated_part["score"] - base_part["score"], 3) if complete else None),
+                "reason": None if complete else (generated_part["reason"] or base_part["reason"]
+                                                 or "partial_generated"),
+                "message": "" if complete else "基座与训练后没有在同一条参考、同一组文本上完整算出，暂不显示差值。",
+            }
+        if model_error:
+            status, message = "failed", "声纹模型不可用，音色指标未能计算；音频质量仍可查看。"
+        elif generated_part["status"] in ("ok", "not_applicable") and consistency_part["status"] == "ok":
+            status, message = "completed", ""
+        elif generated_part["score"] is not None or consistency_part["score"] is not None:
+            status = "partial"
+            message = " ".join(item["message"] for item in (consistency_part, generated_part) if item["message"])
+        else:
+            status = "insufficient"
+            message = (" ".join(item["message"] for item in (consistency_part, generated_part) if item["message"])
+                       or "没有可用于比较的参考片段。")
+        previews = [{"index": index, "value": item.get("score"),
+                     "reference_count": item.get("reference_count", reference_count),
+                     "status": item.get("status"), "reason": item.get("reason"),
+                     "message": reason_message(item.get("reason")) if item.get("reason") else ""}
+                    for index, item in enumerate(trained, 1)]
+        return {
+            "status": status, "message": message, "index_note": cls.INDEX_NOTE,
+            "model": SPEAKER_MODEL_ID,
+            "revision": metadata.get("revision"),
+            "requested_revision": metadata.get("requested_revision"),
+            "algorithm": scores.get("algorithm") or ALGORITHM,
+            "quality_algorithm": scores.get("quality_algorithm") or QUALITY_ALGORITHM,
+            "evaluation_version": scores.get("evaluation_version") or EVALUATION_VERSION,
+            "reference_consistency": consistency_part,
+            "generated_similarity": generated_part,
+            "base_similarity": base_part,
+            "training_effect": training_effect,
+            # Backward-compatible aliases keep old records and history charts readable.
+            "original_index": consistency_part["score"],
+            "generated_index": generated_part["score"],
+            "reference_count": reference_count, "pair_count": consistency_part["pair_count"],
+            "generated_count": generated_part["sample_count"],
+            "previews": previews,
+        }
+
     def run_metrics(self, kind, value, path):
-        from voice_metrics import (SPEAKER_MODEL_ID, MIN_REFERENCE_SECONDS, MAX_REFERENCES,
-                                   SpeakerEmbeddingModel, compute_dataset_metrics)
+        from voice_metrics import (ALGORITHM, EVALUATION_VERSION, MAX_REFERENCES, MIN_REFERENCE_SECONDS,
+                                   QUALITY_ALGORITHM, SPEAKER_MODEL_ID, SpeakerEmbeddingModel,
+                                   compute_dataset_metrics)
         result = None
         try:
             self.check(self.metrics_cancel)
-            entries, references, previews, source = self.metrics_inputs(kind, value)
+            entries, references, previews, base_previews, source = self.metrics_inputs(kind, value)
             original = compute_dataset_metrics([entry["path"] for entry in entries])
             generated = compute_dataset_metrics(previews) if previews else None
             per_preview = [self.quality_view(compute_dataset_metrics([preview])) for preview in previews]
@@ -373,9 +537,12 @@ class TrainingService:
                                   "generated": self.quality_view(generated) if generated else None,
                                   "previews": per_preview},
                       "features": {"status": "pending", "model": SPEAKER_MODEL_ID,
-                                   "revision": None, "algorithm": "speaker-cosine-v1",
+                                   "revision": None, "algorithm": ALGORITHM,
+                                   "quality_algorithm": QUALITY_ALGORITHM,
+                                   "evaluation_version": EVALUATION_VERSION,
                                    "reference_count": 0, "pair_count": 0, "original_index": None,
-                                   "generated_index": None, "previews": [], "message": ""},
+                                   "generated_index": None, "previews": [], "message": "",
+                                   "index_note": self.INDEX_NOTE},
                       "comparison_key": None}
             self.write_metrics(path, {"status": "running", "message": "音频质量已计算，正在分析音色。", "result": result})
             self.check(self.metrics_cancel)
@@ -392,48 +559,41 @@ class TrainingService:
                     with self.model_slot(value, self.metrics_cancel):
                         scores = self.chat.worker.submit(
                             self.metrics_features_on_worker, model,
-                            [entry["path"] for entry in eligible], previews).result()
+                            [entry["path"] for entry in eligible], previews + base_previews).result()
                     self.check(self.metrics_cancel)
-                    consistency = scores["reference_consistency"]
-                    aggregate = scores["generated_aggregate"]
                     by_path = {str(entry["path"]): entry["id"] for entry in references}
                     source["reference_ids"] = [by_path[item["path"]] for item in scores["references"]
                                                if item["status"] == "ok"]
-                    count = consistency["reference_count"]
-                    feature = result["features"]
-                    feature.update({"status": "completed" if count >= 2 else "insufficient",
-                        "message": "" if count >= 2 else "有效原声片段不足两条，无法计算原声内部一致性。",
-                        "revision": (scores.get("model") or {}).get("revision"),
-                        "reference_count": count, "pair_count": consistency["pair_count"],
-                        "original_index": consistency["score"],
-                        "generated_index": aggregate["score"] if aggregate["sample_count"] == 2 else None,
-                        "generated_count": aggregate["sample_count"],
-                        "previews": [{"index": index, "value": item["score"],
-                                      "reference_count": item["reference_count"], "status": item["status"],
-                                      "reason": item["reason"]}
-                                     for index, item in enumerate(scores["generated"], 1)]})
-                    if scores.get("model_error"):
-                        feature.update(status="failed", message="音色模型加载失败，请检查模型缓存后重试。")
-                    elif count == 0:
-                        feature.update(status="failed", message="参考片段特征提取失败，请检查音频后重试。")
-                    elif previews and aggregate["sample_count"] != 2:
-                        feature["message"] = (feature["message"] + " 两条试听未能全部提取特征，请检查音频并重试。 ").strip()
+                    self.check(self.metrics_cancel)
+                    feature = self.features_view(scores, len(previews), len(base_previews))
+                    result["features"] = feature
                     if feature["revision"] and feature["generated_index"] is not None:
                         comparison = {"material_digest": source["material_digest"],
                                       "reference_kind": source["reference_kind"],
-                                      "reference_ids": source["reference_ids"], "preview_texts": source["preview_texts"],
+                                      "reference_ids": source["reference_ids"],
+                                      "preview_texts": source["preview_texts"],
+                                      "synthesis_reference_id": source["synthesis_reference_id"],
+                                      "inference": source["inference"],
                                       "model": feature["model"], "revision": feature["revision"],
-                                      "algorithm": feature["algorithm"], "quality_algorithm": "pcm-20ms-v1"}
+                                      "algorithm": feature["algorithm"],
+                                      "evaluation_version": feature["evaluation_version"],
+                                      "quality_algorithm": feature["quality_algorithm"],
+                                      # Partial scores must not share a key (or a
+                                      # trend line) with fully scored runs.
+                                      "generated_samples": [feature["generated_similarity"]["sample_count"],
+                                                            feature["generated_similarity"]["expected_count"]]}
                         result["comparison_key"] = hashlib.sha256(canonical(comparison).encode()).hexdigest()
                 except Cancelled:
                     raise
                 except Exception as exc:
                     log.error(json.dumps({"task_id": value, "stage": "metrics_features", "error_type": type(exc).__name__}))
-                    result["features"].update(status="failed", message="音色模型下载或加载失败，请检查网络与本机缓存后重试。")
+                    result["features"].update(status="failed",
+                        message="音色模型下载或加载失败，请检查网络与本机缓存后重试。")
                 finally:
                     model.close()
             else:
-                result["features"].update(status="insufficient", message="没有足够长且非静音的参考片段。")
+                result["features"].update(status="insufficient",
+                    message="没有足够长且非静音的参考片段，无法比较音色；音频质量仍可查看。")
             self.verify_metrics_inputs(kind, value, entries)
             self.write_metrics(path, {"status": "completed", "message": "音频分析完成。", "result": result})
         except Cancelled:
@@ -658,6 +818,12 @@ class TrainingService:
                 self.store.segment_path(segment).unlink(missing_ok=True)
             with closing(self.chat.connect()) as db, db:
                 db.execute("DELETE FROM training_segments WHERE source_id=?", (source["id"],))
+                # Reprocessing removes the old clips, so a chosen reference that
+                # belonged to this source can no longer be used.
+                db.execute("""UPDATE training_datasets SET preferred_reference_id=NULL
+                    WHERE id=? AND preferred_reference_id IS NOT NULL
+                    AND preferred_reference_id NOT IN (SELECT id FROM training_segments WHERE dataset_id=?)""",
+                           (dataset_id, dataset_id))
                 db.execute("""UPDATE training_datasets SET version=version+1, approved_duration=(
                     SELECT COALESCE(SUM(end-start),0) FROM training_segments
                     WHERE dataset_id=? AND review_status='approved') WHERE id=?""", (dataset_id, dataset_id))
@@ -681,11 +847,16 @@ class TrainingService:
                             text = self.chat.worker.submit(self.transcribe_clip, destination, cancel).result()
                             if not text:
                                 hints.append("no_speech")
+                            elif len("".join(text.split())) <= 1:
+                                # One character is usually a bad transcript or a
+                                # fragment cut mid-sentence; never approve silently.
+                                hints.append("one_character_text")
                         except Cancelled:
                             raise
                         except Exception:
                             hints.append("transcription_failed_edit_required")
-                    self.store.add_segment(dataset_id, source["id"], segment_id, clip["start"], clip["end"], text, hints)
+                    self.store.add_segment(dataset_id, source["id"], segment_id, clip["start"], clip["end"], text,
+                                           hints, clip.get("quality_stats"))
                     pending_destination = None
                     self.store.update("training_jobs", value, segments_done=index + 1)
                 self.store.update("training_sources", source["id"], status="completed")
@@ -817,7 +988,10 @@ class TrainingService:
     def dataset_summary(self, dataset_id):
         """Pre-training review rollup so the workbench can show what will train."""
         dataset = self.store.one("training_datasets", dataset_id)
-        segments = self.store.rows("training_segments", "dataset_id=?", (dataset_id,))
+        # Same deterministic order create_job uses, so the review page cannot
+        # promise a validation split the job would not build.
+        segments = sorted(self.store.rows("training_segments", "dataset_id=?", (dataset_id,)),
+                          key=lambda segment: (segment["source_id"], segment["start"], segment["id"]))
         sources = self.store.rows("training_sources", "dataset_id=?", (dataset_id,))
         approved = [s for s in segments if s["review_status"] == "approved" and s["transcript"].strip()]
         pending = [s for s in segments if s["review_status"] == "pending"]
@@ -832,6 +1006,10 @@ class TrainingService:
         elif len(approved) > 1 and any(
                 approved[i]["end"] + 3 <= approved[-1]["start"] for i in range(len(approved) - 1)):
             independent = True
+        # Mirror create_job's reference choice so the review page can show it.
+        preferred = dataset.get("preferred_reference_id")
+        reference_index, reference_source = select_reference(approved, list(range(len(approved))), preferred)
+        reference = approved[reference_index] if reference_index is not None else None
         return {
             "dataset_version": dataset["version"],
             "speaker_confirmed": bool(dataset["speaker_confirmed"]),
@@ -843,6 +1021,11 @@ class TrainingService:
             "excluded_segments": len(excluded),
             "independent_validation": independent,
             "validation_warning": None if independent else "insufficient_independent_validation",
+            "preferred_reference_id": preferred,
+            "reference_segment_id": reference["id"] if reference else None,
+            "reference_source": reference_source if reference else None,
+            "reference_note": ("参考片段会同时决定试听与应用推理的提示条件。"
+                               if reference else "至少确认一条带原文的片段后才能选择参考。"),
             "ready": bool(dataset["speaker_confirmed"] and approved),
         }
 
@@ -857,6 +1040,13 @@ class TrainingService:
                 "confirmed_at": confirmation.get("confirmed_at"),
                 "summary": validation.get("training_summary"),
                 "validation_losses": validation.get("validation_losses"),
+                "validation_trend": validation.get("validation_trend"),
+                "step_log": validation.get("step_log"),
+                "best_checkpoint": validation.get("best_checkpoint"),
+                "final_checkpoint_step": validation.get("final_checkpoint_step"),
+                "recipe_version": validation.get("recipe_version"),
+                "reference_segment_id": validation.get("reference_segment_id"),
+                "inference_config": validation.get("inference_config"),
                 "ab": validation.get("ab", 0),
                 "preview_metrics": validation.get("preview_metrics"),
                 "train_losses": validation.get("train_losses")}
@@ -874,7 +1064,8 @@ class TrainingService:
         except (OSError, KeyError, ValueError):
             raise HTTPException(409, "检查点与基座、数据或配置不兼容，不能恢复。") from None
 
-    def save_checkpoint(self, job, model, optimizer, step, base_digest):
+    def save_checkpoint(self, job, model, optimizer, step, base_digest, sampling=None,
+                        initial_adapter=None):
         import mlx.core as mx
         from mlx.utils import tree_flatten
         from breeze_training import save_adapter
@@ -887,7 +1078,11 @@ class TrainingService:
             mx.save_safetensors(str(temporary / "optimizer.safetensors"), dict(tree_flatten(optimizer.state)))
             mx.save_safetensors(str(temporary / "random.safetensors"), {str(i): a for i, a in enumerate(mx.random.state)})
             metadata = {"base_model": self.base_model, "base_digest": base_digest, "digest": job["digest"],
-                        "config": job["config"], "step": step}
+                        "config": job["config"], "step": step, "recipe_version": RECIPE_VERSION,
+                        "initial_adapter_digest": initial_adapter,
+                        # Records where the seeded order stopped so a resume
+                        # continues the same epoch instead of restarting it.
+                        "sampling": {key: sampling.get(key) for key in ("epoch", "position")} if sampling else None}
             (temporary / "metadata.json").write_text(json.dumps(metadata, sort_keys=True))
             temporary.replace(root / name)
             self.store.update("training_jobs", job["id"], checkpoint=name, steps_done=step)
@@ -904,8 +1099,9 @@ class TrainingService:
         import mlx.optimizers as optim
         from mlx.utils import tree_flatten, tree_map, tree_unflatten
         from mlx_audio.tts.utils import load_model
-        from breeze_training import (attach_lora, frozen_digest, load_adapter, save_adapter,
-                                     teacher_forcing_loss, validate_example)
+        from breezetts2_mac_fast import SYNTHESIS_SEED
+        from breeze_training import (attach_lora, frozen_digest, load_adapter, parameter_digest,
+                                     save_adapter, teacher_forcing_loss, validate_example)
         model = gradient_fn = optimizer = None
         config = job["config"]
         value = job["id"]
@@ -923,11 +1119,16 @@ class TrainingService:
             mx.set_memory_limit(mx.device_info()["max_recommended_working_set_size"])
             mx.set_cache_limit(256 * 1024**2)
             model = load_model(self.base_model)
+            # Seed before LoRA initialization: the adapter matrices are part of
+            # the experiment, so the same seed must reproduce the same start.
+            seed = int((config or {}).get("seed", SYNTHESIS_SEED))
+            mx.random.seed(seed)
             attach_lora(model, config["rank"])
+            initial_adapter = parameter_digest(model.trainable_parameters())
             base_digest = frozen_digest(model)
             optimizer = optim.Adam(config["learning_rate"])
-            mx.random.seed(config["seed"])
             step = 0
+            sampling = {"epoch": 0, "position": 0}
             if resume and job.get("checkpoint"):
                 metadata = self.validate_checkpoint(job)
                 if metadata["base_digest"] != base_digest:
@@ -935,9 +1136,11 @@ class TrainingService:
                 directory = self.checkpoint_directory(job)
                 load_adapter(model, directory / "adapter.safetensors")
                 optimizer.state = tree_unflatten(list(mx.load(str(directory / "optimizer.safetensors")).items()))
-                random = mx.load(str(directory / "random.safetensors"))
-                mx.random.state = [random[str(i)] for i in range(len(random))]
+                random_state = mx.load(str(directory / "random.safetensors"))
+                mx.random.state = [random_state[str(i)] for i in range(len(random_state))]
                 step = metadata["step"]
+                saved = metadata.get("sampling") or {}
+                sampling = {"epoch": int(saved.get("epoch", 0)), "position": int(saved.get("position", 0))}
             snapshot = job["snapshot"]
             examples = snapshot["segments"]
             training = [examples[i] for i in snapshot["train_indices"]]
@@ -968,56 +1171,102 @@ class TrainingService:
                 validate_example(model, prompt, codes)
                 return prompt, codes
 
+            order = {"epoch": sampling["epoch"], "position": sampling["position"], "order": []}
+            if order["epoch"] or order["position"]:
+                order["order"] = deterministic_order(len(training), seed, order["epoch"])
+
+            def next_index():
+                # Every epoch visits all training segments once, in a seeded order.
+                if order["position"] >= len(order["order"]):
+                    order["epoch"] += 1
+                    order["order"] = deterministic_order(len(training), seed, order["epoch"])
+                    order["position"] = 0
+                index = order["order"][order["position"]]
+                order["position"] += 1
+                return index
+
+            validation_segments = [examples[i] for i in snapshot["validation_indices"]]
+            validation_trend = []
+
+            def validation_losses():
+                values = []
+                for segment in validation_segments:
+                    prompt, codes = example(segment)
+                    score = teacher_forcing_loss(model, prompt, codes)
+                    mx.eval(score)
+                    if not math.isfinite(score.item()):
+                        raise ValueError("validation_nonfinite")
+                    values.append(round(score.item(), 6))
+                return values
+
+            def record_trend(step_number):
+                if not validation_segments:
+                    return None
+                values = validation_losses()
+                entry = {"step": step_number, "losses": values,
+                         "mean": round(sum(values) / len(values), 6)}
+                validation_trend.append(entry)
+                return entry
+
             gradient_fn = nn.value_and_grad(model, teacher_forcing_loss)
             self.stage(value, "training", steps_done=step)
-            loss_log = []
+            step_log = []
             while step < config["steps"]:
                 self.check(cancel)
                 accumulated = None
+                micro_losses = []
                 for micro in range(config["accumulation_steps"]):
-                    index = (step * config["accumulation_steps"] + micro) % len(training)
+                    index = next_index()
                     prompt, codes = example(training[index])
                     loss, gradients = gradient_fn(model, prompt, codes)
                     mx.eval(loss, gradients)
-                    if len(loss_log) < 200:
-                        loss_log.append(round(loss.item(), 6))
-                    if not math.isfinite(loss.item()) or not all(bool(mx.all(mx.isfinite(g)).item()) for _, g in tree_flatten(gradients)):
+                    micro_losses.append(loss.item())
+                    values = [g for _, g in tree_flatten(gradients)]
+                    if not math.isfinite(loss.item()) or not all(bool(mx.all(mx.isfinite(g)).item()) for g in values):
                         raise ValueError("nonfinite_gradient")
                     scaled = tree_map(lambda g: g / config["accumulation_steps"], gradients)
                     accumulated = scaled if accumulated is None else tree_map(lambda a, b: a + b, accumulated, scaled)
                     self.check(cancel)
+                gradient_norm = math.sqrt(sum(
+                    float(mx.sum(g.astype(mx.float32) ** 2).item())
+                    for _, g in tree_flatten(accumulated)))
                 optimizer.update(model, accumulated)
                 mx.eval(model.trainable_parameters(), optimizer.state)
                 step += 1
+                if len(step_log) < STEP_LOG_LIMIT:
+                    # Accumulated-gradient norm; the loss is the mean over the
+                    # micro-batches that produced this optimizer step.
+                    step_log.append({"step": step,
+                                     "loss": round(sum(micro_losses) / len(micro_losses), 6),
+                                     "gradient_norm": round(gradient_norm, 6),
+                                     "learning_rate": config["learning_rate"],
+                                     "epoch": order["epoch"]})
                 self.store.update("training_jobs", value, steps_done=step)
                 if step % config["checkpoint_every"] == 0 or step == config["steps"]:
-                    self.save_checkpoint(job, model, optimizer, step, base_digest)
+                    record_trend(step)
+                    self.save_checkpoint(job, model, optimizer, step, base_digest,
+                                         sampling=dict(order, order=[]), initial_adapter=initial_adapter)
             self.check(cancel)
             self.stage(value, "validating")
             if frozen_digest(model) != base_digest:
                 raise ValueError("base_weights_changed")
-            validation = [examples[i] for i in snapshot["validation_indices"]]
-            validation_losses = []
-            for segment in validation:
-                prompt, codes = example(segment)
-                score = teacher_forcing_loss(model, prompt, codes)
-                mx.eval(score)
-                if not math.isfinite(score.item()):
-                    raise ValueError("validation_nonfinite")
-                validation_losses.append(score.item())
+            if not validation_trend or validation_trend[-1]["step"] != step:
+                record_trend(step)
+            validation_losses_final = validation_trend[-1]["losses"] if validation_trend else []
+            best = min(validation_trend, key=lambda entry: entry["mean"]) if validation_trend else None
             root = self.job_directory(job)
             save_adapter(model, root / "adapter.safetensors")
             gradient_fn = optimizer = model = None
             gc.collect()
             mx.clear_cache()
-            # Versioned A/B evidence: same text, same reference, same inference
-            # config and reset seed; base and trained audio generated in order
-            # so only one model is resident at a time.
-            inference_config = {"max_tokens": 120, "seed": config["seed"]}
-            reference = snapshot["segments"][0]
+            reference = reference_segment(job)
+            if reference is None:
+                raise HTTPException(422, "没有可用的试听参考片段。")
+            # The same synthesis path and conditions as the running application;
+            # validate_audio records the exact conditions it used.
             model = load_model(self.base_model)
             attach_lora(model, config["rank"])
-            mx.random.seed(config["seed"])
+            mx.random.seed(config.get("seed", SYNTHESIS_SEED))
             base_preview = self.validate_audio(model, job, cancel, variant="base")
             model = None
             gc.collect()
@@ -1025,16 +1274,30 @@ class TrainingService:
             model = load_model(self.base_model)
             attach_lora(model, config["rank"])
             load_adapter(model, root / "adapter.safetensors")
-            mx.random.seed(config["seed"])
+            mx.random.seed(config.get("seed", SYNTHESIS_SEED))
             preview = self.validate_audio(model, job, cancel, variant="trained")
+            inference_config = preview["inference"]
             reference_digest = hashlib.sha256(canonical({"id": reference["id"],
                 "transcript": reference["transcript"], "audio_sha256": reference.get("audio_sha256", "")}).encode()).hexdigest()
+            summary = training_summary(job)
             self._write_validation(job, {"ab": 2, "adapter_loaded": True,
-                "validation_losses": validation_losses, "train_losses": loss_log,
+                "validation_losses": validation_losses_final,
+                "validation_trend": validation_trend,
+                "train_losses": [entry["loss"] for entry in step_log],
+                "step_log": step_log,
+                "recipe_version": RECIPE_VERSION,
+                "initial_adapter_digest": initial_adapter,
+                "sampling": {"seed": seed, "epochs_completed": summary["full_epochs"],
+                             "epoch": order["epoch"], "position": order["position"],
+                             "order": "seeded per epoch", "recipe_version": RECIPE_VERSION},
+                "best_checkpoint": ({"step": best["step"], "validation_loss": best["mean"]}
+                                    if best else None),
+                "final_checkpoint_step": step,
                 "base_model": self.base_model,
                 "adapter_sha256": hashlib.sha256((root / "adapter.safetensors").read_bytes()).hexdigest(),
                 "warning": snapshot.get("validation_warning"), "base_digest": base_digest,
                 "snapshot_digest": job["digest"], "reference_digest": reference_digest,
+                "reference_segment_id": reference["id"],
                 "inference_config": inference_config,
                 "preview_texts": preview["texts"],
                 "preview_texts_sha256": preview["texts_sha256"],
@@ -1042,7 +1305,7 @@ class TrainingService:
                 "preview_metrics": {"base": base_preview["metrics"], "trained": preview["metrics"]},
                 "base_preview_texts_sha256": base_preview["texts_sha256"],
                 "base_preview_audio_sha256": base_preview["audio_sha256"],
-                "training_summary": training_summary(job)})
+                "training_summary": summary})
             self.check(cancel)
             self.stage(value, "completed")
         finally:
@@ -1071,51 +1334,82 @@ class TrainingService:
             expected = segment.get("sha256") or segment.get("audio_sha256")
             if not expected or hashlib.sha256(path.read_bytes()).hexdigest() != expected:
                 raise HTTPException(409, "训练音频快照已改变或不可用。")
+        snapshot = job["snapshot"]
+        reference_id = snapshot.get("reference_segment_id")
+        if reference_id is not None:
+            # The synthesis reference must come from the training subset; a
+            # held-out validation clip is an evaluation target, not a prompt.
+            index = next((i for i, segment in enumerate(snapshot["segments"])
+                          if segment.get("id") == reference_id), None)
+            if index is None or index not in (snapshot.get("train_indices") or []):
+                raise HTTPException(409, "训练快照的试听参考片段无效。")
 
     def validate_audio(self, model, job, cancel, variant="trained"):
+
+        """Generate validation audio under the application's conditions.
+
+        Same synthesis helper, frame limit, chunk size and seed as the chat
+        engine, so a preview measures what the published voice will produce.
+        The job's training seed does not change inference conditions.
+        """
         import time
         import numpy as np
-        from breezetts2_mac_fast import pcm16_bytes
+        from breezetts2_mac_fast import (STREAMING_FRAMES, SYNTHESIS_SEED, SYNTHESIS_MAX_TOKENS,
+                                         inference_signature, pcm16_bytes, pcm_chunks,
+                                         synthesis_args, synthesis_interval)
         from contextlib import closing
+        from voice_app import streaming_frames
         if variant not in ("trained", "base"):
             raise HTTPException(422, "试听变体无效。")
         texts = select_preview_texts(job["snapshot"])
-        reference = job["snapshot"]["segments"][0]
+        reference = reference_segment(job)
+        if reference is None:
+            raise HTTPException(422, "没有可用的试听参考片段。")
         reference_audio = str(self.store.segment_path(reference))
+        interval = synthesis_interval(model) * streaming_frames() / STREAMING_FRAMES
+        seed = SYNTHESIS_SEED
         root = self.job_directory(job)
         prefix = "validation" if variant == "trained" else "validation-base"
         audio_hashes, metrics = {}, {}
         for index, text in enumerate(texts, 1):
             self.check(cancel)
             target = root / f"{prefix}-{index:02d}.wav"
-            samples, first_ms, started = 0, None, time.monotonic()
+            # Every text resets the seed, so one preview cannot condition the next.
+            args = synthesis_args(text, max_tokens=SYNTHESIS_MAX_TOKENS, seed=seed,
+                                  streaming_interval=interval)
+            samples, frames, first_ms, started = 0, 0, None, time.monotonic()
             with wave.open(str(target), "wb") as wav:
                 wav.setnchannels(1)
                 wav.setsampwidth(2)
                 wav.setframerate(model.sample_rate)
-                with closing(model.generate(text=text, max_tokens=120, stream=True,
-                                            ref_audio=reference_audio, ref_text=reference["transcript"])) as results:
-                    for result in results:
+                with closing(pcm_chunks(model, args, reference_audio,
+                                        reference["transcript"])) as chunks:
+                    for pcm, chunk_frames, _ in chunks:
                         self.check(cancel)
                         if first_ms is None:
                             first_ms = round((time.monotonic() - started) * 1000, 2)
-                        audio = np.array(result.audio, dtype=np.float32).reshape(-1)
-                        if not np.isfinite(audio).all():
+                        if not np.isfinite(pcm).all():
                             raise ValueError("invalid_audio")
-                        samples += audio.size
-                        wav.writeframes(pcm16_bytes(audio))
+                        frames += chunk_frames
+                        samples += len(pcm)
+                        wav.writeframes(pcm16_bytes(pcm))
             if not samples:
                 raise ValueError("empty_audio")
             elapsed = (time.monotonic() - started) * 1000
             duration = samples / model.sample_rate
+            hit_max = frames >= args.max_tokens
             audio_hashes[f"{index:02d}"] = hashlib.sha256(target.read_bytes()).hexdigest()
             metrics[f"{index:02d}"] = {"duration": round(duration, 3),
                                        "synthesis_ms": round(elapsed, 2),
                                        "first_audio_ms": first_ms,
+                                       "codec_frames": frames,
+                                       "hit_max_tokens": hit_max,
                                        "rtf": round(elapsed / 1000 / duration, 4) if duration > 0 else None}
         return {"texts": texts,
                 "texts_sha256": hashlib.sha256(canonical(texts).encode()).hexdigest(),
-                "audio_sha256": audio_hashes, "metrics": metrics, "variant": variant}
+                "audio_sha256": audio_hashes, "metrics": metrics, "variant": variant,
+                "inference": inference_signature(args)}
+
 
     def confirm_preview(self, value, body):
         from voice_app import clean_text, timestamp
@@ -1192,7 +1486,9 @@ class TrainingService:
                     self.chat.model_status = "failed"
                     self.chat.model_error = "发布后推理模型恢复失败，请重启应用。"
                     raise
-            reference = job["snapshot"]["segments"][0]
+            reference = reference_segment(job)
+            if reference is None:
+                raise HTTPException(409, "训练快照没有可用的参考片段。")
             shutil.copyfile(self.store.segment_path(reference), recording)
             with closing(self.chat.connect()) as db, db:
                 db.execute("INSERT INTO voice_models(id,job_id,base_model,config,reference_segment_id,created_at) VALUES(?,?,?,?,?,?)",
@@ -1276,6 +1572,12 @@ def training_router(service):
         segment = service.store.one("training_segments", value)
         with service.dataset_edit(segment["dataset_id"]):
             return service.store.edit_segment(value, body.transcript, body.review_status)
+
+    @router.patch("/datasets/{value}/reference")
+    def reference(value: str, body: ReferenceInput):
+        with service.dataset_edit(value):
+            dataset = service.store.set_preferred_reference(value, body.segment_id)
+        return service.dataset_summary(dataset["id"])
 
     @router.post("/datasets/{value}/jobs", status_code=202)
     def train(value: str, body: TrainingConfig, idempotency_key: str | None = Header(default=None)):

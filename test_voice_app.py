@@ -6,6 +6,7 @@ import sqlite3
 import shutil
 from concurrent.futures import ThreadPoolExecutor
 import json
+import os
 from pathlib import Path
 import tempfile
 import threading
@@ -18,7 +19,8 @@ import wave
 
 import httpx
 from fastapi.testclient import TestClient
-from voice_app import Breeze, MAX_WAV, TaskControl, TaskStopped, create_app as make_app, CHAT_MAX_TOKENS
+from voice_app import (Breeze, MAX_WAV, TaskControl, TaskStopped, create_app as make_app,
+                       CHAT_MAX_TOKENS, depth_mode, streaming_frames)
 
 
 class Transcriber:
@@ -1115,6 +1117,83 @@ class RealtimeMessageTests(unittest.TestCase):
         response = self.client.post(f"/api/conversations/{conversation['id']}/messages",
                                     json={"content": "你好", "mode": "bogus"})
         self.assertEqual(response.status_code, 422)
+
+
+class DepthModeTests(unittest.TestCase):
+    def test_explicit_modes_are_returned(self):
+        self.assertEqual(depth_mode("cached"), "cached")
+        self.assertEqual(depth_mode("compiled"), "compiled")
+
+    def test_value_is_normalized(self):
+        self.assertEqual(depth_mode("  Compiled "), "compiled")
+        self.assertEqual(depth_mode("CACHED"), "cached")
+
+    def test_unknown_values_fall_back_to_cached(self):
+        for value in ("native", "", "   ", "fast", "compiled2", 3, True):
+            self.assertEqual(depth_mode(value), "cached", value)
+
+    def test_environment_is_used_when_no_value_is_given(self):
+        with patch.dict(os.environ, {"BREEZE_DEPTH_MODE": "compiled"}):
+            self.assertEqual(depth_mode(), "compiled")
+        with patch.dict(os.environ, {"BREEZE_DEPTH_MODE": "garbage"}):
+            self.assertEqual(depth_mode(), "cached")
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("BREEZE_DEPTH_MODE", None)
+            self.assertEqual(depth_mode(), "cached")
+
+
+    def test_engine_receives_the_configured_mode(self):
+        created = []
+
+        class FakeDepth:
+            def __init__(self, model, mode):
+                created.append((model, mode))
+                self.installed = 0
+                self.warmed = None
+
+            def install(self):
+                self.installed += 1
+
+            def warmup(self, frames, cfg_scale, instruct):
+                self.warmed = (frames, cfg_scale, instruct)
+
+        engine = Breeze.__new__(Breeze)  # no model load; exercise the wiring only
+        with patch("breezetts2_mac_fast.FastDepth", FakeDepth), \
+                patch.dict(os.environ, {"BREEZE_DEPTH_MODE": "compiled"}):
+            attached = engine.attach_depth("model-a")
+        self.assertEqual(created, [("model-a", "compiled")])
+        self.assertEqual(engine.depth_mode, "compiled")
+        self.assertEqual(attached.installed, 1)
+        self.assertEqual(attached.warmed, (2, 1.0, None))
+
+        with patch("breezetts2_mac_fast.FastDepth", FakeDepth), \
+                patch.dict(os.environ, {"BREEZE_DEPTH_MODE": "nonsense"}):
+            engine.attach_depth("model-b")
+        self.assertEqual(created[-1], ("model-b", "cached"))
+        self.assertEqual(engine.depth_mode, "cached")
+
+
+class StreamingFramesTests(unittest.TestCase):
+    def test_defaults_to_library_value(self):
+        from breezetts2_mac_fast import STREAMING_FRAMES
+        self.assertEqual(streaming_frames(), STREAMING_FRAMES)
+        self.assertEqual(streaming_frames(""), STREAMING_FRAMES)
+        self.assertEqual(streaming_frames(None), STREAMING_FRAMES)
+
+    def test_accepts_in_range_values(self):
+        self.assertEqual(streaming_frames("2"), 2)
+        self.assertEqual(streaming_frames(" 8 "), 8)
+        self.assertEqual(streaming_frames(16), 16)
+        self.assertEqual(streaming_frames(1), 1)
+
+    def test_rejects_invalid_and_out_of_range(self):
+        from breezetts2_mac_fast import STREAMING_FRAMES
+        for value in ("0", "-2", "17", "abc", "4.5", 99):
+            self.assertEqual(streaming_frames(value), STREAMING_FRAMES, value)
+
+    def test_environment_is_used(self):
+        with patch.dict(os.environ, {"BREEZE_STREAMING_FRAMES": "6"}):
+            self.assertEqual(streaming_frames(), 6)
 
 
 if __name__ == "__main__":

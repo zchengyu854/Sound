@@ -118,13 +118,33 @@ class VoiceMetricsTests(unittest.TestCase):
         model = Mock()
         model.encode.side_effect = [np.array([[4, 0]]), np.array([1, 0])]
         result = metrics.compute_speaker_similarity([ref], [generated], model=model)
-        self.assertEqual(result["reference_consistency"]["reason"], "insufficient_references")
-        self.assertEqual(result["reference_consistency"]["pair_count"], 0)
-        self.assertIsNone(result["reference_consistency"]["score"])
+        consistency = result["reference_consistency"]
+        self.assertEqual(consistency["status"], "insufficient")
+        self.assertEqual(consistency["reason"], "insufficient_references")
+        self.assertEqual(consistency["pair_count"], 0)
+        self.assertIsNone(consistency["score"])
         self.assertEqual(result["generated"][0]["score"], 100)
         self.assertEqual(result["generated"][0]["comparison_count"], 1)
         self.assertEqual(result["generated_aggregate"]["sample_count"], 1)
         self.assertEqual(result["generated_aggregate"]["score"], 100)
+        self.assertEqual(result["generated_aggregate"]["status"], "ok")
+        self.assertEqual(result["algorithm"], metrics.ALGORITHM)
+        self.assertEqual(result["evaluation_version"], metrics.EVALUATION_VERSION)
+
+    def test_partial_generated_and_missing_audio_are_reported_separately(self):
+        refs = [self.constant("p1.wav", 1000), self.constant("p2.wav", 1500)]
+        silent = self.constant("p-silent.wav", 0)
+        model = Mock()
+        model.encode.side_effect = [np.array([[1, 0]]), np.array([[0, 1]]), np.array([1, 1])]
+        result = metrics.compute_speaker_similarity(
+            refs, [self.constant("p-gen.wav", 2000), silent, self.root / "missing.wav"], model=model)
+        aggregate = result["generated_aggregate"]
+        self.assertEqual(aggregate["status"], "partial")
+        self.assertEqual(aggregate["reason"], "partial_generated")
+        self.assertEqual((aggregate["sample_count"], aggregate["expected_count"], aggregate["failed_count"]), (1, 3, 2))
+        self.assertEqual(result["generated"][2]["reason"], "generated_audio_missing")
+        self.assertIn("参考片段", metrics.reason_message("insufficient_references"))
+        self.assertIn("不可用", metrics.reason_message("unknown_reason"))
 
     def test_similarity_uses_distinct_pairs_clips_and_averages_generated_scores(self):
         refs = [self.constant(f"ref{i}.wav", i * 1000) for i in (1, 2, 3)]

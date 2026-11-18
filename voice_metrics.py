@@ -39,6 +39,30 @@ MAX_EMBEDDING_SECONDS = 12
 MIN_EMBEDDING_SAMPLES = 385
 SPEAKER_MODEL_ID = "marksverdhei/Qwen3-Voice-Embedding-12Hz-1.7B"
 MODEL_FILES = ["config.json", "model.safetensors"]
+# Versioned evaluation contract: scores are only comparable inside one version.
+ALGORITHM = "speaker-cosine-v2"
+QUALITY_ALGORITHM = "pcm-20ms-v1"
+EVALUATION_VERSION = "voice-metrics-2"
+# Whitelisted, user-facing reasons. Raw exceptions never reach the interface.
+REASON_MESSAGES = {
+    "insufficient_references": "需要至少两条参考片段才能计算原声一致性。",
+    "no_usable_references": "没有可用于声纹比较的参考片段。",
+    "model_load_failed": "声纹模型下载或加载失败，请检查网络与模型缓存后重试。",
+    "embedding_failed": "片段声纹特征提取失败，请试听或重新处理该音频后重试。",
+    "too_short": "片段过短，无法提取声纹特征。",
+    "silent": "片段为静音或音量过低，无法提取声纹特征。",
+    "empty": "片段没有音频内容。",
+    "invalid_audio": "片段不是可用的 24 kHz 单声道 PCM WAV。",
+    "reference_limit": "参考片段超过上限，只使用前几条。",
+    "generated_audio_missing": "生成试听音频缺失，请重新试听验收。",
+    "partial_generated": "部分试听未能提取声纹，结果只代表成功的那几条。",
+    "no_usable_generated_audio": "没有可用的生成试听音频。",
+}
+
+
+def reason_message(code):
+    """Map a whitelisted reason code to actionable Chinese text."""
+    return REASON_MESSAGES.get(code, "指标不可用，请重新计算。")
 
 
 def _open_pcm(path):
@@ -332,9 +356,17 @@ def compute_speaker_similarity(reference_paths, generated_paths, *, model=None):
 
     pair_scores = [_similarity(vectors[i], vectors[j])
                    for i in range(len(vectors)) for j in range(i + 1, len(vectors))]
+    if pair_scores:
+        consistency_status, consistency_reason = "ok", None
+    elif model_error:
+        consistency_status, consistency_reason = "unavailable", "model_load_failed"
+    elif not vectors:
+        consistency_status, consistency_reason = "unavailable", "no_usable_references"
+    else:
+        # One usable reference is a legitimate limit, not a system failure.
+        consistency_status, consistency_reason = "insufficient", "insufficient_references"
     reference_consistency = {
-        "status": "ok" if pair_scores else "unavailable",
-        "reason": None if pair_scores else ("model_load_failed" if model_error else "insufficient_references"),
+        "status": consistency_status, "reason": consistency_reason,
         "score": sum(pair_scores) / len(pair_scores) if pair_scores else None,
         "reference_count": len(vectors), "pair_count": len(pair_scores),
     }
@@ -342,6 +374,12 @@ def compute_speaker_similarity(reference_paths, generated_paths, *, model=None):
     generated_records = []
     for path in generated_paths:
         path = str(Path(path))
+        if not Path(path).is_file():
+            generated_records.append({
+                "path": path, "status": "unavailable", "reason": "generated_audio_missing",
+                "detail": None, "duration_seconds": None, "embedding_duration_seconds": None,
+                "score": None, "reference_count": len(vectors), "comparison_count": 0})
+            continue
         scan = _scan_audio(path)
         record = {"path": path, "status": "unavailable", "reason": scan["reason"],
                   "detail": scan["detail"], "duration_seconds": scan["audio_frame_count"] / SAMPLE_RATE,
@@ -368,16 +406,33 @@ def compute_speaker_similarity(reference_paths, generated_paths, *, model=None):
         generated_records.append(record)
 
     scores = [item["score"] for item in generated_records if item["status"] == "ok"]
+    expected_count = len(generated_records)
+    if not expected_count:
+        aggregate_status, aggregate_reason = "unavailable", "generated_audio_missing"
+    elif len(scores) == expected_count:
+        aggregate_status, aggregate_reason = "ok", None
+    elif scores:
+        aggregate_status, aggregate_reason = "partial", "partial_generated"
+    elif model_error:
+        aggregate_status, aggregate_reason = "unavailable", "model_load_failed"
+    elif not vectors:
+        aggregate_status, aggregate_reason = "unavailable", "no_usable_references"
+    else:
+        aggregate_reason = next((item["reason"] for item in generated_records if item["reason"]),
+                                "no_usable_generated_audio")
+        aggregate_status = "unavailable"
     generated_aggregate = {
-        "status": "ok" if scores else "unavailable",
-        "reason": None if scores else ("model_load_failed" if model_error else "no_usable_generated_audio"),
+        "status": aggregate_status, "reason": aggregate_reason,
         "score": sum(scores) / len(scores) if scores else None,
-        "sample_count": len(scores),
+        "sample_count": len(scores), "expected_count": expected_count,
+        "failed_count": expected_count - len(scores),
         "comparison_count": sum(item["comparison_count"] for item in generated_records),
         "reference_count": len(vectors),
     }
     metadata = getattr(model, "metadata", None)
-    return {"model": dict(metadata) if isinstance(metadata, dict) else None,
+    return {"algorithm": ALGORITHM, "quality_algorithm": QUALITY_ALGORITHM,
+            "evaluation_version": EVALUATION_VERSION,
+            "model": dict(metadata) if isinstance(metadata, dict) else None,
             "model_error": model_error, "reference_input_count": len(reference_paths),
             "reference_unique_count": len(reference_records),
             "eligible_reference_count": eligible_count, "selected_reference_count": len(selected),

@@ -19,7 +19,8 @@ from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from test_voice_app import Engine, Transcriber, wav_bytes
-from training_service import TrainingConfig, PreviewInput, Cancelled, canonical, select_preview_texts, training_summary
+from training_service import (TrainingConfig, TrainingService, PreviewInput, Cancelled, canonical,
+                              deterministic_order, select_preview_texts, training_summary)
 from voice_app import create_app
 
 
@@ -440,14 +441,27 @@ class TrainingServiceTests(unittest.TestCase):
         class PreviewModel:
             sample_rate = 24000
 
+            class Decoder:
+                decode_upsample_rate = 320
+
+                def reset_streaming_state(self):
+                    pass
+                    pass
+
             def __init__(self):
+                import mlx.core as mx
+                self.mx = mx
                 self.texts = []
                 self.references = []
+                # pcm_chunks is the same path the chat engine uses.
+                self.audio_tokenizer = SimpleNamespace(decoder=self.Decoder())
 
-            def generate(self, text, max_tokens, stream, ref_audio, ref_text):
+            def generate(self, text, max_tokens, stream, ref_audio, ref_text, **kwargs):
                 self.texts.append(text)
                 self.references.append((ref_audio, ref_text))
-                yield SimpleNamespace(audio=[0.2, -0.2])
+                yield SimpleNamespace(audio=self.mx.array([0.2, -0.2], dtype=self.mx.float32),
+                                      sample_rate=self.sample_rate, token_count=1,
+                                      is_streaming_chunk=True, is_final_chunk=True)
 
         model = PreviewModel()
         preview = self.service.validate_audio(model, job, threading.Event())
@@ -638,16 +652,26 @@ class TrainingServiceTests(unittest.TestCase):
         dataset, _ = self.approved()
         job = self.job(dataset)
         root = self.service.job_directory(job)
-
         class PreviewModel:
             sample_rate = 24000
 
-            def __init__(self, offset):
-                self.offset = offset
+            class Decoder:
+                decode_upsample_rate = 320
 
-            def generate(self, text, max_tokens, stream, ref_audio, ref_text):
+                def reset_streaming_state(self):
+                    pass
+
+            def __init__(self, offset):
+                import mlx.core as mx
+                self.mx = mx
+                self.offset = offset
+                self.audio_tokenizer = SimpleNamespace(decoder=self.Decoder())
+
+            def generate(self, text, max_tokens, stream, ref_audio, ref_text, **kwargs):
                 sample = 0.1 + self.offset
-                yield SimpleNamespace(audio=[sample, -sample])
+                yield SimpleNamespace(audio=self.mx.array([sample, -sample], dtype=self.mx.float32),
+                                      sample_rate=self.sample_rate, token_count=1,
+                                      is_streaming_chunk=True, is_final_chunk=True)
 
         config = {"max_tokens": 120, "seed": 7}
         base = self.service.validate_audio(PreviewModel(0.0), job, threading.Event(), variant="base")
@@ -711,6 +735,133 @@ class TrainingServiceTests(unittest.TestCase):
         self.service._write_validation(job, validation)
         published = self.client.post(f"/api/training/jobs/{value}/publish", json={"name": "x"})
         self.assertEqual(published.status_code, 409)
+
+    def test_features_view_separates_consistency_from_generated(self):
+        scores = {"model": {"revision": "r" * 40}, "model_error": None,
+                  "reference_consistency": {"status": "insufficient", "reason": "insufficient_references",
+                                            "score": None, "reference_count": 1, "pair_count": 0},
+                  "generated": [{"status": "ok", "score": 90.0, "reference_count": 1},
+                                {"status": "unavailable", "score": None, "reason": "silent", "reference_count": 1}],
+                  "algorithm": "speaker-cosine-v2", "quality_algorithm": "pcm-20ms-v1",
+                  "evaluation_version": "voice-metrics-2"}
+        features = TrainingService.features_view(scores, 2)
+        self.assertEqual(features["status"], "partial")
+        self.assertIsNone(features["original_index"])
+        self.assertEqual(features["generated_index"], 90.0)
+        self.assertEqual(features["generated_similarity"]["sample_count"], 1)
+        self.assertEqual(features["generated_similarity"]["expected_count"], 2)
+        self.assertIn("需要至少两条参考", features["reference_consistency"]["message"])
+        self.assertIn("部分", features["generated_similarity"]["message"])
+        self.assertIn("不等于克隆准确率", features["index_note"])
+
+    def test_features_view_has_no_generated_part_for_dataset_metrics(self):
+        features = TrainingService.features_view(
+            {"reference_consistency": {"status": "ok", "score": 95.0, "reference_count": 2, "pair_count": 1},
+             "generated": [], "model_error": None}, 0)
+        self.assertEqual(features["status"], "completed")
+        self.assertEqual(features["generated_similarity"]["status"], "not_applicable")
+        self.assertEqual(features["message"], "")
+        self.assertIsNone(features["generated_index"])
+
+    def test_features_view_compares_base_and_trained_on_the_same_references(self):
+        scores = {"reference_consistency": {"status": "ok", "score": 96.0, "reference_count": 2, "pair_count": 1},
+                  "generated": [{"status": "ok", "score": 91.0, "reference_count": 2},
+                                {"status": "ok", "score": 89.0, "reference_count": 2},
+                                {"status": "ok", "score": 84.0, "reference_count": 2},
+                                {"status": "ok", "score": 85.0, "reference_count": 2}],
+                  "model": {"revision": "abc"}, "model_error": None}
+        features = TrainingService.features_view(scores, 2, 2)
+        self.assertEqual(features["status"], "completed")
+        self.assertEqual(features["training_effect"]["base_index"], 84.5)
+        self.assertEqual(features["training_effect"]["trained_index"], 90.0)
+        self.assertEqual(features["training_effect"]["delta"], 5.5)
+        self.assertEqual(features["previews"][0]["value"], 91.0)
+
+    def test_features_view_reports_model_failure_and_single_side_ab(self):
+        failed = TrainingService.features_view({"model_error": "boom", "generated": []}, 2)
+        self.assertEqual(failed["status"], "failed")
+        self.assertIsNone(failed["generated_index"])
+        self.assertIn("声纹模型", failed["message"])
+        partial = TrainingService.features_view(
+            {"generated": [{"status": "ok", "score": 90.0}, {"status": "ok", "score": 88.0},
+                           {"status": "ok", "score": 84.0}, {"status": "unavailable", "reason": "silent"}],
+             "reference_consistency": {"status": "ok", "score": 95.0, "reference_count": 2, "pair_count": 1}}, 2, 2)
+        # One side is incomplete, so no difference is published.
+        self.assertIsNone(partial["training_effect"]["delta"])
+        self.assertEqual(partial["training_effect"]["status"], "partial")
+        self.assertIn("暂不显示差值", partial["training_effect"]["message"])
+
+    def test_deterministic_order_covers_material_and_ignores_model_randomness(self):
+        first = deterministic_order(5, 7, 1)
+        self.assertEqual(sorted(first), [0, 1, 2, 3, 4])
+        self.assertEqual(deterministic_order(5, 7, 1), first)
+        self.assertNotEqual(deterministic_order(5, 7, 2), first)
+        self.assertNotEqual(deterministic_order(5, 8, 1), first)
+
+    def test_dataset_reference_endpoint_records_an_approved_choice(self):
+        dataset, segment_id = self.approved()
+        url = f"/api/training/datasets/{dataset['id']}/reference"
+        self.assertEqual(self.client.patch(url, json={"segment_id": segment_id}).status_code, 200)
+        summary = self.client.get(f"/api/training/datasets/{dataset['id']}/summary").json()
+        self.assertEqual(summary["preferred_reference_id"], segment_id)
+        self.assertEqual(summary["reference_segment_id"], segment_id)
+        self.assertEqual(summary["reference_source"], "preferred")
+        self.assertEqual(self.client.patch(url, json={"segment_id": str(uuid4())}).status_code, 404)
+        self.assertEqual(self.client.patch(url, json={}).status_code, 200)
+        reset = self.client.get(f"/api/training/datasets/{dataset['id']}/summary").json()
+        self.assertIsNone(reset["preferred_reference_id"])
+        self.assertEqual(reset["reference_source"], "auto")
+
+    def test_validation_and_publish_use_the_recorded_reference(self):
+        dataset, first_id = self.approved()
+        store = self.service.store
+        source = store.rows("training_sources", "dataset_id=?", (dataset["id"],))[0]
+        second_id = str(uuid4())
+        folder = store.dataset_dir(dataset["id"]) / "segments"
+        (folder / f"{second_id}.wav").write_bytes(wav_bytes())
+        store.add_segment(dataset["id"], source["id"], second_id, 4, 8, "第二条原文。", [],
+                          {"effective_seconds": 3.9})
+        store.edit_segment(second_id, review_status="approved")
+        store.set_preferred_reference(dataset["id"], second_id)
+        job = self.job(dataset)
+        self.assertEqual(job["snapshot"]["reference_segment_id"], second_id)
+
+        class Decoder:
+            decode_upsample_rate = 320
+
+            def reset_streaming_state(self):
+                pass
+
+        class Model:
+            sample_rate = 24000
+
+            def __init__(self):
+                import mlx.core as mx
+                self.mx = mx
+                self.references = []
+                self.audio_tokenizer = SimpleNamespace(decoder=Decoder())
+
+            def generate(self, text, max_tokens, stream, ref_audio, ref_text, **kwargs):
+                self.references.append((ref_audio, ref_text))
+                yield SimpleNamespace(audio=self.mx.array([0.1, -0.1], dtype=self.mx.float32),
+                                      sample_rate=self.sample_rate, token_count=1,
+                                      is_streaming_chunk=True, is_final_chunk=True)
+
+        model = Model()
+        preview = self.service.validate_audio(model, job, threading.Event())
+        expected = str(store.segment_path(store.one("training_segments", second_id)))
+        self.assertEqual(set(model.references), {(expected, "第二条原文。")})
+        # Previews must carry the conditions the running application uses, not
+        # the training seed, or the published voice could never reproduce them.
+        self.assertEqual(preview["inference"]["seed"], 42)
+        self.assertEqual(preview["inference"]["max_tokens"], 750)
+        # A reference outside the training subset is rejected by the snapshot check.
+        snapshot = dict(job["snapshot"])
+        snapshot["reference_segment_id"] = str(uuid4())
+        tampered = dict(job, snapshot=snapshot)
+        tampered["digest"] = hashlib.sha256(canonical(snapshot).encode()).hexdigest()
+        with self.assertRaises(HTTPException):
+            self.service.verify_snapshot(tampered)
 
 
 if __name__ == "__main__":

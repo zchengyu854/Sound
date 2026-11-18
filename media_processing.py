@@ -139,10 +139,80 @@ def decode_media(source, destination, cancel):
         temporary.unlink(missing_ok=True)
 
 
+WINDOW = 480                 # 20 ms at 24 kHz
+QUIET_RMS = 180              # about -45 dBFS: quiet, not necessarily silent
+TRIM_MIN = int(0.3 * RATE)   # ignore shorter low-energy edges
+TRIM_MARGIN = int(0.2 * RATE)  # keep 200 ms around the voiced span
+TRIM_MAX = int(1.0 * RATE)   # never remove more than one second per edge
+CLIP_LEVEL = 32760
+
+
+def window_rms(values):
+    """Complete 20 ms windows only; returns one RMS value per window."""
+    count = values.size // WINDOW
+    if not count:
+        return np.zeros(0, dtype=np.float32)
+    frames = values[:count * WINDOW].astype(np.float32).reshape(count, WINDOW)
+    return np.sqrt(np.mean(frames * frames, axis=1))
+
+
+def trim_bounds(rms, total):
+    """Return (start, end) sample offsets to keep, with bounded edge trimming.
+
+    Silence inside the clip is never removed. Edges are trimmed only when more
+    than TRIM_MIN of low energy is present, at most TRIM_MAX per side, keeping
+    TRIM_MARGIN so soft onsets and trailing breaths survive. `total` keeps any
+    trailing partial window.
+    """
+    voiced = np.flatnonzero(rms >= QUIET_RMS)
+    if voiced.size == 0:
+        return 0, total
+    voiced_start = int(voiced[0]) * WINDOW
+    voiced_end = (int(voiced[-1]) + 1) * WINDOW
+    start = 0
+    if voiced_start >= TRIM_MIN:
+        start = max(voiced_start - TRIM_MARGIN, voiced_start - TRIM_MAX)
+        start -= start % WINDOW
+    end = total
+    if total - voiced_end >= TRIM_MIN:
+        end = min(total, voiced_end + TRIM_MARGIN, voiced_end + TRIM_MAX)
+        end -= end % WINDOW
+    return start, end
+
+
+def clip_stats(values, peak, start, end):
+    """Reviewable quality facts; low volume is not treated as no speech."""
+    rms = window_rms(values)
+    voiced = np.flatnonzero(rms >= QUIET_RMS)
+    windows = int(rms.size)
+    if voiced.size:
+        voiced_start = int(voiced[0]) * WINDOW
+        voiced_end = (int(voiced[-1]) + 1) * WINDOW
+    else:
+        # No voiced window: report all low energy, never a negative duration.
+        voiced_start, voiced_end = 0, 0
+    return {
+        "window_count": windows,
+        "voiced_window_count": int(voiced.size),
+        "voiced_fraction": round(float(voiced.size) / windows, 4) if windows else 0.0,
+        "leading_low_energy_ms": (round(voiced_start / RATE * 1000, 1) if voiced.size
+                                  else round(values.size / RATE * 1000, 1)),
+        "trailing_low_energy_ms": (round((values.size - voiced_end) / RATE * 1000, 1) if voiced.size
+                                   else 0.0),
+        "trimmed_start_ms": round(start / RATE * 1000, 1),
+        "trimmed_end_ms": round((values.size - end) / RATE * 1000, 1),
+        "effective_seconds": round((voiced_end - voiced_start) / RATE, 3),
+        "peak_dbfs": round(20 * math.log10(peak / 32768), 2) if peak > 0 else None,
+        "clipped_samples": int(np.count_nonzero(np.abs(values.astype(np.int32)) >= CLIP_LEVEL)),
+    }
+
+
 def split_audio(wav_path, output_dir, cancel):
     """Use quiet 20ms boundaries after 3s; force a cut at 12s if needed.
 
-    Short trailing clips remain reviewable and carry a quality hint, not silent approval.
+    Each clip keeps its source time coordinates, trims only the low-energy
+    edges within bounds, and carries reviewable quality facts and hints.
+    Nothing is approved automatically.
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
@@ -166,39 +236,43 @@ def split_audio(wav_path, output_dir, cancel):
                     while position + 480 <= maximum:
                         check_cancel(cancel)
                         frame = np.frombuffer(source.readframes(480), dtype="<i2").astype(np.float32)
-                        if frame.size and float(np.sqrt(np.mean(frame * frame))) < 180:
+                        if frame.size and float(np.sqrt(np.mean(frame * frame))) < QUIET_RMS:
                             end, quiet = position + 480, True
                             break
                         position += 480
                 source.setpos(start)
+                raw = source.readframes(end - start)
+                if len(raw) != (end - start) * 2:
+                    raise MediaError("truncated_audio")
+                values = np.frombuffer(raw, dtype="<i2")
+                keep_start, keep_end = trim_bounds(window_rms(values), values.size)
+                # int32 avoids int16 overflow at -32768 when measuring the peak.
+                peak = int(np.max(np.abs(values.astype(np.int32)))) if values.size else 0
+                stats = clip_stats(values, peak, keep_start, keep_end)
                 path = output_dir / f"{uuid4()}.wav"
                 created.append(path)
-                peak = 0
                 with wave.open(str(path), "wb") as target:
                     target.setnchannels(1)
                     target.setsampwidth(2)
                     target.setframerate(RATE)
-                    remaining = end - start
-                    while remaining:
-                        check_cancel(cancel)
-                        data = source.readframes(min(remaining, RATE))
-                        if not data:
-                            raise MediaError("truncated_audio")
-                        values = np.frombuffer(data, dtype="<i2").astype(np.int32)
-                        peak = max(peak, int(np.max(np.abs(values))))
-                        target.writeframes(data)
-                        remaining -= len(data) // 2
+                    target.writeframes(values[keep_start:keep_end].tobytes())
                 hints = []
                 if not quiet and maximum < total:
                     hints.append("forced_split_check_words")
-                if end - start < 3 * RATE:
+                if (keep_end - keep_start) < 3 * RATE:
                     hints.append("short_segment")
-                if peak < 180:
+                if peak < QUIET_RMS:
                     hints.append("low_volume_or_silence")
-                if peak >= 32760:
+                elif stats["voiced_fraction"] < 0.3:
+                    hints.append("low_voiced_ratio")
+                if peak >= CLIP_LEVEL:
                     hints.append("possible_clipping")
-                result.append({"start": start / RATE, "end": end / RATE,
-                               "path": str(path), "quality_hints": hints})
+                if keep_start or keep_end < values.size:
+                    hints.append("trimmed_edges")
+                result.append({"start": (start + keep_start) / RATE,
+                               "end": (start + keep_end) / RATE,
+                               "path": str(path), "quality_hints": hints,
+                               "quality_stats": stats})
                 start = end
         return result
     except BaseException:

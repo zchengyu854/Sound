@@ -67,9 +67,10 @@ def validate_example(model, prompt, codes):
         raise ValueError("音频 token 包含 padding、控制符或越界码。")
 
 
-def teacher_forcing_loss(model, prompt, codes):
-    """Batch one, no padding: prompt tokens have no loss; EOS has no depth loss.
+def teacher_forcing_terms(model, prompt, codes):
+    """Return the main (first codebook and EOS) loss and the depth loss.
 
+    Batch one, no padding: prompt tokens have no loss; EOS has no depth loss.
     Last prompt state predicts frame 0; state after frame t predicts t+1.
     Depth position 0 is the backbone state; position k predicts codebook k.
     """
@@ -81,7 +82,7 @@ def teacher_forcing_loss(model, prompt, codes):
     first_targets = mx.concatenate((codes[:, :, 0],
                                    mx.full((1, 1), model.vocab_size, mx.int32)), axis=1)
     first_logits = model._mask_reserved_codec_logits(model.lm_head(states))
-    first_loss = nn.losses.cross_entropy(first_logits, first_targets, reduction="mean")
+    main_loss = nn.losses.cross_entropy(first_logits, first_targets, reduction="mean")
     tokens = codes[0]
     depth_input = mx.concatenate((mx.zeros((frames, 1), mx.int32), tokens[:, :-1]), axis=1)
     depth_hidden = model.depth_decoder.model(depth_input, states[0, :frames])
@@ -90,7 +91,15 @@ def teacher_forcing_loss(model, prompt, codes):
         logits = depth_hidden[:, head + 1] @ model.depth_decoder.codebooks_head.weight[head]
         logits = model._mask_reserved_codec_logits(logits)
         losses.append(nn.losses.cross_entropy(logits, tokens[:, head + 1], reduction="mean"))
-    return first_loss + mx.stack(losses).mean()
+    # A single-codebook model has no depth heads, so its depth loss is absent.
+    depth_loss = mx.stack(losses).mean() if losses else None
+    return main_loss, depth_loss
+
+
+def teacher_forcing_loss(model, prompt, codes):
+    """Main plus depth loss, unchanged objective for existing recipes."""
+    main_loss, depth_loss = teacher_forcing_terms(model, prompt, codes)
+    return main_loss if depth_loss is None else main_loss + depth_loss
 
 
 def parameter_digest(parameters):

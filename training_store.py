@@ -13,19 +13,64 @@ from fastapi import HTTPException
 
 
 SCHEMAS = {
-    "training_datasets": "id TEXT PRIMARY KEY, name TEXT NOT NULL, version INTEGER NOT NULL DEFAULT 1, status TEXT NOT NULL DEFAULT 'new', approved_duration REAL NOT NULL DEFAULT 0, speaker_confirmed INTEGER NOT NULL DEFAULT 0",
+    "training_datasets": "id TEXT PRIMARY KEY, name TEXT NOT NULL, version INTEGER NOT NULL DEFAULT 1, status TEXT NOT NULL DEFAULT 'new', approved_duration REAL NOT NULL DEFAULT 0, speaker_confirmed INTEGER NOT NULL DEFAULT 0, preferred_reference_id TEXT",
     "training_sources": "id TEXT PRIMARY KEY, dataset_id TEXT NOT NULL REFERENCES training_datasets(id), extension TEXT NOT NULL, size INTEGER NOT NULL, duration REAL NOT NULL DEFAULT 0, status TEXT NOT NULL DEFAULT 'uploaded', metadata TEXT NOT NULL DEFAULT '{}'",
-    "training_segments": "id TEXT PRIMARY KEY, dataset_id TEXT NOT NULL REFERENCES training_datasets(id), source_id TEXT NOT NULL REFERENCES training_sources(id), start REAL NOT NULL, end REAL NOT NULL, audio_id TEXT NOT NULL, transcript TEXT NOT NULL DEFAULT '', review_status TEXT NOT NULL DEFAULT 'pending', quality_hints TEXT NOT NULL DEFAULT '[]'",
+    "training_segments": "id TEXT PRIMARY KEY, dataset_id TEXT NOT NULL REFERENCES training_datasets(id), source_id TEXT NOT NULL REFERENCES training_sources(id), start REAL NOT NULL, end REAL NOT NULL, audio_id TEXT NOT NULL, transcript TEXT NOT NULL DEFAULT '', review_status TEXT NOT NULL DEFAULT 'pending', quality_hints TEXT NOT NULL DEFAULT '[]', quality_stats TEXT NOT NULL DEFAULT '{}'",
     "training_jobs": "id TEXT PRIMARY KEY, dataset_id TEXT NOT NULL REFERENCES training_datasets(id), kind TEXT NOT NULL CHECK(kind IN ('prepare','train')), snapshot TEXT, digest TEXT, config TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'queued', attempt INTEGER NOT NULL DEFAULT 1, stage TEXT NOT NULL DEFAULT 'queued', segments_done INTEGER NOT NULL DEFAULT 0, segments_total INTEGER NOT NULL DEFAULT 0, steps_done INTEGER NOT NULL DEFAULT 0, steps_total INTEGER NOT NULL DEFAULT 0, checkpoint TEXT, error_code TEXT, request_key TEXT, parent_job_id TEXT, created_at TEXT NOT NULL, UNIQUE(dataset_id, request_key)",
     "voice_models": "id TEXT PRIMARY KEY, job_id TEXT NOT NULL REFERENCES training_jobs(id), base_model TEXT NOT NULL, config TEXT NOT NULL, reference_segment_id TEXT NOT NULL REFERENCES training_segments(id), created_at TEXT NOT NULL",
 }
-JSON_FIELDS = {"metadata", "quality_hints", "snapshot", "config"}
+JSON_FIELDS = {"metadata", "quality_hints", "quality_stats", "snapshot", "config"}
 FIELDS = {table: {part.strip().split()[0] for part in schema.split(', ') if not part.startswith('UNIQUE')} for table, schema in SCHEMAS.items()}
-IMMUTABLE = {"id", "dataset_id", "source_id", "audio_id", "snapshot", "digest", "config", "request_key", "created_at", "kind", "job_id", "parent_job_id"}
+IMMUTABLE = {"id", "dataset_id", "source_id", "audio_id", "snapshot", "digest", "config", "request_key",
+             "created_at", "kind", "job_id", "parent_job_id", "preferred_reference_id"}
 
 
 def canonical(value):
     return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(',', ':'), allow_nan=False)
+
+
+def reference_rank(segment):
+    """Sort key for choosing a synthesis reference: lower is better.
+
+    A reference is prompt material, so prefer clean, clearly voiced, longer
+    clips with text. The id breaks ties so the same snapshot always selects the
+    same reference.
+    """
+    hints = set(segment.get('quality_hints') or [])
+    stats = segment.get('quality_stats') or {}
+    penalty = 0
+    if 'low_volume_or_silence' in hints:
+        penalty += 6
+    if 'possible_clipping' in hints:
+        penalty += 4
+    if 'low_voiced_ratio' in hints:
+        penalty += 3
+    if 'short_segment' in hints:
+        penalty += 2
+    if not str(segment.get('transcript') or '').strip():
+        penalty += 5
+    effective = stats.get('effective_seconds')
+    if not isinstance(effective, (int, float)):
+        effective = max(0.0, float(segment.get('end', 0)) - float(segment.get('start', 0)))
+    edges = (stats.get('trimmed_start_ms') or 0) + (stats.get('trimmed_end_ms') or 0)
+    return (penalty, -round(float(effective), 3), round(float(edges), 1), str(segment['id']))
+
+
+def select_reference(segments, indices, preferred=None):
+    """Return (index, source) for the synthesis reference of a training split.
+
+    `preferred` must be an approved segment inside the training subset; extra
+    material such as a held-out validation clip is never silently substituted.
+    """
+    candidates = [index for index in indices if 0 <= index < len(segments)]
+    if not candidates:
+        return None, 'none'
+    if preferred is not None:
+        for index in candidates:
+            if segments[index]['id'] == preferred:
+                return index, 'preferred'
+    best = min(candidates, key=lambda index: reference_rank(segments[index]))
+    return best, 'auto'
 
 
 class TrainingStore:
@@ -67,8 +112,14 @@ class TrainingStore:
             columns = {row[1] for row in db.execute('PRAGMA table_info(voices)')}
             job_columns = ({row[1] for row in db.execute('PRAGMA table_info(training_jobs)')}
                            if 'training_jobs' in tables else set())
+            dataset_columns = ({row[1] for row in db.execute('PRAGMA table_info(training_datasets)')}
+                               if 'training_datasets' in tables else set())
+            segment_columns = ({row[1] for row in db.execute('PRAGMA table_info(training_segments)')}
+                               if 'training_segments' in tables else set())
             migration = (not set(SCHEMAS).issubset(tables) or 'model_id' not in columns
-                         or ('training_jobs' in tables and 'parent_job_id' not in job_columns))
+                         or ('training_jobs' in tables and 'parent_job_id' not in job_columns)
+                         or ('training_datasets' in tables and 'preferred_reference_id' not in dataset_columns)
+                         or ('training_segments' in tables and 'quality_stats' not in segment_columns))
             if migration:
                 with closing(sqlite3.connect(self.directory / f'before-training-{uuid4()}.sqlite3')) as backup:
                     db.backup(backup)
@@ -80,6 +131,10 @@ class TrainingStore:
                     db.execute('ALTER TABLE voices ADD COLUMN model_id TEXT REFERENCES voice_models(id)')
                 if 'training_jobs' in tables and 'parent_job_id' not in job_columns:
                     db.execute('ALTER TABLE training_jobs ADD COLUMN parent_job_id TEXT')
+                if 'training_datasets' in tables and 'preferred_reference_id' not in dataset_columns:
+                    db.execute('ALTER TABLE training_datasets ADD COLUMN preferred_reference_id TEXT')
+                if 'training_segments' in tables and 'quality_stats' not in segment_columns:
+                    db.execute("ALTER TABLE training_segments ADD COLUMN quality_stats TEXT NOT NULL DEFAULT '{}'")
                 db.execute("UPDATE training_jobs SET status='failed', stage='interrupted', error_code='interrupted' WHERE status IN ('queued','preparing','transcribing','training','validating','cancelling')")
                 db.commit()
             except Exception:
@@ -188,17 +243,20 @@ class TrainingStore:
             db.execute('UPDATE training_datasets SET version=version+1 WHERE id=?', (dataset_id,))
             return self._one(db, 'training_sources', source_id)
 
-    def add_segment(self, dataset_id, source_id, segment_id, start, end, transcript='', quality_hints=None):
+    def add_segment(self, dataset_id, source_id, segment_id, start, end, transcript='', quality_hints=None,
+                    quality_stats=None):
         self._id(segment_id)
         start, end = float(start), float(end)
         if not math.isfinite(start) or not math.isfinite(end) or start < 0 or end <= start:
             raise HTTPException(422, '片段时间无效。')
+        if quality_stats is not None and not isinstance(quality_stats, dict):
+            raise HTTPException(422, '片段质量统计无效。')
         transcript = self._text(transcript, 20000, '转写') if transcript.strip() else ''
         with closing(self.chat.connect()) as db, db:
             source = self._one(db, 'training_sources', source_id)
             if source['dataset_id'] != self._id(dataset_id):
                 raise HTTPException(422, '素材不属于此数据集。')
-            db.execute('INSERT INTO training_segments(id,dataset_id,source_id,start,end,audio_id,transcript,quality_hints) VALUES(?,?,?,?,?,?,?,?)', (segment_id, dataset_id, source_id, start, end, segment_id, transcript, canonical(quality_hints or [])))
+            db.execute('INSERT INTO training_segments(id,dataset_id,source_id,start,end,audio_id,transcript,quality_hints,quality_stats) VALUES(?,?,?,?,?,?,?,?,?)', (segment_id, dataset_id, source_id, start, end, segment_id, transcript, canonical(quality_hints or []), canonical(quality_stats or {})))
             db.execute('UPDATE training_datasets SET version=version+1 WHERE id=?', (dataset_id,))
             return self._one(db, 'training_segments', segment_id)
 
@@ -219,8 +277,33 @@ class TrainingStore:
             if status not in {'pending', 'approved', 'excluded'} or (status == 'approved' and not text):
                 raise HTTPException(422, '审核通过的片段必须有原文。')
             db.execute('UPDATE training_segments SET transcript=?,review_status=? WHERE id=?', (text, status, id))
+            # An excluded clip can no longer be the synthesis reference.
+            if status == 'excluded':
+                db.execute('UPDATE training_datasets SET preferred_reference_id=NULL WHERE id=? AND preferred_reference_id=?',
+                           (segment['dataset_id'], id))
             db.execute("UPDATE training_datasets SET version=version+1, approved_duration=(SELECT COALESCE(SUM(end-start),0) FROM training_segments WHERE dataset_id=? AND review_status='approved') WHERE id=?", (segment['dataset_id'], segment['dataset_id']))
             return self._one(db, 'training_segments', id)
+
+    def set_preferred_reference(self, dataset_id, segment_id=None):
+        """Record the human choice of synthesis reference for a dataset.
+
+        Only an approved clip of this dataset may be selected; `None` returns to
+        the automatic quality-based choice at the next snapshot.
+        """
+        self._id(dataset_id)
+        with closing(self.chat.connect()) as db, db:
+            db.execute('BEGIN IMMEDIATE')
+            self._one(db, 'training_datasets', dataset_id)
+            if segment_id is not None:
+                segment = self._one(db, 'training_segments', segment_id)
+                if segment['dataset_id'] != self._id(dataset_id):
+                    raise HTTPException(422, '片段不属于此数据集。')
+                if segment['review_status'] != 'approved':
+                    raise HTTPException(422, '只有已确认的片段可以作为试听参考。')
+                segment_id = segment['id']
+            db.execute('UPDATE training_datasets SET preferred_reference_id=?, version=version+1 WHERE id=?',
+                       (segment_id, dataset_id))
+            return self._one(db, 'training_datasets', dataset_id)
 
     def create_job(self, dataset_id, kind, config, request_key=None):
         if kind not in {'prepare', 'train'} or not isinstance(config, dict):
@@ -265,7 +348,30 @@ class TrainingStore:
                         validation = [candidate]
                     else:
                         training = list(range(len(segments)))
-                snapshot = {'dataset_id': dataset_id, 'version': dataset['version'], 'segments': segments, 'train_indices': training, 'validation_indices': validation, 'validation_warning': None if validation else 'insufficient_independent_validation'}
+                # A human-chosen reference must train the model: reporting it as
+                # the reference while training on a different prompt would make
+                # the preview describe a condition the job never used.
+                preferred = dataset.get('preferred_reference_id')
+                if preferred:
+                    for index, segment in enumerate(segments):
+                        if segment['id'] == preferred and index in validation:
+                            validation = [item for item in validation if item != index]
+                            training = sorted(training + [index])
+                            break
+                reference_index, reference_source = select_reference(segments, training, preferred)
+                reference = segments[reference_index] if reference_index is not None else None
+                if reference is None:
+                    raise HTTPException(422, '没有可用于试听的参考片段。')
+                validation_kind = None
+                if validation:
+                    validation_kind = ('independent_source' if len(sources) > 1
+                                       else 'same_recording')
+                snapshot = {'dataset_id': dataset_id, 'version': dataset['version'], 'segments': segments,
+                            'train_indices': training, 'validation_indices': validation,
+                            'validation_kind': validation_kind,
+                            'reference_segment_id': reference['id'] if reference else None,
+                            'reference_source': reference_source,
+                            'validation_warning': None if validation else 'insufficient_independent_validation'}
                 digest = hashlib.sha256(canonical(snapshot).encode()).hexdigest()
             value = str(uuid4())
             db.execute('INSERT INTO training_jobs(id,dataset_id,kind,snapshot,digest,config,request_key,created_at,segments_total) VALUES(?,?,?,?,?,?,?,?,?)', (value, dataset_id, kind, canonical(snapshot) if snapshot is not None else None, digest, encoded_config, request_key, datetime.now(timezone.utc).isoformat(), len(snapshot['segments']) if snapshot else 0))

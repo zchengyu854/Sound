@@ -232,5 +232,68 @@ class TrainingStoreTests(unittest.TestCase):
             self.assertEqual(len(list(Path(directory).glob('before-training-*.sqlite3'))), 1)
 
 
+
+    def test_migration_adds_quality_and_reference_columns(self):
+        with closing(self.chat.connect()) as db:
+            self.assertIn('quality_stats', [row[1] for row in db.execute('PRAGMA table_info(training_segments)')])
+            self.assertIn('preferred_reference_id',
+                          [row[1] for row in db.execute('PRAGMA table_info(training_datasets)')])
+
+    def test_reference_selection_prefers_clean_training_clips(self):
+        source = self.source(30)
+        low = self.store.add_segment(self.did, source['id'], str(uuid4()), 0, 4, '轻声片段',
+                                     ['low_volume_or_silence'], {'effective_seconds': 0.5})
+        clean = self.store.add_segment(self.did, source['id'], str(uuid4()), 4, 12, '清晰片段',
+                                       [], {'effective_seconds': 7.5, 'trimmed_start_ms': 100})
+        for segment in (low, clean):
+            path = self.store.segment_path(segment)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b'audio')
+            self.store.edit_segment(segment['id'], review_status='approved')
+        self.assertEqual(self.store.one('training_segments', clean['id'])['quality_stats'],
+                         {'effective_seconds': 7.5, 'trimmed_start_ms': 100})
+
+        job = self.store.create_job(self.did, 'train', {'rank': 4})
+        snapshot = job['snapshot']
+        # Both clips train here, so the reference is chosen by quality, not order.
+        self.assertEqual(snapshot['validation_indices'], [])
+        self.assertEqual(snapshot['reference_segment_id'], clean['id'])
+        self.assertEqual(snapshot['reference_source'], 'auto')
+        self.assertIsNone(snapshot['validation_kind'])
+
+        self.store.set_preferred_reference(self.did, low['id'])
+        chosen = self.store.create_job(self.did, 'train', {'rank': 4, 'seed': 7})['snapshot']
+        self.assertEqual(chosen['reference_segment_id'], low['id'])
+        self.assertEqual(chosen['reference_source'], 'preferred')
+
+        with self.assertRaises(HTTPException):
+            self.store.set_preferred_reference(self.did, str(uuid4()))
+        self.store.edit_segment(low['id'], review_status='excluded')
+        self.assertIsNone(self.store.one('training_datasets', self.did)['preferred_reference_id'])
+        with self.assertRaises(HTTPException):
+            self.store.set_preferred_reference(self.did, low['id'])
+
+    def test_preferred_reference_is_moved_out_of_the_validation_split(self):
+        source = self.source(30)
+        first = self.segment(source, 0, 3)
+        self.segment(source, 3, 6)
+        held_out = self.segment(source, 12, 15)
+        automatic = self.store.create_job(self.did, 'train', {'rank': 4})['snapshot']
+        self.assertTrue(automatic['validation_indices'])
+        self.assertNotEqual(automatic['reference_segment_id'], held_out['id'])
+
+        self.store.set_preferred_reference(self.did, held_out['id'])
+        chosen = self.store.create_job(self.did, 'train', {'rank': 4, 'seed': 9})['snapshot']
+        # The human choice trains the model instead of being silently dropped.
+        self.assertEqual(chosen['reference_segment_id'], held_out['id'])
+        self.assertEqual(chosen['reference_source'], 'preferred')
+        self.assertEqual(chosen['validation_indices'], [])
+        self.assertIn(held_out['id'], [chosen['segments'][index]['id'] for index in chosen['train_indices']])
+        self.assertEqual(chosen['validation_warning'], 'insufficient_independent_validation')
+
+        # A clip that is not approved cannot be chosen as the reference.
+        with self.assertRaises(HTTPException):
+            self.store.set_preferred_reference(self.did, str(uuid4()))
+
 if __name__ == '__main__':
     unittest.main()

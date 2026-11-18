@@ -17,7 +17,6 @@ from pathlib import Path
 import sqlite3
 import threading
 import tempfile
-from types import SimpleNamespace
 from urllib.parse import urlsplit
 from uuid import UUID, uuid4
 import wave
@@ -37,6 +36,39 @@ CHAT_TIMEOUT_SECONDS = 120
 CHAT_MAX_TOKENS = 160
 ACTIVE = ("queued", "thinking", "replying", "synthesizing")
 MAX_REASONING = 20000
+DEPTH_MODES = ("cached", "compiled")
+STREAMING_FRAME_RANGE = (1, 16)
+
+
+def streaming_frames(value=None):
+    """Chunk size in codec frames for streaming synthesis (BREEZE_STREAMING_FRAMES).
+
+    Larger chunks mean fewer callbacks but later first audio; smaller chunks start
+    sooner. Invalid or out-of-range values fall back to the library default.
+    """
+    from breezetts2_mac_fast import STREAMING_FRAMES
+    raw = os.getenv("BREEZE_STREAMING_FRAMES") if value is None else value
+    if raw is None or str(raw).strip() == "":
+        return STREAMING_FRAMES
+    try:
+        frames = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return STREAMING_FRAMES
+    low, high = STREAMING_FRAME_RANGE
+    return frames if low <= frames <= high else STREAMING_FRAMES
+
+
+
+def depth_mode(value=None):
+    """Depth-decoder mode for this process; anything unknown falls back to cached.
+
+    `cached` reuses the intra-frame KV cache. `compiled` also compiles the whole
+    frame graph: the first call pays a compilation cost, so warm numbers must be
+    measured separately. Read from BREEZE_DEPTH_MODE when `value` is None.
+    """
+    chosen = os.getenv("BREEZE_DEPTH_MODE", "cached") if value is None else value
+    chosen = str(chosen).strip().lower()
+    return chosen if chosen in DEPTH_MODES else "cached"
 log = logging.getLogger(__name__)
 
 
@@ -183,22 +215,28 @@ class Breeze:
         import mlx.core as mx
         from mlx_audio.tts.utils import load_model
         from mlx_audio.tts.models.breeze_tts.breeze_tts import Model
-        from breezetts2_mac_fast import FastDepth
+        from breezetts2_mac_fast import STREAMING_FRAMES, synthesis_interval
         if not mx.metal.is_available():
             raise RuntimeError("MLX Metal GPU 不可用。")
         self.model = load_model(os.getenv("BREEZE_MODEL", "mlx-community/Breeze-TTS-2-mlx-4bit"))
         if not isinstance(self.model, Model):
             raise RuntimeError("只支持 Breeze TTS 2 MLX 权重。")
-        codec = self.model.audio_tokenizer
-        stride = getattr(codec, "decode_upsample_rate", None)
-        if stride is None:
-            stride = codec.decoder.decode_upsample_rate
-        self.interval = (4 + 1e-6) * stride / self.model.sample_rate
-        self.engine = FastDepth(self.model)
-        self.engine.install()
-        self.engine.warmup(2, 1.0, None)
+        self.streaming_frames = streaming_frames()
+        # synthesis_interval() encodes the library default chunk size; scale it to
+        # the configured frame count (the epsilon term is negligible).
+        self.interval = synthesis_interval(self.model) * self.streaming_frames / STREAMING_FRAMES
+        self.engine = self.attach_depth(self.model)
         mx.synchronize()
         self.adapter_path = None
+
+    def attach_depth(self, model):
+        """Install the depth decoder with the configured mode; separated for testing."""
+        from breezetts2_mac_fast import FastDepth
+        self.depth_mode = depth_mode()
+        engine = FastDepth(model, self.depth_mode)
+        engine.install()
+        engine.warmup(2, 1.0, None)
+        return engine
 
     def select_adapter(self, folder):
         folder = Path(folder).resolve() if folder is not None else None
@@ -238,9 +276,8 @@ class Breeze:
         return int(self.model.sample_rate)
 
     def synthesize(self, text, reference, transcript, target, check=lambda: None, on_pcm=None):
-        from breezetts2_mac_fast import pcm_chunks, pcm16_bytes
-        args = SimpleNamespace(text=text, instruct=None, cfg_scale=1.0,
-                               max_tokens=750, seed=42, streaming_interval=self.interval)
+        from breezetts2_mac_fast import SYNTHESIS_MAX_TOKENS, pcm_chunks, pcm16_bytes, synthesis_args
+        args = synthesis_args(text, max_tokens=SYNTHESIS_MAX_TOKENS, streaming_interval=self.interval)
         check()
         total_frames = samples = 0
         with wave.open(str(target), "wb") as audio:
@@ -259,7 +296,8 @@ class Breeze:
         check()
         if not samples:
             raise RuntimeError("模型未生成音频。")
-        warning = "语音达到 750 帧上限，可能被截断；可缩短回复后重新对话。" if total_frames >= 750 else ""
+        warning = (f"语音达到 {SYNTHESIS_MAX_TOKENS} 帧上限，可能被截断；可缩短回复后重新对话。"
+                   if total_frames >= SYNTHESIS_MAX_TOKENS else "")
         return samples / self.model.sample_rate, warning
 
     def close(self):

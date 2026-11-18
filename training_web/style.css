@@ -104,6 +104,7 @@ main { min-width: 0; padding: 30px 32px; }
 .segment-transcript { display: block; }
 .segment textarea { font-size: 12.5px; min-height: 52px; padding: 6px 8px; line-height: 1.6; resize: none; }
 .segment textarea:focus { min-height: 110px; }
+.reference-note { margin: 8px 0 0; line-height: 1.7; overflow-wrap: anywhere; }
 .quality-hints { color: var(--gold); font-size: 10px; margin: 0; }
 .segment-actions { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 6px; }
 .segment-actions button { min-height: 28px; padding: 2px 4px; font-size: 11.5px; }
@@ -180,6 +181,8 @@ dialog form > label { margin-bottom: 22px; font-size: 12px; }
 .metrics-details strong { font-weight: 600; }
 .metrics-value { color: var(--text); font-size: 19px; font-variant-numeric: tabular-nums; }
 .index-chart { display: grid; gap: 10px; padding: 16px; border: 1px solid var(--line); border-radius: 6px; background: var(--surface); }
+.metrics-part { color: var(--blue); margin: 0; }
+.metrics-part + .metrics-part { color: var(--muted); }
 .index-row { display: grid; gap: 5px; font-variant-numeric: tabular-nums; }
 .index-meter { display: block; width: 100%; height: 9px; accent-color: var(--gold); }
 .index-meter::-webkit-meter-bar { background: #303945; border: 0; border-radius: 5px; }

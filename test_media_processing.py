@@ -146,6 +146,39 @@ class MediaTests(unittest.TestCase):
         self.assert_code("cancelled", media.split_audio, path, self.folder / "cancelled", self.cancel)
         self.assertEqual(list((self.folder / "cancelled").glob("*.wav")), [])
 
+    def test_bounded_edge_trim_and_reviewable_quality_stats(self):
+        path = self.folder / "edges.wav"
+        tone = np.full(24000, 4000, dtype=np.int16)
+        samples = np.concatenate([np.zeros(24000, dtype=np.int16), tone,
+                                  np.zeros(48000, dtype=np.int16)])
+        self.write_wav(path, samples)
+        clips = media.split_audio(path, self.folder / "edges", self.cancel)
+        self.assertEqual(len(clips), 1)
+        clip = clips[0]
+        # One second of leading and two seconds of trailing silence are trimmed
+        # to a 200 ms buffer. Source coordinates stay absolute.
+        self.assertAlmostEqual(clip["start"], 0.8, places=2)
+        self.assertAlmostEqual(clip["end"], 2.2, places=2)
+        self.assertIn("trimmed_edges", clip["quality_hints"])
+        self.assertIn("low_voiced_ratio", clip["quality_hints"])
+        stats = clip["quality_stats"]
+        self.assertAlmostEqual(stats["voiced_fraction"], 0.25)
+        self.assertAlmostEqual(stats["effective_seconds"], 1.0, places=2)
+        self.assertAlmostEqual(stats["leading_low_energy_ms"], 1000, delta=1)
+        self.assertAlmostEqual(stats["trailing_low_energy_ms"], 2000, delta=1)
+        self.assertAlmostEqual(stats["trimmed_start_ms"], 800, delta=1)
+        with wave.open(clip["path"]) as wav:
+            self.assertAlmostEqual(wav.getnframes() / 24000, 1.4, delta=0.02)
+
+    def test_no_trim_for_speech_that_starts_and_ends_immediately(self):
+        path = self.folder / "tight.wav"
+        self.write_wav(path, np.full(4 * 24000, 2000, dtype=np.int16))
+        clip = media.split_audio(path, self.folder / "tight", self.cancel)[0]
+        self.assertEqual((clip["start"], clip["end"]), (0, 4))
+        self.assertNotIn("trimmed_edges", clip["quality_hints"])
+        self.assertEqual(clip["quality_stats"]["trimmed_start_ms"], 0)
+        self.assertEqual(clip["quality_stats"]["trimmed_end_ms"], 0)
+
 
 if __name__ == "__main__":
     unittest.main()

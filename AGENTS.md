@@ -9,6 +9,7 @@
 - `media_processing.py`: bounded MP3/MP4/WAV probe, decode to 24 kHz mono PCM16, and silence-aware slicing.
 - `training_store.py`, `training_service.py`, `breeze_training.py`: dataset/snapshot review gates, LoRA training jobs, checkpoints, versioned A/B validation records, and publishing immutable voice versions.
 - `separate_vocals.py` + `requirements-separator.txt`: standalone vocal separation CLI that runs in its own `.venv-separator` and calls `demucs-mlx`; outputs a review WAV plus an uploadable MP3. Not part of the web service.
+- `benchmark_voice.py`: local TTS benchmark (cold/warm RTF, first-chunk latency, raw values + medians) written to ignored `web-test-artifacts/`. `--depth-mode {cached,compiled,native}` compares decoder modes, `--verify` checks numerical parity. Pure helpers `summarize`/`rtf` are unit-tested; the CLI loads the real engine, so stop the app first to avoid two GPU processes. The app reads `BREEZE_DEPTH_MODE` (default `cached`).
 - `web/`: chat frontend (native HTML/CSS/JS, no build step). `web/vad.js` and `web/realtime-worklet.js` are shared with the realtime page.
 - `training_web/`: standalone training workbench served at `/training/`. `realtime_web/`: standalone realtime voice page served at `/realtime/`.
 - `test_voice_app.py`: backend regression tests and fake inference/provider implementations. `test_realtime_runtime.py` covers splitting/queue/turn logic; `test_vad.cjs` and `test_realtime_ui.cjs` cover the realtime browser logic with DOM/API doubles.
@@ -25,16 +26,18 @@ uv pip install --python .venv/bin/python -r requirements-web.txt
 .venv/bin/python voice_app.py
 .venv/bin/python -m unittest -v test_voice_app test_characters test_audio_runtime \
   test_breeze_training test_media_processing test_training_store \
-  test_training_service test_training_web test_separate_vocals test_realtime_runtime
+  test_training_service test_training_web test_separate_vocals test_realtime_runtime \
+  test_benchmark_voice test_voice_metrics
 node --check web/app.js && node --check training_web/app.js
 node --check web/vad.js && node --check web/realtime-worklet.js && node --check realtime_web/app.js
 node test_training_ui.cjs && node test_audio_ui.cjs && node test_reply_ui.cjs
 node test_vad.cjs && node test_realtime_ui.cjs
 .venv/bin/python -m py_compile voice_app.py breezetts2_mac_fast.py realtime_runtime.py \
-  media_processing.py training_store.py training_service.py separate_vocals.py
+  media_processing.py training_store.py training_service.py separate_vocals.py \
+  benchmark_voice.py voice_metrics.py
 ```
 
-These commands install dependencies, serve localhost port 8000, run the 156 backend
+These commands install dependencies, serve localhost port 8000, run the 195 backend
 tests plus five Node suites, and check syntax. No build step is required. Optional
 vocal separation uses a separate environment (`.venv-separator`, git-ignored) so the
 pinned `mlx==0.32.2` / `mlx-audio==0.5.1` of `.venv` stays untouched:
@@ -49,6 +52,14 @@ For real CLI verification:
 
 ```sh
 .venv/bin/python breezetts2_mac_fast.py --no-play --runs 1 --text '你好' --output /tmp/breeze_check
+```
+
+Benchmark the app engine (stop the app first; each mode writes to ignored `web-test-artifacts/`):
+
+```sh
+.venv/bin/python benchmark_voice.py --voice <UUID> --runs 5 --depth-mode cached --verify
+.venv/bin/python benchmark_voice.py --voice <UUID> --runs 5 --depth-mode compiled --verify
+# BREEZE_DEPTH_MODE=compiled .venv/bin/python voice_app.py   # app-side switch, default cached
 ```
 
 ## Coding Style & Naming Conventions

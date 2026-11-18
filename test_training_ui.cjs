@@ -64,8 +64,18 @@ function fixture(sharedSession = storage()) {
   const segment = {id: randomUUID(), dataset_id: id, source_id: randomUUID(), start: 0, end: 4,
     transcript: "<img src=x onerror=alert(1)>", review_status: "pending", quality_hints: ["forced_split_check_words"]};
   const data = {datasets: [item], segments: [segment], jobs: [], posts: [], keys: new Map(), loseTrainResponse: false,
-    datasetMetrics: new Map(), jobMetrics: new Map(), history: new Map(),
+    datasetMetrics: new Map(), jobMetrics: new Map(), history: new Map(), summaries: new Map(),
     cap: {ffmpeg: true, ffprobe: true, compatible: true, available: true, active_job: null, base_model: "test-base", hardware: {chip: "Test Mac", memory_gib: 16}}};
+  const summaryFor = datasetId => {
+    const segments = data.segments.filter(entry => entry.dataset_id === datasetId);
+    const approved = segments.filter(entry => entry.review_status === "approved" && entry.transcript.trim());
+    return {dataset_version: 1, speaker_confirmed: true, sources: 1, sources_pending: 0,
+      approved_segments: approved.length, approved_seconds: approved.length * 4,
+      pending_segments: segments.length - approved.length, excluded_segments: 0,
+      independent_validation: true, validation_warning: null,
+      preferred_reference_id: null, reference_segment_id: approved[0]?.id || null,
+      reference_source: "auto", reference_note: "", ready: true};
+  };
   const response = (value, status = 200) => ({ok: status < 400, status, json: async () => structuredClone(value)});
   const windowListeners = {};
   const win = {localStorage: storage(), sessionStorage: sharedSession, crypto: {randomUUID}, FormData,
@@ -95,6 +105,10 @@ function fixture(sharedSession = storage()) {
         if (url.startsWith("/api/training/jobs?")) return response(data.jobs);
         if (url === "/api/training/capabilities") return response(data.cap);
         if (url === "/api/health") return response({model_status: "ready", stt_status: "ready"});
+        if (/\/datasets\/[^/]+\/summary$/.test(url)) {
+          const datasetId = url.split("/")[4];
+          return response(data.summaries.get(datasetId) || summaryFor(datasetId));
+        }
         if (/\/datasets\/[^/]+\/segments\?/.test(url)) {
           const parsed = new URL(url, "http://127.0.0.1");
           const datasetId = parsed.pathname.split("/")[4];
@@ -103,6 +117,14 @@ function fixture(sharedSession = storage()) {
         }
         const job = data.jobs.find(entry => url === `/api/training/jobs/${entry.id}`);
         if (job) return response(job);
+      }
+      if (method === "PATCH" && /\/datasets\/[^/]+\/reference$/.test(url)) {
+        const datasetId = url.split("/")[4], summary = data.summaries.get(datasetId) || summaryFor(datasetId);
+        const chosen = data.segments.find(entry => entry.id === body.segment_id && entry.dataset_id === datasetId);
+        if (!chosen) return response({detail: "只有已确认的片段可以作为试听参考。"}, 422);
+        Object.assign(summary, {preferred_reference_id: chosen.id, reference_segment_id: chosen.id, reference_source: "preferred"});
+        data.summaries.set(datasetId, summary);
+        return response(summary);
       }
       if (method === "PATCH" && /\/datasets\/[^/]+$/.test(url)) {
         const entry = data.datasets.find(dataset => url.endsWith(dataset.id));
@@ -116,6 +138,12 @@ function fixture(sharedSession = storage()) {
         const dataset = data.datasets.find(entry => entry.id === original.dataset_id);
         dataset.approved_duration = body.review_status === "approved" ? 4 : 0;
         dataset.version++;
+        if (body.review_status === "excluded") {
+          const summary = data.summaries.get(original.dataset_id);
+          if (summary?.preferred_reference_id === original.id) {
+            Object.assign(summary, {preferred_reference_id: null, reference_segment_id: null, reference_source: "auto"});
+          }
+        }
         return response(original);
       }
       if (method === "POST" && url === "/api/training/datasets") {
@@ -379,6 +407,80 @@ async function testNavigation() {
   empty.app.dispose();
 }
 
+async function testReferenceAndParts() {
+  const f = fixture(), datasetId = f.data.datasets[0].id, segmentId = f.data.segments[0].id;
+  f.app.start();
+  await f.app.refresh();
+  await f.app.loadSegments();
+  assert.match(f.doc.getElementById("reference-note").textContent, /至少确认一条/,
+    "an unapproved dataset explains why there is no reference yet");
+
+  await f.app.saveSegment(segmentId, "逐字核对的原文。", "approved");
+  // Reviewing a clip refreshes the summary, so the badge and note move without
+  // a manual segment reload.
+  assert.match(f.doc.getElementById("reference-note").textContent, new RegExp(segmentId),
+    "the automatic reference is shown before training");
+  const card = () => walk(f.doc.getElementById("segments")).find(item => item.className === "segment");
+  assert.match(card().textContent, /试听参考/);
+  assert(!walk(card()).some(item => item.tagName === "BUTTON" && item.textContent === "设为试听参考"),
+    "the current reference does not offer to select itself");
+
+  const secondId = randomUUID();
+  f.data.segments.push({...f.data.segments[0], id: secondId, start: 5, end: 9});
+  await f.app.loadSegments();
+  const posts = f.data.posts.length;
+  const choose = walk(f.doc.getElementById("segments")).find(item => item.tagName === "BUTTON" && item.textContent === "设为试听参考");
+  assert(choose, "an approved non-reference clip can become the reference");
+  await choose.emit("click");
+  const posted = f.data.posts.at(-1);
+  assert.equal(f.data.posts.length, posts + 1);
+  assert.equal(posted.url, `/api/training/datasets/${datasetId}/reference`);
+  assert.equal(posted.method, "PATCH");
+  assert.deepEqual(JSON.parse(posted.body), {segment_id: secondId});
+  assert.match(f.doc.getElementById("reference-note").textContent, /人工选择/);
+  await f.app.saveSegment(secondId, "第二条原文。", "excluded");
+  assert.doesNotMatch(f.doc.getElementById("reference-note").textContent, new RegExp(secondId),
+    "excluding the chosen reference falls back to the automatic choice");
+
+  const quality = {status: "ok", dbfs: -20, low_energy_percent: 10, clipping_percent: 0, duration_seconds: 4, file_count: 1};
+  const job = {id: randomUUID(), dataset_id: datasetId, kind: "train", status: "completed", attempt: 1, config,
+    preview: {texts: ["句一", "句二"], confirmed: false, note: ""}};
+  f.data.jobs.push(job);
+  f.data.jobMetrics.set(job.id, {status: "completed", stale: false, result: {
+    analyzed_at: "2026-03-04T05:06:07Z", comparison_key: "key-1",
+    source: {dataset_version: 1, material_digest: "digest", reference_kind: "validation",
+      reference_label: "同录音留出验证", reference_ids: [segmentId], preview_texts: ["句一", "句二"],
+      synthesis_reference_id: segmentId, inference: {max_tokens: 750, seed: 42, cfg_scale: 1, streaming_interval: 0.32}},
+    quality: {original: quality, generated: quality, previews: [quality]},
+    features: {status: "partial", evaluation_version: "voice-metrics-2", index_note: "0–100 是声纹余弦相似度的缩放指数",
+      model: "model", revision: "v1", algorithm: "speaker-cosine-v2", quality_algorithm: "pcm-20ms-v1",
+      reference_consistency: {status: "insufficient", reason: "insufficient_references", score: null,
+        message: "需要至少两条参考片段才能计算原声一致性。", reference_count: 1, pair_count: 0},
+      generated_similarity: {status: "partial", score: 88.5, sample_count: 1, expected_count: 2, message: ""},
+      training_effect: {status: "ok", base_index: 70, trained_index: 88.5, delta: 18.5},
+      original_index: null, generated_index: 88.5, reference_count: 1, pair_count: 0, generated_count: 1,
+      previews: [{index: 1, value: 88.5, reference_count: 1}]}}});
+  await f.app.refresh();
+  await f.app.refreshMetrics();
+  const trained = f.doc.getElementById("job-metrics-content");
+  assert.match(trained.textContent, /需要至少两条参考片段/, "one reference is a limit, not a system error");
+  assert.match(trained.textContent, /生成试听相似度：部分成功（已计算 1 \/ 2 条）/);
+  assert.match(trained.textContent, /训练前后声纹对照：基座 70 → 训练后 88\.5（\+18\.5）/);
+  assert.match(trained.textContent, /同录音留出验证/);
+  assert.match(trained.textContent, /0–100 是声纹余弦相似度的缩放指数/);
+  assert.match(trained.textContent, /评估版本：voice-metrics-2/);
+  assert.match(trained.textContent, /试听与应用共用的合成参考：/);
+
+  const legacy = f.data.jobMetrics.get(job.id);
+  delete legacy.result.features.evaluation_version;
+  delete legacy.result.features.reference_consistency;
+  f.data.jobMetrics.set(job.id, legacy);
+  await f.app.refreshMetrics();
+  assert.match(f.doc.getElementById("job-metrics-content").textContent, /旧算法结果/,
+    "records from the previous algorithm are labelled");
+  f.app.dispose();
+}
+
 async function main() {
   assert.equal(formatDuration(125), "2:05");
   assert.equal(formatDuration(-3), "0:00");
@@ -566,6 +668,7 @@ async function main() {
   race.app.dispose();
   await testMetrics();
   await testNavigation();
-  console.log("Training UI checks passed: safe rendering, review and publishing, analysis status and retries, comparison groups, history, and stale reads.");
+  await testReferenceAndParts();
+  console.log("Training UI checks passed: safe rendering, review and publishing, analysis status and retries, comparison groups, history, reference selection, metric parts, and stale reads.");
 }
 main().catch(error => { console.error(error); process.exitCode = 1; });

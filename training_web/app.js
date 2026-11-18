@@ -5,7 +5,7 @@
   const ACTIVE = new Set(["queued", "preparing", "transcribing", "training", "validating", "cancelling"]);
   const STATUS = {queued: "排队等待", preparing: "准备素材与模型", transcribing: "逐片转写", review_required: "等待人工审核", training: "正在训练", validating: "验证训练产物", completed: "训练完成，待试听确认", failed: "任务失败", cancelling: "正在取消", cancelled: "已取消"};
   const REVIEW = {pending: "待审核", approved: "已确认", excluded: "已排除"};
-  const HINTS = {forced_split_check_words: "强制切分，请检查断词", short_segment: "片段偏短，请检查内容", low_volume_or_silence: "低音量或静音", possible_clipping: "可能削波失真", no_speech: "未识别到人声，请人工核对", transcription_failed_edit_required: "转写失败，请手动填写原文"};
+  const HINTS = {forced_split_check_words: "强制切分，请检查断词", short_segment: "片段偏短，请检查内容", low_volume_or_silence: "低音量或静音", possible_clipping: "可能削波失真", no_speech: "未识别到人声，请人工核对", transcription_failed_edit_required: "转写失败，请手动填写原文", one_character_text: "只有 1 个字，请核对原文与音频", trimmed_edges: "已修剪首尾停顿，请试听确认没有切掉轻声", low_voiced_ratio: "有声占比偏低，请确认是否为有效语音"};
   const ERRORS = {interrupted: "上次任务因应用退出而中断，请显式重试或恢复。", training_failed: "任务执行失败。请检查素材、可用内存和模型状态，再重试。", dispatch_failed: "任务未能投递，请重试。", cancelled: "任务已取消。可在退出后显式恢复或重试。", media_timeout: "媒体工具处理超时。请缩短素材后重新上传。", invalid_media: "素材损坏或无法解码，请重新导出 MP3、MP4 或 WAV。", unsupported_codec: "WAV 必须使用未压缩 PCM 编码，不能是压缩或浮点格式。", disk_space: "磁盘剩余空间不足，请清理空间后重试。", decoded_size_limit: "解码音频超过限制，请先缩短素材。", duration_limit: "媒体实际时长超限，请缩短素材。", container_mismatch: "扩展名与实际容器不一致，请正确导出素材。", no_audio_stream: "视频没有可用音轨。", media_tool_unavailable: "未找到 FFmpeg 或 FFprobe，请安装后重试。"};
 
   function formatDuration(value) {
@@ -153,22 +153,53 @@
       const features = result.features || {}, source = result.source || {}, quality = result.quality || {};
       const details = node("div", "metrics-details");
       const selectedIndex = job ? features.generated_index : features.original_index;
+      const consistency = features.reference_consistency || {};
+      const similarity = features.generated_similarity || {};
       details.append(node("div", "metrics-value", `${job ? "生成音色指数" : "原声音色指数"}：${metricNumber(selectedIndex)}`));
       if (job) details.append(node("p", "", `任务快照原声指数：${metricNumber(features.original_index)}`));
-      if (job) details.append(node("p", "", `有效生成试听：${metricNumber(features.generated_count)} / 2`));
+      const expectedPreviews = Number.isInteger(similarity.expected_count) ? similarity.expected_count : 2;
+      if (job) details.append(node("p", "", `有效生成试听：${metricNumber(features.generated_count)} / ${expectedPreviews}`));
       details.append(node("p", "", `参考数量：${metricNumber(features.reference_count)} · 配对数：${metricNumber(features.pair_count)}`));
+      details.append(consistency.message
+        ? node("p", "metrics-part", `原声一致性：${consistency.message}`)
+        : node("p", "metrics-part", `原声一致性指数：${metricNumber(consistency.score ?? features.original_index)}`));
+      if (job) {
+        const scored = Number.isInteger(similarity.sample_count) ? similarity.sample_count : 0;
+        const expected = Number.isInteger(similarity.expected_count) ? similarity.expected_count : expectedPreviews;
+        const label = similarity.status === "ok" ? "全部成功" : scored > 0 ? "部分成功" : "不可用";
+        details.append(node("p", "metrics-part", `生成试听相似度：${label}（已计算 ${metricNumber(scored)} / ${metricNumber(expected)} 条）`));
+        if (similarity.message) details.append(node("p", "metrics-part", similarity.message));
+        const effect = features.training_effect;
+        if (effect && typeof effect === "object") {
+          const comparable = effect.status === "ok" && typeof effect.delta === "number" && Number.isFinite(effect.delta);
+          details.append(node("p", comparable ? "" : "muted", comparable
+            ? `训练前后声纹对照：基座 ${metricNumber(effect.base_index)} → 训练后 ${metricNumber(effect.trained_index)}（${effect.delta >= 0 ? "+" : ""}${metricNumber(effect.delta)}）`
+            : `训练前后声纹对照：${effect.message || "缺少同条件的基座试听，不能比较。"}`));
+        } else {
+          details.append(node("p", "muted", "训练前后声纹对照：缺少训练前基座试听，不比较提升幅度。"));
+        }
+        if (typeof source.synthesis_reference_id === "string" && source.synthesis_reference_id) {
+          details.append(node("p", "muted", `试听与应用共用的合成参考：${source.synthesis_reference_id}`));
+        }
+      }
+      details.append(node("p", "muted", typeof features.index_note === "string" && features.index_note
+        ? features.index_note : "0–100 是声纹余弦相似度的缩放指数，不等于克隆准确率，也不衡量发音正确率。"));
       const kinds = {validation: "独立验证片段", training: "训练素材（没有独立验证片段）", current: "当前素材"};
-      details.append(node("p", "muted", `参考来源：${kinds[source.reference_kind] || "不可用"}`));
+      const referenceLabel = typeof source.reference_label === "string" && source.reference_label ? `（${source.reference_label}）` : "";
+      details.append(node("p", "muted", `参考来源：${kinds[source.reference_kind] || "不可用"}${referenceLabel}`));
       const provenance = node("details", "metrics-provenance");
+      const evaluationVersion = typeof features.evaluation_version === "string" && features.evaluation_version
+        ? features.evaluation_version : "旧算法结果（未记录评估版本）";
       provenance.append(node("summary", "", "分析详情"),
         node("p", "muted", `分析时间：${metricText(result.analyzed_at)} · 素材版本：${metricNumber(source.dataset_version)}`),
         node("p", "muted", `素材摘要：${metricText(source.material_digest)}`),
         node("p", "muted", `模型：${metricText(features.model)} · 版本：${metricText(features.revision)} · 算法：${metricText(features.algorithm)}`),
+        node("p", "muted", `评估版本：${evaluationVersion} · 质量算法：${metricText(features.quality_algorithm)}`),
+        node("p", "muted", `推理条件：${source.inference ? JSON.stringify(source.inference) : "不可用"}`),
         node("p", "muted", `比较条件标识：${metricText(result.comparison_key)}`));
       details.append(provenance);
       details.append(node("p", "metrics-subtitle", "试听质量"), qualityBlock(job ? "任务快照原声" : "当前原声", quality.original));
       if (job) details.append(qualityBlock("生成试听", quality.generated));
-
       const referenceIds = Array.isArray(source.reference_ids) ? source.reference_ids : [];
       if (referenceIds.length) {
         details.append(node("p", "metrics-subtitle", "逐条试听参考原声"));
@@ -581,12 +612,26 @@
         $("job-summary").hidden = !summary;
         if (summary) {
           const parts = [`已训练 ${summary.training_seconds} 秒 / 约 ${summary.approx_passes} 轮`];
+          if (Number.isInteger(summary.full_epochs)) {
+            parts.push(summary.partial_epoch_samples > 0
+              ? `完整 ${summary.full_epochs} 轮，另有 ${summary.partial_epoch_samples} 个样本未满一轮`
+              : `完整覆盖 ${summary.full_epochs} 轮`);
+          }
           if (summary.unique_segments_seen < summary.training_segments) {
             parts.push(`${summary.training_segments - summary.unique_segments_seen} 个片段未参与参数更新`);
-          } else if (summary.approx_passes < 2) {
-            parts.push("数据覆盖不到两轮，建议补清晰素材或做训练量对照");
           }
           if (!summary.independent_validation) parts.push("没有独立验证片段，请用未训练文本验收");
+          if (summary.reference_segment_id) parts.push(`合成参考：${summary.reference_segment_id}`);
+          const trend = Array.isArray(preview?.validation_trend) ? preview.validation_trend : [];
+          if (trend.length) {
+            const best = preview?.best_checkpoint;
+            parts.push(best
+              ? `留出验证最低损失在第 ${best.step} 步（${metricNumber(best.validation_loss)}），最终第 ${metricNumber(preview?.final_checkpoint_step)} 步`
+              : "留出验证记录了损失趋势");
+            if (trend.length > 1) parts.push("步数更大不代表声音更好，请以未训练文本试听为准");
+          } else if (item.kind === "train") {
+            parts.push("没有留出验证片段，无法给出验证损失趋势");
+          }
           $("job-summary").textContent = parts.join("；");
         }
         renderPreview(item, preview);
@@ -650,6 +695,10 @@
         ? `已确认 ${summary.approved_segments} 段（${formatDuration(summary.approved_seconds)}）· 待审核 ${summary.pending_segments} 段 · 独立验证：${summary.independent_validation ? "有" : "无，需用未训练文本试听"}`
         : "";
       $("training-readiness").textContent = rollup ? `${readiness} ${rollup}` : readiness;
+      // The same reference drives validation, A/B and application inference.
+      $("reference-note").textContent = !summary ? "" : summary.reference_segment_id
+        ? `试听与应用推理共用的合成参考：${summary.reference_segment_id}（${summary.reference_source === "preferred" ? "人工选择" : "自动按质量选择"}）。可在下方已确认片段中另行选择。`
+        : summary.reference_note || "至少确认一条带原文的片段后才能选择试听参考。";
       if (cap) $("environment").textContent = `FFmpeg：${cap.ffmpeg ? "可用" : "未安装"} / FFprobe：${cap.ffprobe ? "可用" : "未安装"}\n训练环境：${cap.compatible ? "版本兼容" : "不兼容，请检查固定依赖与 Apple Silicon"}\n${cap.hardware?.chip || "本机"}${cap.hardware?.memory_gib ? ` / ${cap.hardware.memory_gib} GiB` : ""}\n基座：${cap.base_model}\n${state.health?.model_error || state.health?.stt_error || "batch size 固定 1，原始模型权重冻结。"}`;
       renderJob();
       renderComparison();
@@ -667,10 +716,12 @@
         const article = node("article", "segment");
         article.title = `来源 ${segment.source_id.slice(0, 8)} / ${(segment.end - segment.start).toFixed(2)} 秒`;
         const meta = node("div", "segment-meta");
+        const isReference = state.summary?.reference_segment_id === segment.id;
         meta.append(
           node("span", "segment-index", String(state.offset + index + 1).padStart(2, "0")),
           node("span", "segment-time", `${formatDuration(segment.start)}–${formatDuration(segment.end)}`),
           node("span", `segment-status ${segment.review_status}`, REVIEW[segment.review_status] || "待审核"));
+        if (isReference) meta.append(node("span", "segment-status approved", "试听参考"));
         const main = node("div", "segment-main");
         const audio = node("audio");
         audio.controls = true;
@@ -690,6 +741,10 @@
         label.append(textarea);
         body.append(label);
         if (segment.quality_hints?.length) body.append(node("p", "quality-hints", segment.quality_hints.map(hint => HINTS[hint] || "素材需要人工检查").join("；")));
+        const stats = segment.quality_stats;
+        if (stats && typeof stats === "object" && Number.isFinite(stats.voiced_fraction)) {
+          body.append(node("p", "muted", `有声占比 ${Math.round(stats.voiced_fraction * 100)}% · 有效语音 ${metricNumber(stats.effective_seconds, " 秒")} · 首部停顿 ${metricNumber(stats.leading_low_energy_ms, " ms")} · 尾部停顿 ${metricNumber(stats.trailing_low_energy_ms, " ms")}`));
+        }
         main.append(audio, body);
         const actions = node("div", "segment-actions");
         for (const [text, review, className] of [["确认片段", "approved", "small"], ["保存原文", "pending", "quiet small"], ["排除此片段", "excluded", "quiet small"]]) {
@@ -697,6 +752,12 @@
           button.type = "button";
           button.addEventListener("click", () => saveSegment(segment.id, textarea.value, review));
           actions.append(button);
+        }
+        if (segment.review_status === "approved" && !isReference) {
+          const choose = node("button", "quiet small", "设为试听参考");
+          choose.type = "button";
+          choose.addEventListener("click", () => setReference(segment.id));
+          actions.append(choose);
         }
         article.append(meta, main, actions);
         container.append(article);
@@ -862,8 +923,19 @@
         const saved = await api(path("segments", id), json("PATCH", {transcript, review_status: reviewStatus}));
         state.segments = state.segments.map(segment => segment.id === id ? saved : segment);
         state.drafts.delete(id);
-        renderSegments();
+        // Review changes also move the reference badge and the approved rollup.
+        await loadSegments();
         notice(reviewStatus === "approved" ? "片段已确认，将进入新任务的训练快照。" : reviewStatus === "excluded" ? "片段已排除，不进入新任务训练。" : "原文已保存，片段恢复为待审核。请核对后确认。");
+      });
+    }
+
+    async function setReference(segmentId) {
+      // Human choice of the prompt reference; the next snapshot records it.
+      if (editingBlocked() || !state.selected) return;
+      await perform("正在记录试听参考", async () => {
+        state.summary = await api(`${path("datasets", state.selected)}/reference`, json("PATCH", {segment_id: segmentId}));
+        renderSegments();
+        notice("已更新试听参考片段。下一次训练、试听与应用推理都会使用它。");
       });
     }
 

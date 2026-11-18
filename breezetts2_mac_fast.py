@@ -70,7 +70,7 @@ import time
 import wave
 from importlib.metadata import version
 from pathlib import Path
-
+from types import SimpleNamespace
 
 def hardware_info():
     info = {"chip": platform.processor() or platform.machine(), "memory_gib": None}
@@ -620,6 +620,42 @@ class Player:
                 self.stream.abort()
         finally:
             self.stream.close()
+
+
+# One set of synthesis conditions, shared by the web app and the training
+# validation so a preview measures the same path a published voice uses.
+SYNTHESIS_MAX_TOKENS = 750
+SYNTHESIS_SEED = 42
+SYNTHESIS_CFG_SCALE = 1.0
+STREAMING_FRAMES = 4
+
+
+def synthesis_interval(model):
+    """Streaming interval in seconds, read from the codec's frame stride."""
+    codec = model.audio_tokenizer
+    stride = getattr(codec, "decode_upsample_rate", None)
+    if stride is None:
+        stride = codec.decoder.decode_upsample_rate
+    return (STREAMING_FRAMES + 1e-6) * stride / model.sample_rate
+
+
+def synthesis_args(text, *, model=None, instruct=None, max_tokens=SYNTHESIS_MAX_TOKENS,
+                   seed=SYNTHESIS_SEED, cfg_scale=SYNTHESIS_CFG_SCALE, streaming_interval=None):
+    """Build the generation arguments both the app and validation pass in."""
+    if streaming_interval is None:
+        if model is None:
+            raise ValueError("合成参数需要模型或流式间隔。")
+        streaming_interval = synthesis_interval(model)
+    return SimpleNamespace(text=str(text), instruct=instruct or None, cfg_scale=cfg_scale,
+                           max_tokens=int(max_tokens), seed=int(seed),
+                           streaming_interval=streaming_interval)
+
+
+def inference_signature(args):
+    """Conditions that must match before two generations may be compared."""
+    return {"max_tokens": int(args.max_tokens), "seed": int(args.seed),
+            "cfg_scale": float(args.cfg_scale),
+            "streaming_interval": round(float(args.streaming_interval), 6)}
 
 
 def pcm_chunks(model, args, ref_audio=None, ref_text=None):
