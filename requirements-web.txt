@@ -1,7 +1,0 @@
-mlx-audio==0.5.1
-mlx==0.32.2
-sounddevice==0.5.3
-fastapi==0.128.8
-uvicorn==0.40.0
-httpx==0.28.1
-python-multipart==0.0.22

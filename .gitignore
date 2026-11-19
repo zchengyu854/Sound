@@ -1,14 +1,12 @@
 .venv/
-.venv-separator/
 __pycache__/
 *.pyc
 .env
+.breeze-*/
 data/
 web-test-artifacts/
-llm-settings.json
-.llm-settings-*.tmp
+*.zip
 *.wav
 *.mp3
 *.mp4
-deployment_test_*.json
-.DS_Store
+*.safetensors

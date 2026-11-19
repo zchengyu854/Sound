@@ -1,3 +1,0 @@
-# 仅用于 .venv-separator；项目主环境 .venv 保持 mlx==0.32.2 / mlx-audio==0.5.1 不变
-mlx==0.32.3
-demucs-mlx==1.6.1

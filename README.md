@@ -1,26 +1,28 @@
-# BreezeTTS2 Mac Streaming
+# Breeze-TTS-2 · Ubuntu CUDA 训练
 
-面向 Apple Silicon 的本地语音项目：用 Breeze-TTS-2 做流式语音合成，并提供网页聊天与跨机声音训练工作台。
+`ubuntu` 分支运行 CUDA LoRA 训练。Mac 工作台、素材审核、试听、发布和聊天在 [`main` 分支](https://github.com/zchengyu854/Sound/tree/main)。
 
-- `breezetts2_mac_fast.py`：重写 Breeze-TTS-2 流式生成循环，减少重复计算并输出 RTF / underflow 诊断。
-- `voice_app.py` + `web/`：FastAPI + 原生网页 + SQLite 的本地语音聊天，支持参考声音、独立会话和 AI 文字回复。
-- `training_service.py` + `training_web/`：Mac 工作台，负责素材审核、任务包导出、结果导入、A/B 试听与发布。
-- `ubuntu_training.py`：Ubuntu CUDA LoRA 训练，读取冻结任务 ZIP 并生成结果 ZIP。
+## 运行
 
-## 快速开始
+在 Ubuntu 安装支持 CUDA 13 的 NVIDIA 驱动和 `uv`。从 Mac 的 `/training/` 下载冻结任务 ZIP，把它传到 Ubuntu 后执行：
 
-```bash
-uv venv --python 3.12 .venv
-uv pip install --python .venv/bin/python -r requirements-web.txt
-.venv/bin/python voice_app.py
+```sh
+uv run --python 3.12 --with-requirements requirements-ubuntu.txt \
+  python ubuntu_training.py /path/to/task.zip /path/to/result.zip
 ```
 
-打开 <http://127.0.0.1:8000/>。
+使用已缓存的同一基座时可追加 `--base-dir /path/to/base`。终端显示步数、损失和 MLX 峰值显存。用同一个任务 ZIP 和输出目录再次运行会恢复最近一次完整检查点。不同任务使用不同的结果文件名。
 
-命令行直接生成语音：
+训练结束后，把结果 ZIP 传回 Mac，在原任务中选择「导入 Ubuntu 结果包」。Mac 校验快照、配置和基座权重，再生成 A/B 试听。取消远端训练使用 Ubuntu 终端的 Ctrl+C。
 
-```bash
-uv run --python 3.12 breezetts2_mac_fast.py
+## 验证
+
+```sh
+uv run --python 3.12 --with-requirements requirements-ubuntu.txt python -m unittest -v
 ```
 
-Mac 的素材预处理需要 `ffmpeg` 和 `ffprobe`。跨机操作步骤见 [Ubuntu CUDA 训练命令](WEB_APP.md#ubuntu-cuda-训练命令)。
+RTX 5060 8 GB 的跨机验收从短片段、rank 4、1 步开始。Mac 的 `test_training_hardware.py` 可用两台机器验证实际导出、训练、导入、试听、发布和聊天合成。
+
+## 分支协作
+
+`training_exchange.py` 和 `breeze_training.py` 是两边的共享代码。先在两个分支同步协议、摘要算法和 adapter 布局的对应变更，再跑跨机验收。平台专属代码在各自分支提交。
