@@ -5,7 +5,7 @@
 - `breezetts2_mac_fast.py`：重写 Breeze-TTS-2 流式生成循环，减少重复计算并输出 RTF / underflow 诊断。
 - `voice_app.py` + `web/`：FastAPI + 原生网页 + SQLite 的本地语音聊天，支持参考声音、独立会话和 AI 文字回复。
 - `training_service.py` + `training_web/`：Mac 工作台，负责素材审核、任务包导出、结果导入、A/B 试听与发布。
-- `ubuntu_training.py`：Ubuntu CUDA LoRA 训练，读取冻结任务 ZIP 并生成结果 ZIP。
+- [`ubuntu` 分支](https://github.com/zchengyu854/Sound/tree/ubuntu) 负责 CUDA LoRA 训练，读取冻结任务 ZIP 并生成结果 ZIP。
 
 ## 快速开始
 

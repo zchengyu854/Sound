@@ -293,17 +293,6 @@ Apple M1 Pro / 16 GiB、`mlx==0.32.2`、`mlx-audio==0.5.1`、本地缓存的4bit
 
 服务级另用4秒独立MP3验收：上传、处理、审核、首步检查点后取消、显式恢复至第2步、合成验证、发布声音、adapter与基座切换均通过；约36.56秒、MLX峰值分配约5.75 GiB。此服务级测试以确定性替身代替Whisper，不验证真实识别准确度。峰值是MLX分配量，不是整个系统或进程RSS，也不代表长片段/长文本训练上限；初次训练建议短片段、rank4、累积1，从少量步数验证。
 
-```sh
-.venv/bin/python -m unittest -q test_voice_app test_characters test_audio_runtime \
-  test_breeze_training test_media_processing test_training_store test_training_service test_training_hardware
-.venv/bin/python -m py_compile voice_app.py breeze_training.py media_processing.py training_store.py training_service.py
-git diff --check
-# opt-in：真实模型、独立临时目录，默认回归跳过；不启动正式服务。
-RUN_BREEZE_TRAINING_HARDWARE=1 HF_HUB_OFFLINE=1 .venv/bin/python -m unittest -v test_training_hardware
-# 仅最小训练验证：输入0.1–3秒24kHz单声道PCM16 WAV。
-.venv/bin/python breeze_training.py --audio /你的独立素材.wav --text '对应原文' --output web-test-artifacts/my-training-probe
-```
-
 原始最小验证在 `web-test-artifacts/training-probe/report.json`，服务级结果在 `web-test-artifacts/training-service-hardware.json`，均被Git忽略。没有前端改动，未增加UI测试。真实目标说话者的音色相似度、长数据集训练速度与不同参数内存占用仍需实际素材验收；有效WAV与有限损失本身不能证明音色训练效果。
 
 最终加固后复测：服务级4秒MP3链路增加了已发布声音在现有聊天接口中的真实合成验证，取消/恢复、基座原始字节摘要校验、adapter哈希校验、发布、聊天音频获取与切回基座全部通过。该次约30.79秒，MLX峰值分配6,172,736,168字节（约5.75 GiB）；LLM回复与Whisper为测试替身，Breeze/codec/训练/adapter/聊天合成为真实执行。最终常规回归100项中99项通过、1项硬件测试默认跳过；该硬件测试已单独显式运行通过。语法与 `git diff --check` 通过。
@@ -324,14 +313,21 @@ RUN_BREEZE_TRAINING_HARDWARE=1 HF_HUB_OFFLINE=1 .venv/bin/python -m unittest -v 
 
 ### Ubuntu CUDA 训练命令
 
-把 `ubuntu_training.py`、`training_exchange.py`、`breeze_training.py` 与任务包放在 Ubuntu 的同一目录。已配置支持 CUDA 13 的 NVIDIA 驱动及 `uv` 后执行：
+在 Ubuntu 检出 [`ubuntu` 分支](https://github.com/zchengyu854/Sound/tree/ubuntu)，并按该分支的 README 配置 CUDA 环境。在训练仓库中运行：
 
 ```sh
-uv run --python 3.12 --with 'mlx[cuda13]==0.32.2' --with mlx-audio==0.5.1 \
-  --with pydantic python ubuntu_training.py task.zip result.zip
+uv run --python 3.12 --with-requirements requirements-ubuntu.txt \
+  python ubuntu_training.py /path/to/task.zip /path/to/result.zip
 ```
 
-把 `task.zip` 换成工作台下载的 ZIP 文件名。已有相同基座缓存时可加 `--base-dir /path/to/base`。结果包旁的任务工作目录保留训练检查点，可重新运行命令恢复。不同训练任务使用不同的输出文件名，避免覆盖已完成结果包。8 GB 显存可先用短片段、rank 4、1 步检查链路。
+已有相同基座缓存时可加 `--base-dir /path/to/base`。8 GB 显存可先用短片段、rank 4、1 步检查链路。
+
+跨机硬件验收在 Mac 上运行。`BREEZE_TRAINING_WORKER` 指向本地检出的 `ubuntu` 工作树，测试会把该分支的训练代码和合成语音任务包发给 Ubuntu：
+
+```sh
+BREEZE_TRAINING_WORKER=../breeze-ubuntu BREEZE_TRAINING_SSH=user@ubuntu HF_HUB_OFFLINE=1 \
+  .venv/bin/python -m unittest -v test_training_hardware
+```
 
 使用生成的系统语音实测通过 Mac 导出、RTX 5060 单步训练、Mac A/B 合成、确认发布和聊天合成。运行环境与结果记录在忽略目录的 `web-test-artifacts/training-exchange-hardware.json`。真实转写准确度、长片段显存上限和音色相似度需要单独验收。
 

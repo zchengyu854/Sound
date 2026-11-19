@@ -1,6 +1,7 @@
 """Opt-in Mac → Ubuntu → Mac Breeze integration with generated system speech.
 
-BREEZE_TRAINING_SSH=user@ubuntu HF_HUB_OFFLINE=1 .venv/bin/python -m unittest -v test_training_hardware
+BREEZE_TRAINING_WORKER=../breeze-ubuntu BREEZE_TRAINING_SSH=user@ubuntu HF_HUB_OFFLINE=1 \
+  .venv/bin/python -m unittest -v test_training_hardware
 Whisper is replaced with a deterministic transcript; transcription quality is not measured.
 """
 import json
@@ -21,6 +22,11 @@ from voice_app import Breeze, create_app
 class HardwareTrainingTests(unittest.TestCase):
     def test_export_train_import_publish_and_restore(self):
         import mlx.core as mx
+        worker = Path(os.environ.get("BREEZE_TRAINING_WORKER", "../breeze-ubuntu")).resolve()
+        files = [worker / name for name in ("ubuntu_training.py", "training_exchange.py",
+                                           "breeze_training.py", "requirements-ubuntu.txt")]
+        self.assertTrue(all(path.is_file() for path in files),
+                        f"Set BREEZE_TRAINING_WORKER to an ubuntu branch checkout: {worker}")
         started = time.perf_counter()
         artifacts = Path(__file__).resolve().parent / "web-test-artifacts"
         artifacts.mkdir(exist_ok=True)
@@ -72,11 +78,10 @@ class HardwareTrainingTests(unittest.TestCase):
                 scp = ["scp", "-C", *connection]
                 remote = subprocess.check_output(ssh + ["mktemp -d"], text=True, timeout=45).strip()
                 try:
-                    files = ["ubuntu_training.py", "training_exchange.py", "breeze_training.py"]
-                    subprocess.run(scp + files + [str(root / "task.zip"), f"{host}:{remote}/"], check=True, timeout=120)
+                    subprocess.run(scp + [str(path) for path in files] + [str(root / "task.zip"), f"{host}:{remote}/"], check=True, timeout=120)
                     base = os.getenv("BREEZE_TRAINING_REMOTE_BASE")
                     command = ("cd " + shlex.quote(remote) + " && ~/.local/bin/uv run --python 3.12 "
-                               "--with 'mlx[cuda13]==0.32.2' --with mlx-audio==0.5.1 --with pydantic "
+                               "--with-requirements requirements-ubuntu.txt "
                                "python ubuntu_training.py task.zip result.zip")
                     if base:
                         command += " --base-dir " + shlex.quote(base)
