@@ -7,12 +7,44 @@ import math
 import os
 from pathlib import Path
 import tempfile
+import time
+from datetime import datetime, timezone
 from uuid import UUID
 import wave
 from zipfile import ZipFile, ZIP_STORED
 
 from training_exchange import (MAX_CLIP, MAX_MANIFEST, PACKAGE_VERSION, RECIPE_VERSION,
                                TrainingConfig, canonical, deterministic_order, read_member, sha256)
+
+
+def utc_now():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds").replace("+00:00", "Z")
+
+
+def write_progress(path, data):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(canonical(data), encoding="utf-8")
+    temporary.replace(path)
+
+
+def append_log(path, message):
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(f"{message}\n")
+
+
+def fail_progress(path, task_name, output_name, message, status="failed"):
+    data = {}
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(value, dict):
+            data = value
+    except (OSError, ValueError):
+        pass
+    data.update({"status": status, "task": task_name, "output": output_name,
+                 "error": message, "updated_at": utc_now()})
+    write_progress(path, data)
 
 
 def save_checkpoint(work, model, optimizer, step, metadata):
@@ -31,7 +63,7 @@ def save_checkpoint(work, model, optimizer, step, metadata):
         directory.replace(work / f"checkpoint-{step:04d}")
 
 
-def train(identity, snapshot, audio_by_id, work, base_dir):
+def train(identity, snapshot, audio_by_id, work, base_dir, progress_path, log_path, task_name, output_name):
     import mlx.core as mx
     import mlx.nn as nn
     import mlx.optimizers as optim
@@ -44,6 +76,8 @@ def train(identity, snapshot, audio_by_id, work, base_dir):
     mx.set_default_device(mx.gpu)
     mx.set_cache_limit(256 * 1024**2)
     config = identity["config"]
+    started_at = utc_now()
+    session_started = time.monotonic()
     checkpoint = max(work.glob("checkpoint-[0-9][0-9][0-9][0-9]"), default=None)
     model = load_model(base_dir or identity["base_model"])
     # Seed before LoRA initialization: the adapter matrices are part of
@@ -68,6 +102,7 @@ def train(identity, snapshot, audio_by_id, work, base_dir):
         step = metadata["step"]
         sampling = metadata["sampling"]
         initial_adapter = metadata["initial_adapter_digest"]
+    session_start_step = step
     examples = snapshot["segments"]
     training = [examples[i] for i in snapshot["train_indices"]]
     cache = work / f"tokens-{base_digest}"
@@ -114,6 +149,31 @@ def train(identity, snapshot, audio_by_id, work, base_dir):
     step_log = metadata["step_log"] if checkpoint else []
     validation_trend = metadata["validation_trend"] if checkpoint else []
 
+    def emit(message):
+        print(message, flush=True)
+        append_log(log_path, message)
+
+    def report(status="running", **extra):
+        done = step - session_start_step
+        elapsed = time.monotonic() - session_started
+        eta = round(elapsed / done * (config["steps"] - step), 1) if status == "running" and done > 0 else None
+        data = {
+            "status": status,
+            "task": task_name,
+            "output": output_name,
+            "started_at": started_at,
+            "updated_at": utc_now(),
+            "step": step,
+            "total_steps": config["steps"],
+            "epoch": order["epoch"],
+            "elapsed_seconds": round(elapsed, 1),
+            "eta_seconds": eta,
+            "step_log": step_log,
+            "validation_trend": validation_trend,
+        }
+        data.update(extra)
+        write_progress(progress_path, data)
+
     def validation_losses():
         values = []
         for segment in validation_segments:
@@ -135,6 +195,8 @@ def train(identity, snapshot, audio_by_id, work, base_dir):
         return entry
 
     gradient_fn = nn.value_and_grad(model, teacher_forcing_loss)
+    emit(f"训练开始: {task_name} -> {output_name}")
+    report()
     while step < config["steps"]:
         accumulated = None
         micro_losses = []
@@ -162,7 +224,6 @@ def train(identity, snapshot, audio_by_id, work, base_dir):
                          "gradient_norm": round(gradient_norm, 6),
                          "learning_rate": config["learning_rate"],
                          "epoch": order["epoch"]})
-        print(f"{step}/{config['steps']}  loss={step_log[-1]['loss']:.6f}  peak={mx.get_peak_memory() / 1024**3:.2f} GiB", flush=True)
         if step % config["checkpoint_every"] == 0 or step == config["steps"]:
             record_trend(step)
             save_checkpoint(work, model, optimizer, step, {
@@ -170,6 +231,10 @@ def train(identity, snapshot, audio_by_id, work, base_dir):
                 "sampling": {key: order[key] for key in ("epoch", "position")},
                 "step_log": step_log, "validation_trend": validation_trend,
                 "initial_adapter_digest": initial_adapter})
+        peak = mx.get_peak_memory() / 1024**3
+        emit(f"{step}/{config['steps']}  loss={step_log[-1]['loss']:.6f}  peak={peak:.2f} GiB")
+        report(loss=step_log[-1]["loss"], gradient_norm=step_log[-1]["gradient_norm"],
+               learning_rate=config["learning_rate"], peak_memory_gib=round(peak, 2))
     if frozen_digest(model) != base_digest:
         raise ValueError("base_weights_changed")
     validation_losses_final = validation_trend[-1]["losses"] if validation_trend else []
@@ -183,10 +248,19 @@ def train(identity, snapshot, audio_by_id, work, base_dir):
               "initial_adapter_digest": initial_adapter,
               "sampling": {key: order[key] for key in ("epoch", "position")},
               "best_checkpoint": ({"step": best["step"], "validation_loss": best["mean"]} if best else None)}
+    last = step_log[-1] if step_log else {}
+    report("completed", loss=last.get("loss"), gradient_norm=last.get("gradient_norm"),
+           learning_rate=config["learning_rate"],
+           best_checkpoint=result["best_checkpoint"], validation_losses=validation_losses_final,
+           final_checkpoint_step=step, adapter_sha256=result["adapter_sha256"])
+    emit(f"训练完成: {step} 步")
     return result, adapter
 
 
 def run(task, output, base_dir):
+    output.parent.mkdir(parents=True, exist_ok=True)
+    progress_path = output.parent / "progress.json"
+    log_path = output.parent / "training.log"
     with ZipFile(task) as package:
         manifest = json.loads(read_member(package, "task.json", MAX_MANIFEST))
         identity, snapshot = manifest["identity"], manifest["snapshot"]
@@ -213,15 +287,29 @@ def run(task, output, base_dir):
             audio_by_id(segment)
         work = output.parent / (".breeze-" + sha256(canonical(identity).encode()))
         work.mkdir(mode=0o700, exist_ok=True)
+        write_progress(progress_path, {"status": "running", "task": task.name, "output": output.name,
+                                       "started_at": utc_now(), "updated_at": utc_now(), "step": 0,
+                                       "total_steps": identity["config"]["steps"],
+                                       "step_log": [], "validation_trend": []})
         with (work / "lock").open("a") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
-            result, adapter = train(identity, snapshot, audio_by_id, work, base_dir)
-            with tempfile.TemporaryDirectory(dir=output.parent) as temporary:
-                target = Path(temporary) / "result.zip"
-                with ZipFile(target, "w", ZIP_STORED) as archive:
-                    archive.writestr("result.json", canonical(result))
-                    archive.writestr("adapter.safetensors", adapter)
-                os.replace(target, output)
+            try:
+                result, adapter = train(identity, snapshot, audio_by_id, work, base_dir,
+                                        progress_path, log_path, task.name, output.name)
+                with tempfile.TemporaryDirectory(dir=output.parent) as temporary:
+                    target = Path(temporary) / "result.zip"
+                    with ZipFile(target, "w", ZIP_STORED) as archive:
+                        archive.writestr("result.json", canonical(result))
+                        archive.writestr("adapter.safetensors", adapter)
+                    os.replace(target, output)
+            except KeyboardInterrupt:
+                fail_progress(progress_path, task.name, output.name, "训练被中断。", "interrupted")
+                append_log(log_path, "训练被中断。")
+                raise
+            except Exception as exc:
+                fail_progress(progress_path, task.name, output.name, str(exc))
+                append_log(log_path, f"训练失败: {exc}")
+                raise
 
 
 def main():

@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#090b0e">
+  <meta name="description" content="Ubuntu CUDA 训练监控：查看训练损失、验证损失、梯度范数、日志和结果包。">
+  <title>声线研习室 · Ubuntu 训练监控</title>
+  <link rel="stylesheet" href="style.css">
+  <script src="app.js" defer></script>
+</head>
+<body>
+  <header class="masthead">
+    <div class="identity">
+      <span class="mark" aria-hidden="true">声</span>
+      <div><h1>声线研习室</h1><p>Ubuntu CUDA 训练 · 实时监控</p></div>
+    </div>
+    <div class="connection" role="status" aria-live="polite">
+      <span class="dot" id="connection-dot" aria-hidden="true"></span>
+      <span id="connection-text">正在连接训练服务…</span>
+    </div>
+  </header>
+
+  <div class="layout">
+    <aside class="library" aria-label="训练任务">
+      <div class="section-heading">
+        <h2>训练任务</h2>
+        <button id="refresh" class="quiet small" type="button">刷新</button>
+      </div>
+      <p id="runs-count" class="muted">正在读取任务…</p>
+      <nav id="runs" class="run-list" aria-label="训练任务列表"></nav>
+      <div class="local-note">
+        <span class="dot" aria-hidden="true"></span>
+        <p>页面只读取 <code>training-runs/</code>。训练由 Ubuntu 终端启动；远端访问请用 SSH 端口转发。</p>
+      </div>
+    </aside>
+
+    <main>
+      <section id="empty" class="empty" hidden>
+        <p class="eyebrow">UBUNTU TRAINING</p>
+        <h2>还没有可显示的训练</h2>
+        <p>把 Mac 导出的 <code>task.zip</code> 放进一个任务目录，再用 CLI 启动训练。页面会自动出现进度，不需要刷新。</p>
+        <pre id="empty-command"></pre>
+        <p class="footnote">每个任务使用独立目录；同一个目录重复训练会恢复最近一次完整检查点。</p>
+      </section>
+
+      <section id="workspace" hidden>
+        <div class="run-heading">
+          <div>
+            <p class="eyebrow">CURRENT RUN</p>
+            <h2 id="run-title">—</h2>
+            <p id="run-subtitle" class="muted"></p>
+          </div>
+          <div class="run-actions">
+            <a id="download-result" class="button" hidden>下载 result.zip</a>
+          </div>
+        </div>
+
+        <div class="status-line">
+          <span id="status-tag" class="tag">等待训练</span>
+          <div class="progress-wrap">
+            <progress id="run-progress" max="1" value="0" aria-label="训练进度"></progress>
+            <span id="step-text" class="muted"></span>
+          </div>
+        </div>
+
+        <div class="stat-grid">
+          <div class="stat"><span>当前损失</span><strong id="stat-loss">—</strong></div>
+          <div class="stat"><span>验证损失</span><strong id="stat-validation">—</strong></div>
+          <div class="stat"><span>梯度范数</span><strong id="stat-gradient">—</strong></div>
+          <div class="stat"><span>学习率</span><strong id="stat-lr">—</strong></div>
+          <div class="stat"><span>轮次</span><strong id="stat-epoch">—</strong></div>
+          <div class="stat"><span>已用时间</span><strong id="stat-elapsed">—</strong></div>
+          <div class="stat"><span>预计剩余</span><strong id="stat-eta">—</strong></div>
+          <div class="stat"><span>峰值显存</span><strong id="stat-memory">—</strong></div>
+        </div>
+
+        <div class="charts">
+          <section class="card" aria-labelledby="loss-title">
+            <div class="card-heading">
+              <h3 id="loss-title">训练损失</h3>
+              <span class="legend"><i class="loss-key"></i>step loss <i class="validation-key"></i>validation mean</span>
+            </div>
+            <svg id="loss-chart" class="chart" viewBox="0 0 640 220" role="img" aria-label="训练损失曲线"></svg>
+          </section>
+          <section class="card" aria-labelledby="gradient-title">
+            <div class="card-heading">
+              <h3 id="gradient-title">梯度范数</h3>
+              <span class="muted">越低越稳定</span>
+            </div>
+            <svg id="gradient-chart" class="chart" viewBox="0 0 640 220" role="img" aria-label="梯度范数曲线"></svg>
+          </section>
+        </div>
+
+        <section class="card" aria-labelledby="validation-title">
+          <div class="card-heading">
+            <h3 id="validation-title">留出验证</h3>
+            <span id="validation-note" class="muted"></span>
+          </div>
+          <div id="validation-table" class="validation-table"></div>
+        </section>
+
+        <section class="card" aria-labelledby="log-title">
+          <div class="card-heading">
+            <h3 id="log-title">训练日志</h3>
+            <span class="muted">最后 200 KB</span>
+          </div>
+          <pre id="log" class="log" tabindex="0" aria-label="训练日志"></pre>
+        </section>
+
+        <p id="result-note" class="footnote"></p>
+      </section>
+    </main>
+  </div>
+</body>
+</html>

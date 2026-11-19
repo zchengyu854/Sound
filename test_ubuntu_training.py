@@ -39,3 +39,23 @@ class UbuntuTrainingTests(unittest.TestCase):
         self.assertEqual(deterministic_order(5, 7, 1), first)
         self.assertNotEqual(deterministic_order(5, 7, 2), first)
         self.assertNotEqual(deterministic_order(5, 8, 1), first)
+
+    def test_progress_file_is_atomic_json(self):
+        from ubuntu_training import write_progress
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "progress.json"
+            write_progress(path, {"status": "running", "step": 3, "loss": 1.25})
+            self.assertEqual(json.loads(path.read_text(encoding="utf-8")),
+                             {"status": "running", "step": 3, "loss": 1.25})
+            self.assertFalse(path.with_suffix(".json.tmp").exists())
+
+    def test_failure_progress_keeps_existing_step_log(self):
+        from ubuntu_training import fail_progress, write_progress
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "progress.json"
+            write_progress(path, {"status": "running", "step": 3, "step_log": [{"step": 1, "loss": 2.0}]})
+            fail_progress(path, "task.zip", "result.zip", "CUDA out of memory")
+            data = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(data["status"], "failed")
+            self.assertEqual(data["error"], "CUDA out of memory")
+            self.assertEqual(data["step_log"], [{"step": 1, "loss": 2.0}])

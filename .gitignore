@@ -3,6 +3,7 @@ __pycache__/
 *.pyc
 .env
 .breeze-*/
+training-runs/
 data/
 web-test-artifacts/
 *.zip
