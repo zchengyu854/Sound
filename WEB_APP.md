@@ -192,7 +192,9 @@ uv run --python 3.12 --with-requirements requirements-ubuntu.txt \
 
 控制台上传 multipart 字段 `task` 指向的冻结任务 ZIP，完成后从对应任务下载结果 ZIP。`TRAINING_WEB_HOST`、`TRAINING_WEB_PORT`、`TRAINING_DATA_DIR`、`BREEZE_BASE_DIR` 和 `TRAINING_MAX_UPLOAD_BYTES` 用于配置监听、任务数据、基座缓存和上传上限。
 
-当前拆分先建立运行边界。Mac 的任务导出、Ubuntu 结果导回 Mac，以及导入后的 A/B 与发布界面尚未重新接入主页面，不能把“Ubuntu 已完成训练”表述为“Mac 已可试听或发布”。跨机传递时必须保持同一任务快照、配置和基座摘要，不能跨任务比较指标，也不能把任务内 base→trained 差值当成历史趋势。
+Mac 不提交或控制 Ubuntu 训练任务。Ubuntu 完成训练后，用户下载仅含 `result.json` 和 `adapter.safetensors` 的 `result.zip`，在 Mac 主页面选择已有参考声音并导入。Mac 会校验包结构、配方版本、基座型号、adapter 摘要和本地基座权重摘要，随后复制参考 WAV 与原文，创建独立声音并加载 adapter。原声音不被改写，导入后的声音可直接建立会话并用于语音合成。
+
+当前没有跨机任务调度、远端训练控制和 A/B 工作台，也不需要这些能力来完成“Ubuntu 训练、Mac 使用产物”。现有旧训练声音仍按原 `model_id` 兼容加载。导入只证明训练产物已通过格式校验并能被本机模型加载，不代替主观音色验收。
 
 ## 带背景音乐素材：本地人声抽离（可选预处理）
 
@@ -239,7 +241,7 @@ uv pip install --python .venv-separator/bin/python -r requirements-separator.txt
 - 训练效果、未训练文本试听与真人音色相似度在 Ubuntu 训练侧验收，不由有效 WAV、有限 loss 或 Mac 页面自动化测试代替。真实麦克风多轮对话、端到端首音、缓冲耗尽与停顿仍是 Mac 人工验收项。
 - 性能记录要求：固定声音与配置，冷启动与预热后分开；短、中两档中文回复，每档预热后至少 5 次，报告原始值/中位数/最大值/样本量；端到端首音以浏览器实测为准，不用服务端首 PCM 代替。预热后 RTF < 1（争取约 20% 余量）是持续播放目标，非未测承诺；若训练后声音持续 RTF ≥ 1，保留自动接话与完整生成播放并如实记录，不靠加大缓冲冒充实时输出。
 
-验证：`test_realtime_runtime.py`（断句/队列/轮次）、`test_realtime_ui.cjs`（自动发送、幂等、SSE 早播、旧轮次隔离、结束回收、打断中止、播放中开口打断、URL 声音服务端校验）、`test_voice_app.py` 与 `test_training_service.py`（分句合成、interrupted 终态、标准取消兼容、幂等模式校验、合成失败分类、训练产物校验和单声音校验）以及现有 Node 回归。
+验证：`test_realtime_runtime.py`（断句/队列/轮次）、`test_realtime_ui.cjs`（自动发送、幂等、SSE 早播、旧轮次隔离、结束回收、打断中止、播放中开口打断、URL 声音服务端校验）、`test_voice_adapters.py`（Ubuntu 产物校验、导入回滚、原声音隔离、导入声音实际合成）、`test_voice_app.py` 与 `test_training_service.py`（分句合成、interrupted 终态、标准取消兼容、幂等模式校验、合成失败分类、训练产物校验和单声音校验）以及现有 Node 回归。
 
 人工验收步骤、记录表与判定标准见 **`MANUAL_TESTS.md`**；自动化覆盖范围也在其中列出，避免重复劳动。
 
@@ -293,13 +295,14 @@ uv pip install --python .venv-separator/bin/python -r requirements-separator.txt
 推进条件：实时性在中位意义上已达标，继续调参收益耗尽。若要让短句与首个请求也稳定 < 1，只能降低固定开销（更小模型或更高算力），而不是继续加缓冲。任何改动都要在同等条件下重测并保留 `benchmark.json`。产物：`web-test-artifacts/chunk-2|4|8/`、`chunk-4-r5/`、`final-adapter/`、`final-compiled/`、`final-native/`；更早一次的对照记录在 `bench-cached|bench-compiled|bench-native/`。
 
 ```sh
-.venv/bin/python -m unittest -v test_main_page test_voice_app test_characters test_audio_runtime \
+.venv/bin/python -m unittest -v test_main_page test_voice_app test_voice_adapters test_characters test_audio_runtime \
   test_breeze_training test_media_processing test_training_store test_training_service \
   test_separate_vocals test_realtime_runtime test_benchmark_voice test_voice_metrics
 node --check web/app.js && node --check web/vad.js && node --check web/realtime-worklet.js \
   && node --check realtime_web/app.js
 node test_audio_ui.cjs && node test_reply_ui.cjs && node test_vad.cjs && node test_realtime_ui.cjs
-.venv/bin/python -m py_compile voice_app.py breezetts2_mac_fast.py breeze_training.py \
-  media_processing.py training_store.py training_service.py realtime_runtime.py separate_vocals.py
+.venv/bin/python -m py_compile voice_app.py voice_adapters.py breezetts2_mac_fast.py \
+  breeze_training.py media_processing.py training_store.py training_service.py \
+  realtime_runtime.py separate_vocals.py
 git diff --check
 ```

@@ -103,6 +103,203 @@ svg { display: block; }
 }
 #bg-grid-path { stroke: var(--grid); }
 
+/* Boot sequence */
+.boot {
+  position: fixed;
+  inset: 0;
+  z-index: 100;
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+  background: var(--ink-inverse);
+  color: var(--ink);
+  animation: boot-out 0.45s ease 2.4s both;
+}
+.boot::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: radial-gradient(circle at 50% 44%, rgba(255, 255, 255, 0.045), transparent 56%);
+}
+.boot-grid {
+  position: absolute;
+  inset: 0;
+  background-image:
+    linear-gradient(to right, rgba(154, 164, 178, 0.10) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(154, 164, 178, 0.10) 1px, transparent 1px);
+  background-size: 48px 48px;
+  opacity: 0;
+  animation: boot-grid 0.7s ease 0.05s forwards;
+}
+.boot-scan {
+  position: absolute;
+  right: 0;
+  left: 0;
+  top: 50%;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, rgba(255, 255, 255, 0.7), transparent);
+  opacity: 0;
+  animation: boot-scan 0.9s cubic-bezier(0.4, 0, 0.2, 1) 0.4s both;
+}
+.boot-core {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  width: min(86vw, 34rem);
+  padding: clamp(28px, 4.5vh, 48px) clamp(20px, 4vw, 44px);
+  text-align: center;
+  animation: boot-core-out 0.4s ease 2.25s both;
+}
+.boot-corner {
+  position: absolute;
+  width: 18px;
+  height: 18px;
+  border: 0 solid var(--ink);
+  opacity: 0;
+  animation: boot-corner-in 0.5s ease 0.2s both;
+}
+.boot-corner.tl { top: 0; left: 0; border-top-width: 1px; border-left-width: 1px; }
+.boot-corner.tr { top: 0; right: 0; border-top-width: 1px; border-right-width: 1px; }
+.boot-corner.bl { bottom: 0; left: 0; border-bottom-width: 1px; border-left-width: 1px; }
+.boot-corner.br { right: 0; bottom: 0; border-right-width: 1px; border-bottom-width: 1px; }
+.boot-word {
+  margin: 0 -0.12em 0 0;
+  font-size: clamp(2.3rem, 7vw, 4.6rem);
+  font-weight: 900;
+  letter-spacing: 0.5em;
+  line-height: 1;
+  opacity: 0;
+  transform: scale(0.985);
+  animation: boot-word 0.9s cubic-bezier(0.16, 1, 0.3, 1) 0.1s both;
+}
+.boot-degree {
+  position: relative;
+  top: -0.42em;
+  margin-left: 0.02em;
+  font-size: 0.45em;
+  letter-spacing: 0;
+  color: var(--muted);
+}
+.boot-wave {
+  width: 100%;
+  height: clamp(26px, 4vw, 38px);
+  margin: clamp(16px, 3vh, 28px) 0 clamp(12px, 2vh, 18px);
+  overflow: visible;
+}
+.boot-wave path {
+  fill: none;
+  stroke: var(--ink);
+  stroke-width: 1.5;
+  stroke-dasharray: 430;
+  stroke-dashoffset: 430;
+  opacity: 0.8;
+  animation: boot-wave 1.05s cubic-bezier(0.4, 0, 0.2, 1) 0.6s forwards;
+}
+.boot-sub {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 12px;
+  margin: 0;
+  color: var(--muted);
+  font-size: var(--micro);
+  letter-spacing: 0.18em;
+  text-transform: uppercase;
+  opacity: 0;
+  animation: boot-fade 0.55s ease 0.65s both;
+}
+.boot-sub span + span {
+  padding-left: 12px;
+  border-left: 1px solid var(--line-2);
+  letter-spacing: 0.08em;
+  text-transform: none;
+}
+.boot-foot {
+  position: absolute;
+  right: max(1.25rem, env(safe-area-inset-right));
+  bottom: max(1.1rem, env(safe-area-inset-bottom));
+  left: max(1.25rem, env(safe-area-inset-left));
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  opacity: 0;
+  animation: boot-fade 0.5s ease 0.35s both;
+}
+.boot-state {
+  display: grid;
+  grid-template-columns: 6px auto;
+  align-items: center;
+  column-gap: 8px;
+  height: 14px;
+  color: var(--muted);
+  font-family: var(--display);
+  font-size: 0.62rem;
+  letter-spacing: 0.22em;
+}
+.boot-dot {
+  grid-area: 1 / 1;
+  width: 6px;
+  height: 6px;
+  background: var(--ink);
+  animation: pulse 1.1s ease-in-out infinite;
+}
+.boot-label { grid-area: 1 / 2; }
+.boot-label-b { opacity: 0; animation: boot-ready 0.12s linear 1.88s forwards; }
+.boot-label-a { animation: boot-init-out 0.12s linear 1.88s forwards; }
+.boot-track {
+  position: relative;
+  height: 1px;
+  overflow: hidden;
+  background: var(--line);
+}
+.boot-track span {
+  position: absolute;
+  inset: 0;
+  background: var(--ink);
+  transform: scaleX(0);
+  transform-origin: left;
+  animation: boot-progress 1.55s cubic-bezier(0.65, 0, 0.35, 1) 0.5s forwards;
+}
+@keyframes boot-grid {
+  to { opacity: 0.55; }
+}
+@keyframes boot-scan {
+  0% { opacity: 0; transform: translateY(-18vh); }
+  20%, 80% { opacity: 0.8; }
+  100% { opacity: 0; transform: translateY(18vh); }
+}
+@keyframes boot-corner-in {
+  from { opacity: 0; transform: scale(0.55); }
+  to { opacity: 1; transform: none; }
+}
+@keyframes boot-word {
+  from { opacity: 0; letter-spacing: 0.5em; transform: scale(0.985); }
+  to { opacity: 1; letter-spacing: 0.12em; transform: none; }
+}
+@keyframes boot-wave {
+  to { stroke-dashoffset: 0; }
+}
+@keyframes boot-fade {
+  to { opacity: 1; }
+}
+@keyframes boot-progress {
+  to { transform: scaleX(1); }
+}
+@keyframes boot-init-out {
+  to { opacity: 0; }
+}
+@keyframes boot-ready {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+@keyframes boot-core-out {
+  to { opacity: 0; transform: translateY(-6px); }
+}
+@keyframes boot-out {
+  to { opacity: 0; visibility: hidden; pointer-events: none; }
+}
+
 /* Work panel */
 .app {
   position: fixed;
@@ -818,6 +1015,17 @@ dialog.drawer::backdrop { background: var(--backdrop); backdrop-filter: blur(2px
 .drawer .error { margin: 14px 0 0; padding-left: 8px; border-left: 2px solid var(--ink); }
 .drawer .error:empty { display: none; }
 .wide { width: 100%; margin-top: 24px; }
+.quiet {
+  padding: var(--btn-py) var(--btn-px);
+  background: transparent;
+  border: 1px solid var(--line-2);
+  color: var(--ink);
+  font-size: var(--body);
+  letter-spacing: 0.04em;
+  transition: border-color 0.18s ease;
+}
+.quiet:hover:not(:disabled) { border-color: var(--ink); }
+.quiet:disabled { border-style: dashed; color: var(--muted); }
 .status-row {
   display: flex;
   gap: 16px;
@@ -1002,6 +1210,7 @@ dialog.drawer::backdrop { background: var(--backdrop); backdrop-filter: blur(2px
 
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation: none !important; transition: none !important; }
+  .boot { display: none; }
 }
 
 /* Character and memory panels reuse the existing drawer and line palette. */

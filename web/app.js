@@ -1,4 +1,5 @@
 "use strict";
+setTimeout(() => document.querySelector(".boot")?.remove(), 3100);
 const $ = id => document.getElementById(id);
 const SVG = "http://www.w3.org/2000/svg";
 const ACTIVE = new Set(["queued", "thinking", "replying", "synthesizing"]);
@@ -48,9 +49,9 @@ function toast(message) {
   clearTimeout(toastTimer);
   toastTimer = setTimeout(() => { $("toast").hidden = true; }, 4000);
 }
-async function api(path, options = {}) {
+async function api(path, {timeoutMs = 30000, ...options} = {}) {
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), 30000);
+  const timeout = setTimeout(() => controller.abort(), timeoutMs);
   try {
     const response = await fetch(`/api/${path}`, {...options, signal: controller.signal});
     const data = await response.json();
@@ -643,6 +644,48 @@ $("voice-form").addEventListener("submit", async event => {
   } catch (error) {
     if ($("voice-dialog").open) $("voice-error").textContent = error.message; else toast(error.message);
   } finally { $("save-voice").disabled = false; $("save-voice").textContent = "保存声音"; }
+});
+function openAdapterImport() {
+  if (!state.voices.length) {
+    $("voice-error").textContent = "请先保存一段参考录音，再导入训练产物。";
+    return;
+  }
+  const select = $("adapter-reference");
+  select.replaceChildren();
+  for (const voice of state.voices) select.add(new Option(voice.name, voice.id));
+  $("adapter-error").textContent = "";
+  if ($("voice-dialog").open) $("voice-dialog").close();
+  if (!$("adapter-dialog").open) $("adapter-dialog").showModal();
+}
+$("open-adapter-import").addEventListener("click", openAdapterImport);
+$("adapter-form").addEventListener("submit", async event => {
+  event.preventDefault();
+  const file = $("adapter-file").files[0];
+  if (!file || file.size > 41 * 1024 * 1024) {
+    $("adapter-error").textContent = "请选择不超过 41 MiB 的训练结果 ZIP。";
+    return;
+  }
+  $("import-adapter").disabled = true;
+  $("import-adapter").textContent = "正在校验并加载…";
+  $("adapter-error").textContent = "";
+  try {
+    const voice = await api("voice-adapters", {
+      method: "POST",
+      body: new FormData(event.target),
+      timeoutMs: 120000
+    });
+    await refresh();
+    $("adapter-dialog").close();
+    event.target.reset();
+    if ($("character-dialog").open) fillCharacterVoices(voice.id);
+    else openCharacter(null, voice.id);
+    toast("训练声音已导入并可立即使用。");
+  } catch (error) {
+    $("adapter-error").textContent = error.message;
+  } finally {
+    $("import-adapter").disabled = false;
+    $("import-adapter").textContent = "导入并使用";
+  }
 });
 $("chat-form").addEventListener("submit", async event => {
   event.preventDefault();

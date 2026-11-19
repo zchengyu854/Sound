@@ -15,6 +15,7 @@ from datetime import datetime, timezone
 import os
 from pathlib import Path
 import sqlite3
+import shutil
 import threading
 import tempfile
 from urllib.parse import urlsplit
@@ -29,6 +30,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from character_store import CharacterStore, CharacterInput, MemoryInput
 from audio_runtime import PCMBuffer, Whisper, transcription_audio, MAX_TRANSCRIPTION, TRANSCRIPTION_TIMEOUT
 from starlette.middleware.trustedhost import TrustedHostMiddleware
+from voice_adapters import MAX_ARTIFACT, read_adapter_package
 
 ROOT = Path(__file__).resolve().parent
 MAX_WAV = 10 * 1024 * 1024
@@ -310,6 +312,7 @@ class ChatService:
         self.directory = Path(directory).resolve()
         self.recordings = self.directory / "recordings"
         self.audio = self.directory / "audio"
+        self.adapters = self.directory / "voice_adapters"
         self.db = self.directory / "chat.sqlite3"
         self.engine, self.reply = engine, reply or self.complete
         self.worker = ThreadPoolExecutor(max_workers=1, thread_name_prefix="voice-inference")
@@ -365,12 +368,19 @@ class ChatService:
         self.load_llm_settings()
         self.recordings.mkdir(exist_ok=True, mode=0o700)
         self.audio.mkdir(exist_ok=True, mode=0o700)
+        self.adapters.mkdir(exist_ok=True, mode=0o700)
         with closing(self.connect()) as db, db:
             db.executescript("""
                 PRAGMA journal_mode=WAL;
+                CREATE TABLE IF NOT EXISTS voice_adapters (
+                    id TEXT PRIMARY KEY, source_job_id TEXT NOT NULL, source_attempt INTEGER NOT NULL,
+                    base_model TEXT NOT NULL, config TEXT NOT NULL, base_digest TEXT NOT NULL,
+                    adapter_sha256 TEXT NOT NULL, source_name TEXT NOT NULL,
+                    created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')));
                 CREATE TABLE IF NOT EXISTS voices (
                     id TEXT PRIMARY KEY, name TEXT NOT NULL, transcript TEXT NOT NULL,
-                    duration REAL NOT NULL, created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')));
+                    duration REAL NOT NULL, adapter_id TEXT REFERENCES voice_adapters(id),
+                    created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')));
                 CREATE TABLE IF NOT EXISTS conversations (
                     id TEXT PRIMARY KEY, voice_id TEXT NOT NULL REFERENCES voices(id),
                     title TEXT NOT NULL DEFAULT '新的对话',
@@ -384,6 +394,11 @@ class ChatService:
                     created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')));
                 CREATE INDEX IF NOT EXISTS message_conversation ON messages(conversation_id);
             """)
+            voice_columns = {row[1] for row in db.execute("PRAGMA table_info(voices)")}
+            if "adapter_id" not in voice_columns:
+                with closing(sqlite3.connect(self.directory / f"before-adapters-{uuid4()}.sqlite3")) as backup:
+                    db.backup(backup)
+                db.execute("ALTER TABLE voices ADD COLUMN adapter_id TEXT REFERENCES voice_adapters(id)")
             columns = {row[1] for row in db.execute("PRAGMA table_info(messages)")}
             additions = {"reasoning": "TEXT NOT NULL DEFAULT ''", "request_key": "TEXT", "error_code": "TEXT", "attempt": "INTEGER NOT NULL DEFAULT 0",
                          "started_at": "TEXT", "finished_at": "TEXT", "timings": "TEXT NOT NULL DEFAULT '{}'",
@@ -408,6 +423,8 @@ class ChatService:
         for folder in (self.audio, self.recordings):
             for temp in folder.glob("*.tmp"):
                 temp.unlink()
+        for temp in self.adapters.glob(".tmp-*"):
+            shutil.rmtree(temp, ignore_errors=True)
         self.training.start()
         self.worker.submit(self.load)
 
@@ -709,6 +726,127 @@ class ChatService:
             job = self.training.store.one("training_jobs", control[0])
             if job["kind"] == "train" or self.active_kind in ("training", "training_publish"):
                 raise HTTPException(409, {"message": "正在生成训练试听，请稍候。", "stage": job["stage"]})
+
+    def select_voice_adapter(self, voice):
+        folder = None
+        if voice.get("adapter_id"):
+            identifier(voice["adapter_id"])
+            self.one("voice_adapters", voice["adapter_id"])
+            folder = (self.adapters / voice["adapter_id"]).resolve()
+            if folder.parent != self.adapters.resolve():
+                raise RuntimeError("声音 adapter 路径无效。")
+        elif voice.get("model_id"):
+            self.training.store.one("voice_models", voice["model_id"])
+            folder = (self.directory / "voice_models" / identifier(voice["model_id"])).resolve()
+            if folder.parent != (self.directory / "voice_models").resolve():
+                raise RuntimeError("声音模型路径无效。")
+        if hasattr(self.engine, "select_adapter"):
+            self.engine.select_adapter(folder)
+
+    def import_adapter(self, reference_id, name, filename, data):
+        name = clean_text(name, 60, "名称")
+        expected_model = os.getenv("BREEZE_MODEL", "mlx-community/Breeze-TTS-2-mlx-4bit")
+        try:
+            parsed, adapter = read_adapter_package(data, expected_model)
+        except ValueError as exc:
+            raise HTTPException(422, str(exc)) from None
+        with self.admission:
+            self.check_training_busy()
+            if not self.accepting_tasks:
+                raise HTTPException(503, self.service_error or "应用正在停止，暂不接受新声音。")
+            if self.model_status != "ready":
+                raise HTTPException(503, self.model_error or "模型加载中，请稍候再导入。")
+            if not self.gate.acquire(blocking=False):
+                raise HTTPException(409, "正在生成回复或识别语音，请稍候再导入训练产物。")
+
+            self.active_kind = "import_adapter"
+            adapter_id, voice_id = str(uuid4()), str(uuid4())
+            folder = self.adapters / adapter_id
+            target = self.path(self.recordings, voice_id)
+            temporary = target.with_suffix(".tmp")
+            try:
+                source = self.one("voices", reference_id)
+                source_audio = self.path(self.recordings, reference_id).read_bytes()
+                duration = validate_wav(source_audio)
+                folder.mkdir(mode=0o700)
+                manifest_path = folder / "manifest.json"
+                adapter_path = folder / "adapter.safetensors"
+                manifest_path.write_text(
+                    json.dumps(parsed["manifest"], ensure_ascii=False, sort_keys=True),
+                    encoding="utf-8",
+                )
+                adapter_path.write_bytes(adapter)
+                os.chmod(manifest_path, 0o600)
+                os.chmod(adapter_path, 0o600)
+                if not hasattr(self.engine, "select_adapter"):
+                    raise RuntimeError("当前语音引擎不支持 adapter。")
+                self.worker.submit(self.engine.select_adapter, folder).result()
+
+                temporary.write_bytes(source_audio)
+                temporary.replace(target)
+                created_at = timestamp()
+                with closing(self.connect()) as db, db:
+                    db.execute(
+                        """INSERT INTO voice_adapters(
+                            id, source_job_id, source_attempt, base_model, config,
+                            base_digest, adapter_sha256, source_name, created_at
+                        ) VALUES(?,?,?,?,?,?,?,?,?)""",
+                        (
+                            adapter_id,
+                            parsed["job_id"],
+                            parsed["attempt"],
+                            expected_model,
+                            json.dumps(parsed["config"], ensure_ascii=False, sort_keys=True),
+                            parsed["manifest"]["base_digest"],
+                            parsed["adapter_sha256"],
+                            Path(filename or "result.zip").name[:180],
+                            created_at,
+                        ),
+                    )
+                    db.execute(
+                        """INSERT INTO voices(
+                            id, name, transcript, duration, adapter_id, created_at
+                        ) VALUES(?,?,?,?,?,?)""",
+                        (
+                            voice_id,
+                            name,
+                            source["transcript"],
+                            duration,
+                            adapter_id,
+                            created_at,
+                        ),
+                    )
+            except HTTPException:
+                temporary.unlink(missing_ok=True)
+                target.unlink(missing_ok=True)
+                shutil.rmtree(folder, ignore_errors=True)
+                raise
+            except BaseException as exc:
+                temporary.unlink(missing_ok=True)
+                target.unlink(missing_ok=True)
+                shutil.rmtree(folder, ignore_errors=True)
+                log.warning(json.dumps({
+                    "stage": "adapter_import",
+                    "error_type": type(exc).__name__,
+                    "adapter_id": adapter_id,
+                }))
+                raise HTTPException(
+                    422,
+                    "训练产物无法加载，可能已损坏或与当前基座不兼容。",
+                ) from None
+            finally:
+                self.active_kind = None
+                self.gate.release()
+
+        return {
+            "id": voice_id,
+            "name": name,
+            "transcript": source["transcript"],
+            "duration": duration,
+            "adapter_id": adapter_id,
+            "model_id": None,
+            "created_at": created_at,
+        }
 
     def start_transcription(self, samples, duration):
         with self.admission:
@@ -1031,14 +1169,7 @@ class ChatService:
             self.live_audio = live
             self.update(value, status="synthesizing")
             voice = self.one("voices", voice_id)
-            if voice.get("model_id"):
-                self.training.store.one("voice_models", voice["model_id"])
-                folder = (self.directory / "voice_models" / identifier(voice["model_id"])).resolve()
-                if folder.parent != (self.directory / "voice_models").resolve():
-                    raise RuntimeError("声音模型路径无效。")
-                self.engine.select_adapter(folder)
-            elif hasattr(self.engine, "select_adapter"):
-                self.engine.select_adapter(None)
+            self.select_voice_adapter(voice)
 
             pcm_chunks = []
             total_duration = 0.0
@@ -1141,14 +1272,7 @@ class ChatService:
             control.check()
             task = self.one("messages", value)
             voice = self.one("voices", voice_id)
-            if voice.get("model_id"):
-                self.training.store.one("voice_models", voice["model_id"])
-                folder = (self.directory / "voice_models" / identifier(voice["model_id"])).resolve()
-                if folder.parent != (self.directory / "voice_models").resolve():
-                    raise RuntimeError("声音模型路径无效。")
-                self.engine.select_adapter(folder)
-            elif hasattr(self.engine, "select_adapter"):
-                self.engine.select_adapter(None)
+            self.select_voice_adapter(voice)
             with control.measure("tts"):
                 def emit_pcm(data):
                     control.check()
@@ -1210,16 +1334,24 @@ class UploadLimit:
         if scope["type"] != "http":
             return await self.app(scope, receive, send)
         total = 0
-        transcription = scope.get("path") == "/api/transcriptions"
-        limit = MAX_TRANSCRIPTION if transcription else MAX_WAV
+        path = scope.get("path")
+        transcription = path == "/api/transcriptions"
+        adapter_import = path == "/api/voice-adapters"
+        limit = MAX_ARTIFACT if adapter_import else MAX_TRANSCRIPTION if transcription else MAX_WAV
 
         async def limited_receive():
             nonlocal total
             message = await receive()
             total += len(message.get("body", b""))
             if total > limit + 65536:
-                raise HTTPException(413, "转写录音不能超过 1 MiB。" if transcription else
-                                    "上传请求过大，录音不能超过 10 MB。")
+                raise HTTPException(
+                    413,
+                    "训练产物不能超过 41 MiB。"
+                    if adapter_import
+                    else "转写录音不能超过 1 MiB。"
+                    if transcription
+                    else "上传请求过大，录音不能超过 10 MB。",
+                )
             return message
 
         await self.app(scope, limited_receive, send)
@@ -1367,6 +1499,28 @@ def create_app(directory=None, engine=None, reply=None, transcriber=None):
             target.unlink(missing_ok=True)
             raise
         return service.one("voices", value)
+
+    @app.post("/api/voice-adapters", status_code=201)
+    async def import_voice_adapter(
+        name: str = Form(max_length=60),
+        reference_voice_id: str = Form(),
+        artifact: UploadFile = File(),
+    ):
+        if not (artifact.filename or "").lower().endswith(".zip"):
+            raise HTTPException(422, "请选择 Ubuntu 导出的训练结果 ZIP。")
+        try:
+            data = await artifact.read(MAX_ARTIFACT + 1)
+        finally:
+            await artifact.close()
+        if len(data) > MAX_ARTIFACT:
+            raise HTTPException(413, "训练产物不能超过 41 MiB。")
+        return await asyncio.to_thread(
+            service.import_adapter,
+            reference_voice_id,
+            name,
+            artifact.filename,
+            data,
+        )
 
     @app.get("/api/conversations")
     def conversations():
