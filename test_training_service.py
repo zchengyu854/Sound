@@ -16,13 +16,14 @@ from uuid import uuid4
 import wave
 from zipfile import ZipFile
 
-from fastapi import HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
 
 from test_voice_app import Engine, Transcriber, wav_bytes
 from audio_runtime import UnreliableTranscript
 from training_service import (TrainingConfig, TrainingService, PreviewInput, Cancelled, canonical,
-                              select_preview_texts, training_summary)
+                              select_preview_texts, training_router, training_summary)
 from voice_app import create_app
 
 
@@ -57,7 +58,23 @@ class TrainingServiceTests(unittest.TestCase):
                               lambda history: ("测试回复。", ""), Transcriber())
         self.chat = self.app.state.service
         self.service = self.chat.training
-        self.client = TestClient(self.app, base_url="http://127.0.0.1")
+        self.chat_client = TestClient(self.app, base_url="http://127.0.0.1")
+        self.chat_client.__enter__()
+        # Production intentionally omits this router; mount it only for service regressions.
+        training_app = FastAPI()
+        training_app.include_router(training_router(self.service))
+
+        @training_app.middleware("http")
+        async def training_origin_guard(request: Request, call_next):
+            origin = request.headers.get("origin")
+            if request.url.path.startswith("/api/") and request.method != "GET" and (
+                request.headers.get("sec-fetch-site") == "cross-site"
+                or (origin and origin != str(request.base_url).rstrip("/"))
+            ):
+                return JSONResponse({"detail": "请从本机应用页面访问。"}, status_code=403)
+            return await call_next(request)
+
+        self.client = TestClient(training_app, base_url="http://127.0.0.1")
         self.client.__enter__()
         self.wait(lambda: self.chat.stt_status == "ready")
         self.model_download = patch("voice_metrics.SpeakerEmbeddingModel.download", side_effect=OSError("offline"))
@@ -66,6 +83,7 @@ class TrainingServiceTests(unittest.TestCase):
 
     def tearDown(self):
         self.client.__exit__(None, None, None)
+        self.chat_client.__exit__(None, None, None)
         self.temp.cleanup()
 
     def wait(self, condition):
@@ -570,7 +588,7 @@ class TrainingServiceTests(unittest.TestCase):
         self.engine.fail_adapter = True
         with self.assertRaises(RuntimeError):
             self.service.publish(job["id"], "失败版本")
-        self.assertEqual(self.client.get("/api/voices").json(), [])
+        self.assertEqual(self.chat_client.get("/api/voices").json(), [])
         self.assertEqual(list((self.chat.directory / "voice_models").iterdir()), [])
         self.assertFalse(self.chat.gate.locked())
         self.engine.fail_adapter = False
@@ -579,7 +597,7 @@ class TrainingServiceTests(unittest.TestCase):
         self.assertEqual(voice["id"], repeated["id"])
         self.assertIsNotNone(voice["model_id"])
         self.assertTrue(all(t == self.engine.threads[0] for t in self.engine.threads))
-        conversation = self.client.post("/api/conversations", json={"voice_id": voice["id"]}).json()
+        conversation = self.chat_client.post("/api/conversations", json={"voice_id": voice["id"]}).json()
         with closing(self.chat.connect()) as db:
             self.assertEqual(db.execute("SELECT voice_id FROM conversations WHERE id=?", (conversation["id"],)).fetchone()[0], voice["id"])
 

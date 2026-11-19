@@ -1211,17 +1211,15 @@ class UploadLimit:
             return await self.app(scope, receive, send)
         total = 0
         transcription = scope.get("path") == "/api/transcriptions"
-        import re
-        training_upload = bool(re.fullmatch(r"/api/training/datasets/[0-9a-f-]{36}/sources", scope.get("path", "")))
-        limit = 200 * 1024**2 if training_upload else MAX_TRANSCRIPTION if transcription else MAX_WAV
+        limit = MAX_TRANSCRIPTION if transcription else MAX_WAV
 
         async def limited_receive():
             nonlocal total
             message = await receive()
             total += len(message.get("body", b""))
             if total > limit + 65536:
-                raise HTTPException(413, "素材上传不能超过 200 MiB。" if training_upload else
-                                    "转写录音不能超过 1 MiB。" if transcription else "上传请求过大，录音不能超过 10 MB。")
+                raise HTTPException(413, "转写录音不能超过 1 MiB。" if transcription else
+                                    "上传请求过大，录音不能超过 10 MB。")
             return message
 
         await self.app(scope, limited_receive, send)
@@ -1240,15 +1238,16 @@ def create_app(directory=None, engine=None, reply=None, transcriber=None):
 
     app = FastAPI(title="声音 · 本地声音聊天", lifespan=lifespan)
     app.state.service = service
-    from training_service import training_router
-    app.include_router(training_router(service.training))
     app.add_middleware(UploadLimit)
     app.add_middleware(TrustedHostMiddleware, allowed_hosts=["127.0.0.1", "localhost", "[::1]"])
 
     @app.middleware("http")
     async def local_requests(request: Request, call_next):
+        path = request.url.path
+        if path in ("/training", "/api/training") or path.startswith(("/training/", "/api/training/")):
+            return JSONResponse({"detail": "Not Found"}, status_code=404)
         origin = request.headers.get("origin")
-        if request.url.path.startswith("/api/") and (
+        if path.startswith("/api/") and (
             request.headers.get("sec-fetch-site") == "cross-site"
             or (origin and origin != str(request.base_url).rstrip("/"))
         ):
@@ -1499,17 +1498,11 @@ def create_app(directory=None, engine=None, reply=None, transcriber=None):
             raise HTTPException(404, "语音尚未生成或文件不存在。")
         return FileResponse(path, media_type="audio/wav", filename=f"{value}.wav" if download else None)
 
-    @app.get("/training", include_in_schema=False)
-    def training_entry():
-        from fastapi.responses import RedirectResponse
-        return RedirectResponse("/training/")
-
     @app.get("/realtime", include_in_schema=False)
     def realtime_entry():
         from fastapi.responses import RedirectResponse
         return RedirectResponse("/realtime/")
 
-    app.mount("/training", StaticFiles(directory=ROOT / "training_web", html=True), name="training-web")
     app.mount("/realtime", StaticFiles(directory=ROOT / "realtime_web", html=True), name="realtime-web")
     app.mount("/", StaticFiles(directory=ROOT / "web", html=True), name="web")
     return app

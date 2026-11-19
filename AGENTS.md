@@ -7,13 +7,14 @@
 - `breezetts2_mac_fast.py`: streaming inference CLI and shared helpers such as `FastDepth`, `pcm_chunks`, and `pcm16_bytes`. Preserve existing CLI behavior when changing shared code.
 - `character_store.py`: character profiles, immutable conversation snapshots, and bounded memory extraction.
 - `media_processing.py`: bounded MP3/MP4/WAV probe, decode to 24 kHz mono PCM16, and silence-aware slicing.
-- `training_store.py`, `training_service.py`: review gates, frozen task ZIP export, result ZIP import, Mac A/B validation, and publishing immutable voice versions.
-- `training_exchange.py` and `breeze_training.py`: shared package format and adapter primitives. Keep these compatible with the `ubuntu` branch, which owns the CUDA worker and checkpoint tests.
+- `training_store.py`, `training_service.py`: Mac-side adapter registry and result validation used by the interaction app. The Mac app does not expose a training page or training HTTP routes.
+- `training_exchange.py` and `breeze_training.py`: shared package format and adapter primitives. Keep these compatible with the `ubuntu` branch, which owns the training console, CUDA worker, and checkpoint tests.
 - `test_training_hardware.py`: opt-in cross-machine validation using the worker checkout selected by `BREEZE_TRAINING_WORKER`.
 - `separate_vocals.py` + `requirements-separator.txt`: standalone vocal separation CLI that runs in its own `.venv-separator` and calls `demucs-mlx`; outputs a review WAV plus an uploadable MP3. Not part of the web service.
 - `benchmark_voice.py`: local TTS benchmark (cold/warm RTF, first-chunk latency, raw values + medians) written to ignored `web-test-artifacts/`. `--depth-mode {cached,compiled,native}` compares decoder modes, `--verify` checks numerical parity. Pure helpers `summarize`/`rtf` are unit-tested; the CLI loads the real engine, so stop the app first to avoid two GPU processes. The app reads `BREEZE_DEPTH_MODE` (default `cached`).
 - `web/`: chat frontend (native HTML/CSS/JS, no build step). `web/vad.js` and `web/realtime-worklet.js` are shared with the realtime page.
-- `training_web/`: standalone training workbench served at `/training/`. `realtime_web/`: standalone realtime voice page served at `/realtime/`.
+- `ubuntu` branch：独立训练控制台、任务队列、CUDA worker 和结果下载。Mac `main` 不包含 `training_web/`。
+- `realtime_web/`: standalone realtime voice page served at `/realtime/`.
 - `test_voice_app.py`: backend regression tests and fake inference/provider implementations. `test_realtime_runtime.py` covers splitting/queue/turn logic; `test_vad.cjs` and `test_realtime_ui.cjs` cover the realtime browser logic with DOM/API doubles.
 - `README.md` describes streaming inference; `WEB_APP.md` covers web configuration, APIs, training/realtime behavior, and the manual acceptance checklist. `MANUAL_TESTS.md` is the human acceptance checklist (audio listening, microphone, barge-in, latency) with recording tables. `fish_s2_mac_stream.py.py` is a separate Fish streaming script.
 - Ignored `data/` holds private recordings, generated audio, SQLite state, and migration backups. Keep verification artifacts in ignored `web-test-artifacts/`.
@@ -28,19 +29,19 @@ uv pip install --python .venv/bin/python -r requirements-web.txt
 .venv/bin/python voice_app.py
 .venv/bin/python -m unittest -v test_voice_app test_characters test_audio_runtime \
   test_breeze_training test_media_processing test_training_store \
-  test_training_service test_training_web test_separate_vocals test_realtime_runtime \
+  test_training_service test_main_page test_separate_vocals test_realtime_runtime \
   test_benchmark_voice test_voice_metrics
-node --check web/app.js && node --check training_web/app.js
+node --check web/app.js
 node --check web/vad.js && node --check web/realtime-worklet.js && node --check realtime_web/app.js
-node test_training_ui.cjs && node test_audio_ui.cjs && node test_reply_ui.cjs
+node test_audio_ui.cjs && node test_reply_ui.cjs
 node test_vad.cjs && node test_realtime_ui.cjs
 .venv/bin/python -m py_compile voice_app.py breezetts2_mac_fast.py realtime_runtime.py \
   media_processing.py training_store.py training_service.py separate_vocals.py \
   benchmark_voice.py voice_metrics.py
 ```
 
-These commands install dependencies, serve localhost port 8000, run the 195 backend
-tests plus five Node suites, and check syntax. No build step is required. Optional
+These commands install dependencies, serve localhost port 8000, run the backend
+tests plus four Node suites, and check syntax. No build step is required. Optional
 vocal separation uses a separate environment (`.venv-separator`, git-ignored) so the
 pinned `mlx==0.32.2` / `mlx-audio==0.5.1` of `.venv` stays untouched:
 

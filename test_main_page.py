@@ -1,4 +1,4 @@
-"""Independent training page routes; no real models or private datasets."""
+"""Mac interaction page boundary; training UI lives on the Ubuntu branch."""
 from html.parser import HTMLParser
 from pathlib import Path
 import re
@@ -30,7 +30,7 @@ class PageParser(HTMLParser):
             self.assets.append(attrs["href"])
 
 
-class TrainingPageTests(unittest.TestCase):
+class MainPageTests(unittest.TestCase):
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.app = create_app(Path(self.temp.name) / "data", Engine(),
@@ -42,26 +42,19 @@ class TrainingPageTests(unittest.TestCase):
         self.client.__exit__(None, None, None)
         self.temp.cleanup()
 
-    def test_training_has_separate_route_and_assets(self):
-        response = self.client.get("/training/")
-        self.assertEqual(response.status_code, 200)
-        self.assertIn("声线研习室", response.text)
-        self.assertIn("text/html", response.headers["content-type"])
-        self.assertEqual(self.client.get("/training").url.path, "/training/")
-        parser = PageParser()
-        parser.feed(response.text)
-        self.assertEqual(len(parser.ids), len(set(parser.ids)))
-        self.assertFalse(parser.inline_scripts)
-        self.assertEqual(set(parser.assets), {"/training/app.js", "/training/style.css"})
-        for asset in parser.assets:
-            result = self.client.get(asset)
-            self.assertEqual(result.status_code, 200, asset)
-            self.assertEqual(result.headers["x-content-type-options"], "nosniff")
-        source = (ROOT / "training_web" / "app.js").read_text()
-        referenced_ids = set(re.findall(r'\$\("([a-z-]+)"\)', source))
-        self.assertFalse(referenced_ids - set(parser.ids))
-        self.assertNotIn(".innerHTML", source)
-        self.assertIn("script-src 'self'", response.headers["content-security-policy"])
+    def test_training_page_and_api_belong_to_ubuntu(self):
+        paths = (
+            "/training",
+            "/training/",
+            "/training/app.js",
+            "/api/training",
+            "/api/training/capabilities",
+            "/api/training/jobs",
+        )
+        for method in ("get", "post", "patch", "delete"):
+            request = getattr(self.client, method)
+            for path in paths:
+                self.assertEqual(request(path).status_code, 404, f"{method.upper()} {path}")
 
     def test_realtime_page_has_separate_route_and_reachable_assets(self):
         response = self.client.get("/realtime/")
@@ -97,13 +90,9 @@ class TrainingPageTests(unittest.TestCase):
         self.assertNotIn("声线研习室", response.text)
         self.assertEqual(self.client.get("/app.js").content, (ROOT / "web" / "app.js").read_bytes())
 
-    def test_page_cannot_expose_training_files_or_bypass_api_origin_guard(self):
-        for path in ("/training/data/chat.sqlite3", "/training/voice_app.py", "/training/%2e%2e/voice_app.py"):
-            self.assertEqual(self.client.get(path).status_code, 404, path)
-        rejected = self.client.post("/api/training/datasets", json={"name": "unauthorized"},
-                                    headers={"Origin": "https://other.example"})
+    def test_main_page_cannot_bypass_api_origin_guard(self):
+        rejected = self.client.post("/api/voices", headers={"Origin": "https://other.example"})
         self.assertEqual(rejected.status_code, 403)
-        self.assertEqual(self.client.get("/api/training/datasets").json(), [])
 
 
 if __name__ == "__main__":
