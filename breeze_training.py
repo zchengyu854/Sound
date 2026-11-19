@@ -1,21 +1,13 @@
-"""Experimental Breeze LoRA feasibility gate; run separately from the web server.
-
-This module deliberately does not publish voices or mark imported audio trained.
-The full training service is gated on the real-model probe succeeding.
-"""
+"""Shared Breeze LoRA math and adapter compatibility helpers."""
 from __future__ import annotations
 
-import argparse
 import hashlib
-import json
 import math
 import os
 from pathlib import Path
-import time
 
 import mlx.core as mx
 import mlx.nn as nn
-import mlx.optimizers as optim
 from mlx.utils import tree_flatten, tree_unflatten
 
 
@@ -149,96 +141,3 @@ def load_adapter(model, source):
         raise ValueError("Adapter 含非有限值。")
     model.load_weights(list(weights.items()), strict=False)
     mx.eval(model.trainable_parameters())
-
-
-def probe(args):
-    """Real model gate. Report each completed stage, even on a native failure."""
-    from mlx_audio.tts.utils import load_model
-    from breezetts2_mac_fast import pcm16_bytes
-    import wave
-
-    output = Path(args.output)
-    output.mkdir(parents=True, exist_ok=True)
-    started = time.perf_counter()
-    report = {"status": "running", "stage": "loading", "model": args.model,
-              "rank": args.rank, "device": mx.device_info(), "steps": 0}
-
-    def record(stage, **fields):
-        report.update(stage=stage, elapsed_seconds=time.perf_counter() - started,
-                      peak_memory_bytes=mx.get_peak_memory(), **fields)
-        (output / "report.json").write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n")
-        print(json.dumps(report, ensure_ascii=False), flush=True)
-
-    # Keep allocations within this machine's recommended Metal working set.
-    mx.set_memory_limit(mx.device_info()["max_recommended_working_set_size"])
-    mx.set_cache_limit(256 * 1024**2)
-    record("loading")
-    try:
-        model = load_model(args.model)
-        targets = attach_lora(model, args.rank)
-        record("encoding", targets=targets)
-        import numpy as np
-        with wave.open(str(args.audio), "rb") as wav:
-            rate = wav.getframerate()
-            if wav.getnchannels() != 1 or wav.getsampwidth() != 2:
-                raise ValueError("验证素材必须为单声道 PCM16 WAV。")
-            audio = np.frombuffer(wav.readframes(wav.getnframes()), dtype="<i2").astype(np.float32) / 32768
-        if rate != model.sample_rate or not 0.1 <= len(audio) / rate <= 3:
-            raise ValueError("验证素材必须为 0.1–3 秒、24 kHz 单声道 WAV。")
-        codes = mx.stop_gradient(model._encode_reference(mx.array(audio)))
-        prompt = mx.stop_gradient(model._prompt_embeddings(
-            args.text, voice=None, instruct=None, ref_audio=None, ref_text=None))
-        mx.eval(codes, prompt)
-        record("checking_tokens", code_shape=list(codes.shape), code_dtype=str(codes.dtype))
-        validate_example(model, prompt, codes)
-        before_base = frozen_digest(model)
-        before_adapter = parameter_digest(model.trainable_parameters())
-        record("training", frames=codes.shape[1], frozen_before=before_base)
-        result = train_step(model, optim.Adam(learning_rate=1e-4), prompt, codes)
-        if frozen_digest(model) != before_base:
-            raise RuntimeError("基座参数发生变化。")
-        trained_digest = parameter_digest(model.trainable_parameters())
-        if trained_digest == before_adapter:
-            raise RuntimeError("Adapter 参数未更新。")
-        save_adapter(model, output / "adapter.safetensors")
-        record("reloading", steps=1, base_unchanged=True, adapter_changed=True, **result)
-        # Reload into a fresh base, rather than merely assigning to the trained model.
-        del model, codes, prompt
-        import gc
-        gc.collect()
-        mx.clear_cache()
-        model = load_model(args.model)
-        attach_lora(model, args.rank)
-        load_adapter(model, output / "adapter.safetensors")
-        if parameter_digest(model.trainable_parameters()) != trained_digest:
-            raise RuntimeError("Adapter 保存加载不一致。")
-        record("synthesizing", adapter_roundtrip=True)
-        chunks = [result.audio for result in model.generate(
-            text=args.text, max_tokens=40, temperature=0.7)]
-        audio = mx.concatenate(chunks)
-        mx.eval(audio)
-        if audio.size == 0 or not bool(mx.all(mx.isfinite(audio)).item()):
-            raise RuntimeError("合成结果无效。")
-        with wave.open(str(output / "probe.wav"), "wb") as wav:
-            wav.setnchannels(1)
-            wav.setsampwidth(2)
-            wav.setframerate(model.sample_rate)
-            wav.writeframes(pcm16_bytes(audio))
-        record("completed", status="passed", audio_samples=audio.size)
-    except Exception as exc:
-        record(report["stage"], status="failed", error_type=type(exc).__name__, error=str(exc))
-        raise
-
-
-def main():
-    parser = argparse.ArgumentParser(description="独立 Breeze LoRA 最小训练可行性验证")
-    parser.add_argument("--model", default="mlx-community/Breeze-TTS-2-mlx-4bit")
-    parser.add_argument("--audio", required=True)
-    parser.add_argument("--text", required=True)
-    parser.add_argument("--rank", type=int, choices=(1, 2, 4, 8), default=4)
-    parser.add_argument("--output", required=True)
-    probe(parser.parse_args())
-
-
-if __name__ == "__main__":
-    main()
