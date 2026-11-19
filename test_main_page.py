@@ -82,13 +82,26 @@ class MainPageTests(unittest.TestCase):
         for path in ("/realtime/data/chat.sqlite3", "/realtime/voice_app.py", "/realtime/%2e%2e/voice_app.py"):
             self.assertEqual(self.client.get(path).status_code, 404, path)
 
-    def test_chat_home_is_unchanged_and_has_no_training_entry(self):
+    def test_chat_home_has_neural_grid_and_no_training_entry(self):
         response = self.client.get("/")
         self.assertEqual(response.status_code, 200)
         self.assertEqual(response.content, (ROOT / "web" / "index.html").read_bytes())
         self.assertNotIn("/training", response.text)
         self.assertNotIn("声线研习室", response.text)
-        self.assertEqual(self.client.get("/app.js").content, (ROOT / "web" / "app.js").read_bytes())
+        parser = PageParser()
+        parser.feed(response.text)
+        self.assertEqual(len(parser.ids), len(set(parser.ids)))
+        self.assertFalse(parser.inline_scripts)
+        self.assertIn("home-greeting", parser.ids)
+        self.assertIn("neural-gradient", parser.ids)
+        self.assertIn("/home.css", parser.assets)
+        for asset in parser.assets:
+            result = self.client.get(asset)
+            self.assertEqual(result.status_code, 200, asset)
+        source = self.client.get("/app.js")
+        self.assertEqual(source.content, (ROOT / "web" / "app.js").read_bytes())
+        referenced_ids = set(re.findall(r'\$\("([a-z-]+)"\)', source.text))
+        self.assertFalse(referenced_ids - set(parser.ids), referenced_ids - set(parser.ids))
 
     def test_main_page_cannot_bypass_api_origin_guard(self):
         rejected = self.client.post("/api/voices", headers={"Origin": "https://other.example"})
