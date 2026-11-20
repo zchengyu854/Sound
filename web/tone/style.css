@@ -1,0 +1,46 @@
+:root {
+  color-scheme: dark;
+  --base: #0a1116;
+  --panel: #131d25;
+  --line: #334651;
+  --ink: #edf3f5;
+  --muted: #a8bac3;
+  --signal: #92e7d8;
+  background: var(--base);
+  color: var(--ink);
+  font: 16px/1.55 system-ui, sans-serif;
+}
+* { box-sizing: border-box; }
+body { margin: 0; }
+header, main { max-width: 1060px; margin: auto; padding-inline: clamp(18px, 4vw, 46px); }
+header { display: flex; justify-content: space-between; gap: 12px; padding-block: 19px; color: var(--muted); font-size: .85rem; }
+a { color: var(--signal); }
+main { padding-block: clamp(18px, 5vw, 58px); }
+h1 { margin: 0; font-size: clamp(2rem, 5vw, 3rem); letter-spacing: .025em; }
+h2 { margin: 0 0 12px; font-size: 1rem; }
+.intro { margin: 6px 0 28px; color: var(--muted); }
+.layout, .comparison { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 18px; }
+form, .layout section, article { padding: clamp(15px, 3vw, 24px); background: var(--panel); border: 1px solid var(--line); }
+label { display: block; margin-bottom: 6px; font-weight: 600; }
+select, textarea, button { font: inherit; }
+select, textarea { display: block; width: 100%; padding: 9px; color: var(--ink); background: var(--base); border: 1px solid var(--line); border-radius: 4px; }
+select { margin-bottom: 16px; }
+textarea { resize: vertical; }
+.hint, #status, h2 span { color: var(--muted); font-size: .84rem; }
+button { border: 0; border-radius: 4px; padding: 9px 15px; background: var(--signal); color: var(--base); font-weight: 700; cursor: pointer; }
+button:disabled { opacity: .55; cursor: default; }
+:focus-visible { outline: 2px solid var(--signal); outline-offset: 3px; }
+#status, .warning { margin: 8px 0 0; }
+#status:empty, .warning:empty { display: none; }
+.warning, #status.error { color: #ffc4a6; }
+ol { margin: 0; padding-left: 26px; }
+li { padding: 8px 0 10px 6px; border-bottom: 1px solid var(--line); overflow-wrap: anywhere; }
+li::marker { color: var(--signal); }
+li span { display: block; color: var(--signal); font-size: .83rem; }
+.comparison { margin-top: 18px; }
+.comparison[hidden] { display: none; }
+h2 span { margin-left: 8px; font-weight: normal; }
+audio { display: block; width: 100%; }
+@media (max-width: 620px) {
+  .layout, .comparison { grid-template-columns: 1fr; }
+}

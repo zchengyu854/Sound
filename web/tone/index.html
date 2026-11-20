@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>语气试听 · 声音</title>
+  <link rel="stylesheet" href="/tone/style.css">
+  <script src="/tone/app.js" defer></script>
+</head>
+<body>
+  <header><a href="/">返回 Home</a><span>声音 / 语气试听</span></header>
+  <main>
+    <h1>语气试听</h1>
+    <p class="intro">用同一个声音读同一段话，听听逐句调整语气前后的差异。</p>
+    <div class="layout">
+      <form id="preview-form">
+        <label for="voice">声音</label>
+        <select id="voice" required disabled><option value="">正在读取声音</option></select>
+        <label for="text">试听文本</label>
+        <textarea id="text" rows="4" maxlength="120" required>我在这里。你准备好了吗？别担心，我们慢慢来。</textarea>
+        <p class="hint">最多 120 字、四句话。选一句问句或安慰句来听变化。</p>
+        <button id="generate" type="submit" disabled>生成对照试听</button>
+        <p id="status" role="status"></p>
+      </form>
+      <section aria-labelledby="timeline-title">
+        <h2 id="timeline-title">逐句语气</h2>
+        <p id="empty" class="hint">生成后查看每句使用的语气。</p>
+        <ol id="sentences"></ol>
+      </section>
+    </div>
+    <section id="comparison" class="comparison" aria-label="对照试听" hidden>
+      <article>
+        <h2>默认语气 <span id="default-duration"></span></h2>
+        <audio id="default-audio" controls preload="metadata" aria-label="默认语气试听"></audio>
+        <p id="default-warning" class="warning"></p>
+      </article>
+      <article>
+        <h2>逐句语气 <span id="styled-duration"></span></h2>
+        <audio id="styled-audio" controls preload="metadata" aria-label="逐句语气试听"></audio>
+        <p id="styled-warning" class="warning"></p>
+      </article>
+    </section>
+  </main>
+</body>
+</html>

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager, closing, contextmanager
 import fcntl
@@ -278,28 +279,43 @@ class Breeze:
         return int(self.model.sample_rate)
 
     def synthesize(self, text, reference, transcript, target, check=lambda: None, on_pcm=None):
+        from sentence_tone import spoken_segments
+
+        segments = spoken_segments(text)
+        if not any(instruction for _, instruction in segments):
+            segments = [(text, None)]
+        return self.synthesize_segments(segments, reference, transcript, target, check=check, on_pcm=on_pcm)
+
+    def synthesize_segments(self, segments, reference, transcript, target, check=lambda: None, on_pcm=None):
         from breezetts2_mac_fast import SYNTHESIS_MAX_TOKENS, pcm_chunks, pcm16_bytes, synthesis_args
-        args = synthesis_args(text, max_tokens=SYNTHESIS_MAX_TOKENS, streaming_interval=self.interval)
+
         check()
-        total_frames = samples = 0
+        samples = 0
+        capped = False
         with wave.open(str(target), "wb") as audio:
             audio.setnchannels(1)
             audio.setsampwidth(2)
             audio.setframerate(int(self.model.sample_rate))
-            with closing(pcm_chunks(self.model, args, str(reference), transcript)) as chunks:
-                for pcm, frames, _ in chunks:
-                    check()
-                    data = pcm16_bytes(pcm)
-                    if on_pcm is not None:
-                        on_pcm(data)
-                    audio.writeframesraw(data)
-                    total_frames += frames
-                    samples += len(pcm)
+            for sentence, instruction in segments:
+                check()
+                args = synthesis_args(sentence, instruct=instruction, max_tokens=SYNTHESIS_MAX_TOKENS,
+                                      streaming_interval=self.interval)
+                total_frames = 0
+                with closing(pcm_chunks(self.model, args, str(reference), transcript)) as chunks:
+                    for pcm, frames, _ in chunks:
+                        check()
+                        data = pcm16_bytes(pcm)
+                        if on_pcm is not None:
+                            on_pcm(data)
+                        audio.writeframesraw(data)
+                        total_frames += frames
+                        samples += len(pcm)
+                capped |= total_frames >= SYNTHESIS_MAX_TOKENS
         check()
         if not samples:
             raise RuntimeError("模型未生成音频。")
         warning = (f"语音达到 {SYNTHESIS_MAX_TOKENS} 帧上限，可能被截断；可缩短回复后重新对话。"
-                   if total_frames >= SYNTHESIS_MAX_TOKENS else "")
+                   if capped else "")
         return samples / self.model.sample_rate, warning
 
     def close(self):
@@ -324,6 +340,7 @@ class ChatService:
         self.transcriber = transcriber or Whisper()
         self.stt_status, self.stt_error = "loading", None
         self.transcription = None
+        self.tone_preview_control = None
         self.active_kind = None
         self.accepting_tasks = True
         self.service_error = None
@@ -516,6 +533,8 @@ class ChatService:
                 self.active.cancel.set()
             if self.transcription is not None:
                 self.transcription.cancel.set()
+            if self.tone_preview_control is not None:
+                self.tone_preview_control.cancel.set()
             if self.live_audio is not None:
                 self.live_audio.close()
         try:
@@ -847,6 +866,58 @@ class ChatService:
             "model_id": None,
             "created_at": created_at,
         }
+
+    def preview_tone(self, voice_id, text):
+        from sentence_tone import spoken_segments
+
+        segments = spoken_segments(text)
+        if len(segments) > 4:
+            raise HTTPException(422, "一次最多试听四句话。")
+        voice = self.one("voices", voice_id)
+        control = TaskControl("tone_preview", 1, min(120, self.task_timeout))
+        with self.admission:
+            self.check_training_busy()
+            if not self.accepting_tasks or self.model_status != "ready":
+                raise HTTPException(503, "语音模型未就绪，请稍候。")
+            if not self.gate.acquire(blocking=False):
+                raise HTTPException(409, "正在处理其他语音任务，请稍候。")
+            self.active_kind = "tone_preview"
+            self.tone_preview_control = control
+            try:
+                future = self.worker.submit(self.render_tone_preview, voice, segments, control)
+            except BaseException:
+                self.active_kind = self.tone_preview_control = None
+                self.gate.release()
+                raise
+        return future.result()
+
+    def render_tone_preview(self, voice, segments, control):
+        try:
+            control.check()
+            self.select_voice_adapter(voice)
+            reference = self.path(self.recordings, voice["id"])
+            variants = {"default": [(text, None) for text, _ in segments], "styled": segments}
+            output = {"sentences": [{"text": text, "instruction": instruction}
+                                    for text, instruction in segments], "audio": {}}
+            with tempfile.TemporaryDirectory(dir=self.directory, prefix="tone-preview-") as temporary:
+                target = Path(temporary) / "sample.wav"
+                for mode, phrases in variants.items():
+                    duration, warning = self.engine.synthesize_segments(
+                        phrases, reference, voice["transcript"], target, check=control.check)
+                    output["audio"][mode] = {
+                        "wav": base64.b64encode(target.read_bytes()).decode("ascii"),
+                        "duration": duration, "warning": warning,
+                    }
+            return output
+        except TaskStopped as error:
+            raise HTTPException(503, "语气试听已停止或超时，请缩短文本后再试。") from error
+        except Exception as error:
+            log.warning(json.dumps({"stage": "tone_preview", "error_type": type(error).__name__}))
+            raise HTTPException(422, "试听合成失败，请检查参考录音或缩短文本。") from error
+        finally:
+            with self.admission:
+                self.active_kind = self.tone_preview_control = None
+                self.gate.release()
 
     def start_transcription(self, samples, duration):
         with self.admission:
@@ -1315,6 +1386,16 @@ class MessageInput(BaseModel):
         return value
 
 
+class TonePreviewInput(BaseModel):
+    voice_id: str
+    text: str = Field(min_length=1, max_length=120)
+
+    @field_validator("text")
+    @classmethod
+    def trim(cls, value):
+        return clean_text(value, 120, "试听文本")
+
+
 class ConversationInput(BaseModel):
     voice_id: str | None = None
     character_id: str | None = None
@@ -1387,7 +1468,7 @@ def create_app(directory=None, engine=None, reply=None, transcriber=None):
         response = await call_next(request)
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["Referrer-Policy"] = "no-referrer"
-        response.headers["Content-Security-Policy"] = "default-src 'self'; script-src 'self'; style-src 'self' https://fonts.googleapis.com; media-src 'self'; connect-src 'self'; img-src 'self' data: https://images.higgs.ai https://d8j0ntlcm91z4.cloudfront.net; font-src 'self' https://fonts.gstatic.com; object-src 'none'; frame-ancestors 'none'"
+        response.headers["Content-Security-Policy"] = "default-src 'self'; script-src 'self'; style-src 'self' https://fonts.googleapis.com; media-src 'self' blob:; connect-src 'self'; img-src 'self' data: https://images.higgs.ai https://d8j0ntlcm91z4.cloudfront.net; font-src 'self' https://fonts.gstatic.com; object-src 'none'; frame-ancestors 'none'"
         if request.url.path.startswith("/api/"):
             response.headers["Cache-Control"] = "no-store"
         return response
@@ -1467,6 +1548,10 @@ def create_app(directory=None, engine=None, reply=None, transcriber=None):
     @app.post("/api/characters/{value}/memories/refresh", status_code=202)
     def refresh_memories(value: str):
         return service.characters.trigger(value, manual=True)
+
+    @app.post("/api/tone/preview")
+    def tone_preview(body: TonePreviewInput):
+        return service.preview_tone(body.voice_id, body.text)
 
     @app.get("/api/voices")
     def voices():

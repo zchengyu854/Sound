@@ -783,6 +783,67 @@ class VoiceAppTests(unittest.TestCase):
             self.assertEqual(audio.getsampwidth(), 2)
             self.assertEqual(audio.getnframes(), 3)
 
+    def test_breeze_switches_tone_per_sentence_with_same_model_and_reference(self):
+        import numpy as np
+        engine = Breeze()
+        engine.model = SimpleNamespace(sample_rate=24000)
+        engine.interval = 0.32
+        target = Path(self.temp.name) / "toned.wav"
+        reference = Path(self.temp.name) / "reference.wav"
+        calls, emitted = [], []
+
+        def chunks(model, args, ref_audio, ref_text):
+            self.assertIs(engine.model, model)
+            self.assertEqual((ref_audio, ref_text), (str(reference), "同一段原声"))
+            calls.append((args.text, args.instruct))
+            yield np.ones(2, dtype=np.float32), 750 if not args.instruct else 1, True
+
+        with patch("breezetts2_mac_fast.pcm_chunks", chunks):
+            duration, warning = engine.synthesize(
+                "我在这里。你准备好了吗？别担心，我们慢慢来。", reference,
+                "同一段原声", target, on_pcm=emitted.append)
+
+        self.assertEqual([text for text, _ in calls], ["我在这里。", "你准备好了吗？", "别担心，我们慢慢来。"])
+        self.assertIsNone(calls[0][1])
+        self.assertIn("提问", calls[1][1])
+        self.assertIn("安慰", calls[2][1])
+        self.assertEqual(len(emitted), 3)
+        self.assertIn("截断", warning)
+        self.assertAlmostEqual(duration, 6 / 24000)
+        with wave.open(str(target)) as audio:
+            self.assertEqual(audio.getnframes(), 6)
+
+    def test_tone_preview_compares_same_voice_and_does_not_create_chat(self):
+        import base64
+
+        voice = self.voice()
+        calls = []
+
+        def generate(segments, reference, transcript, target, check):
+            check()
+            calls.append((segments, reference, transcript))
+            target.write_bytes(b"RIFF-test")
+            return 1.25, ""
+
+        with patch.object(self.engine, "synthesize_segments", generate, create=True):
+            response = self.client.post("/api/tone/preview", json={
+                "voice_id": voice["id"], "text": "你好。你准备好了吗？",
+            })
+        self.assertEqual(response.status_code, 200, response.text)
+        result = response.json()
+        self.assertEqual(calls[0][1:], calls[1][1:])
+        self.assertEqual(calls[0][0], [("你好。", None), ("你准备好了吗？", None)])
+        self.assertIn("提问", calls[1][0][1][1])
+        self.assertEqual(result["sentences"][1]["instruction"], calls[1][0][1][1])
+        self.assertEqual(base64.b64decode(result["audio"]["styled"]["wav"]), b"RIFF-test")
+        self.assertEqual(self.client.get("/api/conversations").json(), [])
+        self.assertFalse(self.app.state.service.gate.locked())
+        self.assertEqual(self.client.get("/tone/").status_code, 200)
+        invalid = self.client.post("/api/tone/preview", json={
+            "voice_id": voice["id"], "text": "一。二。三。四。五。",
+        })
+        self.assertEqual(invalid.status_code, 422)
+
     def test_provider_errors_are_failed_tasks_without_payload_leak(self):
         service = self.app.state.service
         service.reply = service.complete
