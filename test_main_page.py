@@ -93,6 +93,8 @@ class MainPageTests(unittest.TestCase):
         self.assertEqual(len(parser.ids), len(set(parser.ids)))
         self.assertFalse(parser.inline_scripts)
         self.assertIn("home-greeting", parser.ids)
+        self.assertIn("realtime-link", parser.ids)
+        self.assertIn('href="/realtime/"', response.text)
         self.assertIn("neural-gradient", parser.ids)
         self.assertIn("/home.css", parser.assets)
         for asset in parser.assets:

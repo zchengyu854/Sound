@@ -18,7 +18,12 @@ class Element {
   async emit(name, options = {}) { for (const fn of this.listeners[name] || []) await fn({target: this, preventDefault() {}, ...options}); }
 }
 function fakeDocument() {
-  const elements = new Map([...html.matchAll(/<([a-z-]+)[^>]*\bid="([^"]+)"[^>]*>/g)].map(m => [m[2], new Element(m[1])]));
+  const elements = new Map([...html.matchAll(/<([a-z-]+)[^>]*\bid="([^"]+)"[^>]*>/g)].map(match => {
+    const element = new Element(match[1]);
+    element.hidden = /\bhidden\b/.test(match[0]);
+    element.disabled = /\bdisabled\b/.test(match[0]);
+    return [match[2], element];
+  }));
   return {getElementById: id => elements.get(id) || null, createElement: tag => new Element(tag), elements};
 }
 class FakeEventSource {
@@ -31,7 +36,7 @@ FakeEventSource.instances = [];
 class FakeVad {
   constructor() { this.queue = []; FakeVad.last = this; }
   push() { return this.queue.shift() ?? null; }
-  samples() { return new Int16Array(320); }
+  samples() { return Int16Array.from([0, 16384, -16384, 32767, -32768]); }
 }
 class FakeNode {
   constructor() { this.port = {onmessage: null}; FakeNode.last = this; }
@@ -41,12 +46,12 @@ class FakeNode {
 class FakeContext {
   constructor() { this.sampleRate = 16000; this.destination = {}; this.audioWorklet = {addModule: async () => {}}; }
   resume() { return Promise.resolve(); }
-  createMediaStreamSource() { return {connect() {}}; }
-  createGain() { return {gain: {value: 0}, connect() { return {connect() {}}; }}; }
+  createMediaStreamSource() { return {connect() {}, disconnect() {}}; }
+  createGain() { return {gain: {value: 0}, connect() { return {connect() {}}; }, disconnect() {}}; }
   close() { return Promise.resolve(); }
 }
 
-function fixture(voiceId) {
+function fixture(voiceId, characters = [], characterId = null) {
   FakeEventSource.instances.length = 0;
   FakeNode.last = null;
   FakeVad.last = null;
@@ -56,7 +61,7 @@ function fixture(voiceId) {
   const voices = [{id: "v1", name: "声音一"}, {id: "v2", name: "声音二"}];
   const win = {
     crypto: {randomUUID}, FormData: class { append() {} }, Blob: class { constructor(p) { this.parts = p; } },
-    URL: class { constructor(u) { this.href = u; } searchParams = {get: key => key === "voice_id" ? voiceId : null}; },
+    URL: class { constructor(u) { this.href = u; } searchParams = {get: key => key === "voice_id" ? voiceId : key === "character_id" ? characterId : null}; },
     Option: class { constructor(text, value) { this.text = text; this.value = value; } },
     location: {href: `http://localhost/realtime/?voice_id=${voiceId || ""}`},
     setTimeout: () => 1, clearTimeout() {},
@@ -64,16 +69,23 @@ function fixture(voiceId) {
     AudioContext: FakeContext, AudioWorkletNode: FakeNode,
     navigator: {mediaDevices: {getUserMedia: async () => ({getTracks: () => [{stop() {}}]})}},
     VoiceAudio: {Player: class {
-      // Stays pending until stop(), like the real streaming player.
-      play() { calls.push(["play"]); return new Promise(resolve => { this.done = resolve; }); }
-      stop() { calls.push(["stop"]); if (this.done) this.done(); }
-    }, encodeWav: () => new ArrayBuffer(44)},
+      constructor(changed) { this.changed = changed; this.active = false; }
+      playing() { return this.active; }
+      play() { this.active = true; calls.push(["play"]); this.changed(); return Promise.resolve(); }
+      stop() { calls.push(["stop"]); this.active = false; this.changed(); }
+    }, encodeWav: samples => { calls.push(["encoded", [...samples]]); return new ArrayBuffer(44); }},
     VoiceVad: {VoiceVad: FakeVad},
     async fetch(url, options = {}) {
       const method = options.method || "GET";
       calls.push([method, url, options.body && typeof options.body === "string" ? JSON.parse(options.body) : null, options.headers?.["Idempotency-Key"]]);
       if (url === "/api/health") return {ok: true, json: async () => ({busy: false})};
       if (url === "/api/voices") return {ok: true, json: async () => voices};
+      if (url === "/api/characters") return {ok: true, json: async () => characters};
+      const oneCharacter = url.match(/^\/api\/characters\/([^/]+)$/);
+      if (oneCharacter) {
+        const found = characters.find(character => character.id === decodeURIComponent(oneCharacter[1]));
+        return found ? {ok: true, json: async () => found} : {ok: false, status: 404, json: async () => ({detail: "人物不存在"})};
+      }
       const oneVoice = url.match(/^\/api\/voices\/([^/]+)$/);
       if (oneVoice) {
         const found = voices.find(v => v.id === decodeURIComponent(oneVoice[1]));
@@ -120,6 +132,17 @@ async function main() {
     const called = f.calls.find(c => c[1] === "/api/conversations" && c[0] === "POST");
     assert.deepEqual(called[2], {voice_id: "v1"});
     assert.equal(f.doc.elements.get("stage").hidden, false);
+    assert.equal(f.app.state.listening, true, "one click starts microphone capture");
+  });
+
+  await check("a character link starts a character conversation", async () => {
+    const f = fixture(null, [{id: "c1", name: "小林", voice_id: "v1"}], "c1");
+    await f.app.init();
+    assert.equal(f.app.state.characterId, "c1");
+    await f.app.start();
+    const called = f.calls.find(call => call[1] === "/api/conversations" && call[0] === "POST");
+    assert.deepEqual(called[2], {character_id: "c1"});
+    assert.ok(f.calls.some(call => call[1] === "/api/characters/c1"));
   });
 
   await check("send uses idempotency key and plays after completion", async () => {
@@ -159,6 +182,29 @@ async function main() {
     assert.equal(sendCall[2].content, "手动输入");
   });
 
+  await check("a lost send response is retried with the same idempotency key", async () => {
+    const f = fixture("v1");
+    const originalFetch = f.win.fetch;
+    let savedResponse;
+    const keys = [];
+    f.win.fetch = async (url, options = {}) => {
+      if (options.method === "POST" && /\/conversations\/conv-1\/messages$/.test(url)) {
+        keys.push(options.headers["Idempotency-Key"]);
+        if (!savedResponse) {
+          savedResponse = await originalFetch(url, options);
+          throw new Error("connection lost after acceptance");
+        }
+        return savedResponse;
+      }
+      return originalFetch(url, options);
+    };
+    await f.app.init(); await f.app.start();
+    await f.app.send("你好", 1);
+    assert.equal(keys.length, 2);
+    assert.equal(keys[0], keys[1]);
+    assert.equal(f.calls.filter(call => call[0] === "POST" && /\/conversations\/conv-1\/messages$/.test(call[1])).length, 1);
+  });
+
   await check("starts playback early on synthesizing in realtime mode", async () => {
     const f = fixture("v1");
     await f.app.init(); await f.app.start();
@@ -194,7 +240,7 @@ async function main() {
     const bad = fixture("missing");
     await bad.app.init();
     assert.equal(bad.app.state.voiceId, "v1");
-    assert.match(bad.doc.elements.get("setup-hint").textContent, /不存在/);
+    assert.match(bad.doc.elements.get("setup-hint").textContent, /不可用/);
   });
 
   await check("barge-in stops playback, cancels the reply and submits a new turn", async () => {
@@ -218,6 +264,8 @@ async function main() {
     for (let i = 0; i < 80 && !f.calls.some(c => c[1] === "/api/transcriptions"); i++) await tick();
     assert.ok(f.calls.some(c => c[1] === "/api/health"), "waited for model release before transcribing");
     assert.ok(f.calls.some(c => c[1] === "/api/transcriptions"), "new turn transcribed");
+    const samples = f.calls.find(call => call[0] === "encoded")[1];
+    assert.deepEqual(samples.slice(0, 3), [0, 0.5, -0.5], "PCM is normalized before WAV encoding");
     const posts = f.calls.filter(c => c[0] === "POST" && /\/conversations\/conv-1\/messages$/.test(c[1]));
     assert.equal(posts.length, 2, "original plus barge-in turn");
     assert.ok(posts.every(call => call[2].mode === "realtime"));
@@ -243,6 +291,65 @@ async function main() {
     assert.equal(f.app.state.ended, true);
     assert.equal(f.doc.elements.get("stage").hidden, true);
     assert.equal(f.doc.elements.get("setup").hidden, false);
+    await f.app.start();
+    assert.equal(f.app.state.ended, false);
+    assert.equal(f.app.state.listening, true, "a new conversation can start after ending");
+  });
+
+  await check("capture continues while streamed audio plays and after it ends", async () => {
+    const f = fixture("v1");
+    await f.app.init(); await f.app.start();
+    await f.app.send("你好", 1);
+    const source = FakeEventSource.instances.at(-1);
+    source.emit({id: "msg-1", attempt: 1, status: "synthesizing", mode: "realtime", content: "你好"});
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(f.app.state.playing, true, "play promise resolution does not mean playback finished");
+    assert.equal(f.app.state.listening, true, "microphone remains active for interruption");
+    source.emit({id: "msg-1", attempt: 1, status: "complete", mode: "realtime", content: "你好呀"});
+    f.app.stopPlayback();
+    assert.equal(f.app.state.playing, false);
+    assert.equal(f.app.state.listening, true, "microphone remains active for the next turn");
+  });
+
+  await check("ending during microphone permission releases a late stream", async () => {
+    const f = fixture("v1");
+    let grant, stopped = 0;
+    f.win.navigator.mediaDevices.getUserMedia = () => new Promise(resolve => { grant = resolve; });
+    await f.app.init();
+    const pending = f.app.start();
+    await new Promise(resolve => setImmediate(resolve));
+    await f.app.end();
+    grant({getTracks: () => [{stop() { stopped++; }}]});
+    await pending;
+    assert.equal(stopped, 1);
+    assert.equal(f.app.state.listening, false);
+    assert.ok(!f.calls.some(call => call[0] === "POST" && call[1] === "/api/conversations"));
+  });
+
+  await check("microphone denial leaves an actionable setup error", async () => {
+    const f = fixture("v1");
+    f.win.navigator.mediaDevices.getUserMedia = async () => { throw new Error("denied"); };
+    await f.app.init(); await f.app.start();
+    assert.match(f.doc.elements.get("setup-hint").textContent, /麦克风/);
+    assert.equal(f.doc.elements.get("stage").hidden, true);
+    assert.ok(!f.calls.some(call => call[0] === "POST" && call[1] === "/api/conversations"));
+  });
+
+  await check("a late transcription cannot send into an ended conversation", async () => {
+    const f = fixture("v1");
+    const originalFetch = f.win.fetch;
+    let finishTranscription;
+    f.win.fetch = (url, options) => url === "/api/transcriptions"
+      ? new Promise(resolve => { finishTranscription = resolve; })
+      : originalFetch(url, options);
+    await f.app.init(); await f.app.start();
+    const pending = f.app.submitUtterance(new Int16Array(16000), 16000);
+    for (let index = 0; index < 20 && !finishTranscription; index++) await new Promise(resolve => setImmediate(resolve));
+    await f.app.end();
+    finishTranscription({ok: true, json: async () => ({text: "迟到的结果"})});
+    await pending;
+    assert.ok(!f.calls.some(call => call[0] === "POST" && /\/conversations\/conv-1\/messages$/.test(call[1])));
+    assert.equal(f.doc.elements.get("conversation").children.length, 0);
   });
 
   console.log(`Realtime UI checks passed: ${passed}`);

@@ -283,6 +283,12 @@ function renderLists() {
     }
   }
   const conversation = currentConversation();
+  const realtimeLink = $("realtime-link");
+  const realtimeCharacter = conversation ? conversation.character_id : primaryCharacter()?.id;
+  const realtimeVoice = conversation ? conversation.voice_id : primaryVoice()?.id;
+  realtimeLink.href = realtimeCharacter
+    ? `/realtime/?character_id=${encodeURIComponent(realtimeCharacter)}`
+    : realtimeVoice ? `/realtime/?voice_id=${encodeURIComponent(realtimeVoice)}` : "/realtime/";
   $("voice-select").value = conversation ? (conversation.character_id ? `c:${conversation.character_id}` : `v:${conversation.voice_id}`) : (state.characters[0] ? `c:${state.characters[0].id}` : state.voices[0] ? `v:${state.voices[0].id}` : "");
   $("voice-select").disabled = !state.voices.length;
   $("chat-title").textContent = conversation ? displayName(conversation) : "创建一个有声音的人物";
