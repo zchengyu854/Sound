@@ -46,7 +46,7 @@
   margin-left: auto;
 }
 
-.app .top-actions :is(.home-nav, .mobile-list) {
+.app .top-actions :is(.home-nav, .mobile-list, .realtime-link) {
   display: inline-flex;
   align-items: center;
   min-height: 36px;
@@ -54,10 +54,11 @@
   border: 0;
   color: #a5afb2;
   font: 13px var(--sans);
+  text-decoration: none;
 }
 
 .app .top-actions .mobile-list svg { display: none; }
-.app .top-actions button:hover { color: var(--ink); }
+.app .top-actions :is(button, a):hover { color: var(--ink); }
 .app .top-actions .status {
   min-height: 36px;
   padding: 0 6px;

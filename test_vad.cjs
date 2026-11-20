@@ -43,6 +43,18 @@ check("pre-roll is kept before the start event", () => {
   assert.strictEqual(Math.abs(first), 120); // pre-roll quiet samples retained
 });
 
+check("retains the first and threshold-crossing speech frames", () => {
+  const vad = new VoiceVad({threshold: 180, prerollMs: 20, startMs: 40, endMs: 40, minMs: 40});
+  vad.push(frame(0));
+  vad.push(frame(1000));
+  assert.strictEqual(vad.push(frame(2000)), "start");
+  vad.push(frame(0));
+  assert.strictEqual(vad.push(frame(0)), "end");
+  const samples = vad.samples();
+  assert.strictEqual(Math.abs(samples[320]), 1000);
+  assert.strictEqual(Math.abs(samples[640]), 2000);
+});
+
 check("short noise bursts do not emit end", () => {
   const vad = new VoiceVad({threshold: 180});
   for (let i = 0; i < 5; i++) vad.push(frame(2000));
@@ -54,13 +66,14 @@ check("short noise bursts do not emit end", () => {
 
 check("maximum duration yields timeout and bounded buffer", () => {
   const vad = new VoiceVad({threshold: 180, maxMs: 1000, minMs: 100});
+  for (let i = 0; i < 10; i++) vad.push(frame(0));
   let event = null;
   for (let i = 0; i < 200 && event !== "timeout"; i++) {
     const next = vad.push(frame(2000));
     if (next === "timeout") event = next;
   }
   assert.strictEqual(event, "timeout");
-  assert.ok(vad.samples().length <= 60 * 320); // 1000ms at 20ms/frame plus 200ms pre-roll
+  assert.ok(vad.samples().length <= 50 * 320, "pre-roll is included in the maximum sent to the server");
 });
 
 check("reset clears state but keeps last result", () => {

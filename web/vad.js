@@ -53,7 +53,7 @@
       const prerollSize = Math.max(1, Math.round(this.prerollMs / this.frameMs));
       const startFrames = Math.max(1, Math.round(this.startMs / this.frameMs));
       const endFrames = Math.max(1, Math.round(this.endMs / this.frameMs));
-      const maxFrames = Math.max(1, Math.round(this.maxMs / this.frameMs));
+      const maxFrames = Math.max(1, Math.floor(this.maxMs / this.frameMs));
       // Adapt the noise floor slowly toward quiet input only.
       if (rms < this.threshold * 1.5) this.noise = this.noise * 0.98 + rms * 0.02;
       const active = rms > Math.max(this.threshold, this.noise * 3);
@@ -62,6 +62,7 @@
         if (active) {
           this.phase = "starting";
           this.buffer = this.preroll.slice();
+          this.buffer.push(frame);
           this.preroll = [];
           this.loudCount = 1;
           this.quietCount = 0;
@@ -82,11 +83,11 @@
           if (this.quietCount > startFrames) { this.reset(); return null; }
         }
         this.frames++;
+        this.buffer.push(frame);
         if (this.loudCount >= startFrames) {
           this.phase = "speaking";
           return "start";
         }
-        this.buffer.push(frame);
         return null;
       }
 
@@ -95,7 +96,7 @@
         this.frames++;
         if (active) this.quietCount = 0;
         else this.quietCount++;
-        if (this.frames >= maxFrames) {
+        if (this.buffer.length >= maxFrames) {
           const tooShort = this.frames * this.frameMs < this.minMs;
           this.result = tooShort ? null : this.flatten();
           this.reset();

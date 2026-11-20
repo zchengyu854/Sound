@@ -5,7 +5,7 @@ import asyncio
 import base64
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import asynccontextmanager, closing, contextmanager
-import fcntl
+import errno
 import io
 import logging
 import json
@@ -14,15 +14,23 @@ import time
 import traceback
 from datetime import datetime, timezone
 import os
+import platform
 from pathlib import Path
 import sqlite3
 import shutil
+import sys
+import sysconfig
 import threading
 import tempfile
 from typing import Literal
 from urllib.parse import urlsplit
 from uuid import UUID, uuid4
 import wave
+
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
 
 import httpx
 from fastapi import FastAPI, File, Form, Header, HTTPException, Request, UploadFile
@@ -45,6 +53,29 @@ STREAMING_FRAME_RANGE = (1, 16)
 VOICE_TONE_INSTRUCTIONS = {
     "gentle": "像在和熟悉的人轻声说话，温柔克制，语速略慢但不拖字，按意思自然停顿，重音轻一点，句尾轻轻收住。",
 }
+
+_cuda_dll_directories = []
+
+
+def prepare_windows_cuda():
+    if os.name != "nt" or _cuda_dll_directories:
+        return
+    nvidia = Path(sysconfig.get_path("platlib")) / "nvidia"
+    directories = list(nvidia.glob("*/bin"))
+    cuda_path = os.getenv("CUDA_PATH")
+    if cuda_path:
+        directories.append(Path(cuda_path) / "bin")
+    for directory in directories:
+        if directory.is_dir():
+            _cuda_dll_directories.append(os.add_dll_directory(str(directory)))
+
+
+def lock_data_directory(lease):
+    if os.name == "nt":
+        lease.seek(0)
+        msvcrt.locking(lease.fileno(), msvcrt.LK_NBLCK, 1)
+    else:
+        fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
 
 
 def streaming_frames(value=None):
@@ -213,18 +244,30 @@ def validate_wav(data: bytes) -> float:
 
 class Breeze:
     def load(self):
-        import platform
         from importlib.metadata import version
-        if platform.system() != "Darwin" or platform.machine() != "arm64":
-            raise RuntimeError("需要 Apple Silicon Mac 和原生 arm64 Python。")
         if version("mlx") != "0.32.2" or version("mlx-audio") != "0.5.1":
-            raise RuntimeError("请按 requirements-web.txt 安装固定版本依赖。")
+            raise RuntimeError("请按对应平台的安装说明安装固定版本依赖。")
+        prepare_windows_cuda()
         import mlx.core as mx
         from mlx_audio.tts.utils import load_model
         from mlx_audio.tts.models.breeze_tts.breeze_tts import Model
         from breezetts2_mac_fast import STREAMING_FRAMES, synthesis_interval
-        if not mx.metal.is_available():
-            raise RuntimeError("MLX Metal GPU 不可用。")
+        if platform.system() == "Darwin" and platform.machine() == "arm64":
+            if not mx.metal.is_available():
+                raise RuntimeError("MLX Metal GPU 不可用。")
+        elif platform.system() == "Darwin" and platform.machine() == "x86_64":
+            if not mx.is_available(mx.cpu):
+                raise RuntimeError("MLX CPU 后端不可用，请检查 Intel Mac 的安装步骤。")
+            mx.set_default_device(mx.cpu)
+        elif platform.system() == "Windows" and platform.machine().lower() in ("amd64", "x86_64", "arm64", "aarch64"):
+            if mx.cuda.is_available() and mx.is_available(mx.gpu):
+                mx.set_default_device(mx.gpu)
+            elif mx.is_available(mx.cpu):
+                mx.set_default_device(mx.cpu)
+            else:
+                raise RuntimeError("MLX CUDA 不可用，请检查 NVIDIA 驱动和 Windows 安装步骤。")
+        else:
+            raise RuntimeError("需要 64 位 Mac 或 Windows，请检查对应平台的安装说明。")
         self.model = load_model(os.getenv("BREEZE_MODEL", "mlx-community/Breeze-TTS-2-mlx-4bit"))
         if not isinstance(self.model, Model):
             raise RuntimeError("只支持 Breeze TTS 2 MLX 权重。")
@@ -252,7 +295,7 @@ class Breeze:
         manifest = None
         if folder is not None:
             import hashlib
-            manifest = json.loads((folder / "manifest.json").read_text())
+            manifest = json.loads((folder / "manifest.json").read_text(encoding="utf-8"))
             if (manifest["base_model"] != os.getenv("BREEZE_MODEL", "mlx-community/Breeze-TTS-2-mlx-4bit")
                     or hashlib.sha256((folder / "adapter.safetensors").read_bytes()).hexdigest() != manifest["sha256"]):
                 raise RuntimeError("声音 adapter 与基座不兼容或文件已改变。")
@@ -380,13 +423,20 @@ class ChatService:
             raise
 
     def _start(self):
+        if os.name == "nt" and sys.version_info < (3, 12, 4):
+            raise RuntimeError("Windows 需要 Python 3.12.4 或更新的 3.12 版本，以保护数据目录权限。")
         self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.lease = (self.directory / "app.lock").open("a")
         try:
-            fcntl.flock(self.lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            lock_data_directory(self.lease)
         except BlockingIOError:
             self.lease.close()
             raise RuntimeError("该数据目录已有应用在运行；请勿使用多个 worker 或 --reload。")
+        except OSError as error:
+            if os.name == "nt" and error.errno in (errno.EACCES, errno.EDEADLK, errno.EAGAIN):
+                self.lease.close()
+                raise RuntimeError("该数据目录已有应用在运行；请勿使用多个 worker 或 --reload。") from None
+            raise
         self.load_llm_settings()
         self.recordings.mkdir(exist_ok=True, mode=0o700)
         self.audio.mkdir(exist_ok=True, mode=0o700)
@@ -488,7 +538,8 @@ class ChatService:
                     with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=self.directory,
                                                      prefix=".llm-settings-", suffix=".tmp", delete=False) as target:
                         temp = Path(target.name)
-                        os.fchmod(target.fileno(), 0o600)
+                        if os.name != "nt":
+                            os.fchmod(target.fileno(), 0o600)
                         json.dump(values, target, ensure_ascii=False)
                         target.flush()
                         os.fsync(target.fileno())

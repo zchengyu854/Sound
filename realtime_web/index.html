@@ -15,27 +15,31 @@
 <body>
   <div class="shell">
     <header class="topbar">
-      <div class="brand"><span class="avatar" aria-hidden="true">声</span><div><h1>声线对话</h1><p id="voice-name">本地语音 · 正在载入</p></div></div>
-      <a class="quiet" href="/">返回聊天</a>
+      <div class="brand"><span class="brand-mark">VOICE<sup>˚</sup></span><div><h1>声线对话</h1><p id="voice-name">正在载入</p></div></div>
+      <a class="quiet" href="/">返回首页</a>
     </header>
 
     <section class="setup" id="setup">
-      <label for="voice-select">选择声音（已发布声音与普通参考声音）</label>
-      <select id="voice-select"><option value="">正在读取声音…</option></select>
-      <p class="hint" id="setup-hint">选择声音后点击开始。切换声音会新建会话；刷新后需重新开始。</p>
-      <button id="start" class="primary" type="button" disabled>开始对话</button>
+      <p class="eyebrow">实时语音</p>
+      <h2>说话，就从这里开始。</h2>
+      <p class="intro">选择人物或声音。说完后会自动回复，想插话时直接开口。</p>
+      <label for="voice-select">人物或声音</label>
+      <select id="voice-select"><option value="">正在读取…</option></select>
+      <p class="hint" id="setup-hint">点击开始后允许使用麦克风。建议佩戴耳机，减少声音回传。</p>
+      <button id="start" class="primary" type="button" disabled>开始实时对话</button>
+      <p class="privacy">录音和语音合成留在本机，识别后的文字会发送至配置的聊天服务。</p>
     </section>
 
     <section class="stage" id="stage" hidden>
       <div class="status" id="status" role="status" aria-live="polite">准备中</div>
       <div class="conversation" id="conversation" aria-live="polite"></div>
       <div class="controls">
-        <button id="mic-toggle" class="mic" type="button" disabled>开始监听</button>
+        <button id="mic-toggle" class="mic" type="button" disabled>暂停监听</button>
         <button id="stop-play" class="quiet" type="button" hidden>停止播放</button>
         <button id="end" class="danger" type="button">结束对话</button>
       </div>
       <div class="manual">
-        <label for="manual-input">识别失败时可直接输入</label>
+        <label for="manual-input">也可以输入文字</label>
         <div class="manual-row"><input id="manual-input" maxlength="500" placeholder="输入文字后发送"><button id="manual-send" class="small" type="button">发送</button></div>
       </div>
     </section>
