@@ -48,10 +48,12 @@ API Key 使用密码框，只显示“已设置 / 未设置”，不会从后端
 ## 验证
 
 ```sh
-.venv/bin/python -m unittest -v test_voice_app test_characters test_audio_runtime
+.venv/bin/python -m unittest discover -s tests -p "test_voice_app.py" -v
+.venv/bin/python -m unittest discover -s tests -p "test_characters.py" -v
+.venv/bin/python -m unittest discover -s tests -p "test_audio_runtime.py" -v
 node --check web/app.js
-node test_audio_ui.cjs
-node test_reply_ui.cjs
+node tests/test_audio_ui.cjs
+node tests/test_reply_ui.cjs
 # 原命令行用法保持兼容：
 .venv/bin/python breezetts2_mac_fast.py --no-play --runs 1 --text '你好，这是命令行兼容检查。' --output /tmp/breeze_cli_check
 ```
@@ -177,7 +179,7 @@ node test_reply_ui.cjs
 
 提示词的字数要求不是服务端硬保证，token也不等于汉字数或音频秒数。若提供方忽略参数或提示，仍可能返回长回复；应用不伪装为短回答。提供方报告输出上限或Breeze达到750帧（约60秒）时，沿用原有明确提示。真实服务是否遵守约束需要实测，不保证任何语速下都在60秒内。
 
-消息气泡、紧凑语音卡片和安全的历史加粗显示保留；一条回复渲染为单张卡片，所有段落完整显示。界面使用统一设计令牌，桌面与窄屏列表/聊天视图共用黑色主题。检查命令：`node --check web/app.js`、`node test_reply_ui.cjs`、`.venv/bin/python -m unittest -q test_voice_app test_characters`。
+消息气泡、紧凑语音卡片和安全的历史加粗显示保留；一条回复渲染为单张卡片，所有段落完整显示。界面使用统一设计令牌，桌面与窄屏列表/聊天视图共用黑色主题。检查命令：`node --check web/app.js`、`node tests/test_reply_ui.cjs`、`.venv/bin/python -m unittest discover -s tests -p "test_voice_app.py" -q`、`.venv/bin/python -m unittest discover -s tests -p "test_characters.py" -q`。
 
 ## Mac 与 Ubuntu 的训练边界
 
@@ -224,7 +226,7 @@ uv pip install --python .venv-separator/bin/python -r requirements-separator.txt
 
 **必须人工试听**：人声分离不保证干净，残留伴奏、混响、多人声或断词都会污染训练。脚本只标记 `review_required` 和 `single_speaker_unverified`，不会判断授权、说话人数或转写是否正确。确认只有一位说话者且人声清晰后，再交给训练侧的素材整理流程。当前 Mac 主页面不负责上传或审核，分离也不能替代真人音色相似度验收。
 
-本部分验证命令：`.venv/bin/python -m py_compile separate_vocals.py`、`.venv/bin/python -m unittest -q test_separate_vocals`。测试用真实 ffmpeg 转码、替身模拟 demucs，不下载模型或触发真实分离。
+本部分验证命令：`.venv/bin/python -m py_compile separate_vocals.py`、`.venv/bin/python -m unittest discover -s tests -p "test_separate_vocals.py" -q`。测试用真实 ffmpeg 转码、替身模拟 demucs，不下载模型或触发真实分离。
 
 ## 实时语音（两阶段）
 
@@ -243,9 +245,9 @@ uv pip install --python .venv-separator/bin/python -r requirements-separator.txt
 - 训练效果、未训练文本试听与真人音色相似度在 Ubuntu 训练侧验收，不由有效 WAV、有限 loss 或 Mac 页面自动化测试代替。真实麦克风多轮对话、端到端首音、缓冲耗尽与停顿仍是 Mac 人工验收项。
 - 性能记录要求：固定声音与配置，冷启动与预热后分开；短、中两档中文回复，每档预热后至少 5 次，报告原始值/中位数/最大值/样本量；端到端首音以浏览器实测为准，不用服务端首 PCM 代替。预热后 RTF < 1（争取约 20% 余量）是持续播放目标，非未测承诺；若训练后声音持续 RTF ≥ 1，保留自动接话与完整生成播放并如实记录，不靠加大缓冲冒充实时输出。
 
-验证：`test_realtime_runtime.py`（断句/队列/轮次）、`test_realtime_ui.cjs`（自动发送、幂等、SSE 早播、旧轮次隔离、结束回收、打断中止、播放中开口打断、URL 声音服务端校验）、`test_voice_adapters.py`（Ubuntu 产物校验、导入回滚、原声音隔离、导入声音实际合成）、`test_voice_app.py` 与 `test_training_service.py`（分句合成、interrupted 终态、标准取消兼容、幂等模式校验、合成失败分类、训练产物校验和单声音校验）以及现有 Node 回归。
+验证：`tests/test_realtime_runtime.py`（断句/队列/轮次）、`tests/test_realtime_ui.cjs`（自动发送、幂等、SSE 早播、旧轮次隔离、结束回收、打断中止、播放中开口打断、URL 声音服务端校验）、`tests/test_voice_adapters.py`（Ubuntu 产物校验、导入回滚、原声音隔离、导入声音实际合成）、`tests/test_voice_app.py` 与 `tests/test_training_service.py`（分句合成、interrupted 终态、标准取消兼容、幂等模式校验、合成失败分类、训练产物校验和单声音校验）以及现有 Node 回归。
 
-人工验收步骤、记录表与判定标准见 **`MANUAL_TESTS.md`**；自动化覆盖范围也在其中列出，避免重复劳动。
+人工验收步骤、记录表与判定标准见 **`docs/MANUAL_TESTS.md`**；自动化覆盖范围也在其中列出，避免重复劳动。
 
 ## 性能测量与推进条件
 
@@ -297,12 +299,10 @@ uv pip install --python .venv-separator/bin/python -r requirements-separator.txt
 推进条件：实时性在中位意义上已达标，继续调参收益耗尽。若要让短句与首个请求也稳定 < 1，只能降低固定开销（更小模型或更高算力），而不是继续加缓冲。任何改动都要在同等条件下重测并保留 `benchmark.json`。产物：`web-test-artifacts/chunk-2|4|8/`、`chunk-4-r5/`、`final-adapter/`、`final-compiled/`、`final-native/`；更早一次的对照记录在 `bench-cached|bench-compiled|bench-native/`。
 
 ```sh
-.venv/bin/python -m unittest -v test_main_page test_voice_app test_voice_adapters test_characters test_audio_runtime \
-  test_breeze_training test_media_processing test_training_store test_training_service \
-  test_separate_vocals test_realtime_runtime test_benchmark_voice test_voice_metrics
+.venv/bin/python -m unittest discover -s tests -v
 node --check web/app.js && node --check web/vad.js && node --check web/realtime-worklet.js \
   && node --check realtime_web/app.js
-node test_audio_ui.cjs && node test_reply_ui.cjs && node test_vad.cjs && node test_realtime_ui.cjs
+node tests/test_audio_ui.cjs && node tests/test_reply_ui.cjs && node tests/test_vad.cjs && node tests/test_realtime_ui.cjs
 .venv/bin/python -m py_compile voice_app.py voice_adapters.py breezetts2_mac_fast.py \
   breeze_training.py media_processing.py training_store.py training_service.py \
   realtime_runtime.py separate_vocals.py

@@ -1,6 +1,6 @@
 "use strict";
 const assert = require("assert");
-const {VoiceVad} = require("./web/vad.js");
+const {VoiceVad} = require("../web/vad.js");
 
 function frame(rms, length = 320) {
   const out = new Int16Array(length);
