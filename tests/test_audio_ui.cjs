@@ -1,7 +1,9 @@
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
+const path = require("node:path");
 const vm = require("node:vm");
-require("./web/audio.js");
+require("../web/audio.js");
+const ROOT = path.join(__dirname, "..");
 
 const encoded = new Uint8Array(VoiceAudio.encodeWav(new Float32Array([-1, -.5, 0, .5, 1])));
 const header = new DataView(encoded.buffer);
@@ -54,7 +56,7 @@ async function main() {
   assert.equal(player.playing("message"), false);
   assert.deepEqual(failures, []);
 
-  const recorderSource = fs.readFileSync("./web/recorder.js", "utf8") + "\nglobalThis.TestRecorder = VoiceRecorder;";
+  const recorderSource = fs.readFileSync(path.join(ROOT, "web/recorder.js"), "utf8") + "\nglobalThis.TestRecorder = VoiceRecorder;";
   let grant, stopped = 0, transcripts = 0;
   const recorderContext = vm.createContext({navigator: {mediaDevices: {getUserMedia: () => new Promise(resolve => { grant = resolve; })}},
     window: {AudioWorkletNode: class {}, AudioContext, OfflineAudioContext: class {}}, AudioContext, AbortController,
@@ -119,7 +121,7 @@ async function main() {
   let capture;
   class AudioWorkletProcessor { constructor() { this.port = {postMessage: data => capture.push(data)}; } }
   const workletContext = vm.createContext({AudioWorkletProcessor, Float32Array, registerProcessor: (name, processor) => { workletContext.Processor = processor; }});
-  vm.runInContext(fs.readFileSync("./web/recorder-worklet.js", "utf8"), workletContext);
+  vm.runInContext(fs.readFileSync(path.join(ROOT, "web/recorder-worklet.js"), "utf8"), workletContext);
   capture = [];
   const worklet = new workletContext.Processor();
   worklet.process([[new Float32Array([1, -1]), new Float32Array([0, 0])]]);

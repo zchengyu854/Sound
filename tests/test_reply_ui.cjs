@@ -1,5 +1,5 @@
 const assert = require("node:assert/strict");
-require("./web/reply.js");
+require("../web/reply.js");
 const {paragraphs, tokens, blocks} = globalThis.VoiceReply;
 assert.deepEqual(paragraphs("你好。\n\n慢慢说。"), ["你好。", "慢慢说。"]);
 assert.equal(paragraphs(("这是一个句子。".repeat(30))).join(""), "这是一个句子。".repeat(30));

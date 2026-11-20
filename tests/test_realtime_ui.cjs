@@ -1,9 +1,11 @@
 "use strict";
 const assert = require("node:assert/strict");
 const fs = require("node:fs");
+const path = require("node:path");
 const {randomUUID} = require("node:crypto");
-const {createRealtime} = require("./realtime_web/app.js");
-const html = fs.readFileSync("./realtime_web/index.html", "utf8");
+const {createRealtime} = require("../realtime_web/app.js");
+const ROOT = path.join(__dirname, "..");
+const html = fs.readFileSync(path.join(ROOT, "realtime_web/index.html"), "utf8");
 
 class Element {
   constructor(tag = "div") {

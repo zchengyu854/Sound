@@ -77,4 +77,4 @@ After installing the dependencies on an Apple Silicon Mac, generate a WAV withou
 
 Reference recordings, generated WAV files, and conversations are stored in `data/` by default. Set `VOICE_DATA_DIR` to use another directory. Chat messages, character settings, and relevant memories are sent to your configured chat model. Reference recordings and speech synthesis stay on your device. On Windows, a newly created data directory is restricted to the current user and administrators. Check permissions if you use an existing directory. The web server binds to `127.0.0.1` by default and has no login authentication.
 
-See the [web app guide in Chinese](WEB_APP.md) for configuration, API details, and test commands.
+See the [web app guide in Chinese](docs/WEB_APP.md) for configuration, API details, and test commands.

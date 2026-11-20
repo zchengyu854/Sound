@@ -1,7 +1,7 @@
 """Opt-in Mac → Ubuntu → Mac Breeze integration with generated system speech.
 
 BREEZE_TRAINING_WORKER=../breeze-ubuntu BREEZE_TRAINING_SSH=user@ubuntu HF_HUB_OFFLINE=1 \
-  .venv/bin/python -m unittest -v test_training_hardware
+  .venv/bin/python -m unittest discover -s tests -p "test_training_hardware.py" -v
 Whisper is replaced with a deterministic transcript; transcription quality is not measured.
 """
 import json
