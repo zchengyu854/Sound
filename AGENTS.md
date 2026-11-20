@@ -3,6 +3,7 @@
 ## Project Structure & Module Organization
 
 - `voice_app.py`: FastAPI endpoints, SQLite persistence, task scheduling, cancellation, and Breeze integration. Standard (`mode=standard`) and realtime (`mode=realtime`) replies share one model thread; realtime streams LLM text on a separate I/O executor and synthesizes per sentence.
+- `platform_runtime.py`: process-level CUDA setup, data-directory locking, and streaming/depth environment configuration.
 - `realtime_runtime.py`: incremental Chinese sentence splitting, bounded segment queue, and turn/round control for realtime replies. Pure logic; keep it free of model and I/O dependencies.
 - `breezetts2_mac_fast.py`: streaming inference CLI and shared helpers such as `FastDepth`, `pcm_chunks`, and `pcm16_bytes`. Preserve existing CLI behavior when changing shared code.
 - `character_store.py`: character profiles, immutable conversation snapshots, and bounded memory extraction.

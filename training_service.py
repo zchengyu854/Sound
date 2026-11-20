@@ -1276,7 +1276,7 @@ class TrainingService:
                                          inference_signature, pcm16_bytes, pcm_chunks,
                                          synthesis_args, synthesis_interval)
         from contextlib import closing
-        from voice_app import streaming_frames
+        from platform_runtime import streaming_frames
         if variant not in ("trained", "base"):
             raise HTTPException(422, "试听变体无效。")
         texts = select_preview_texts(job["snapshot"])

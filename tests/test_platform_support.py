@@ -10,6 +10,7 @@ import mlx.core as mx
 from mlx_audio.tts.models.breeze_tts import breeze_tts
 from mlx_audio.tts import utils as tts_utils
 
+import platform_runtime
 import voice_app
 
 
@@ -60,11 +61,11 @@ class PlatformSupportTests(unittest.TestCase):
             add = Mock(side_effect=lambda directory: directory)
             windows_os = SimpleNamespace(name="nt", getenv=lambda key: str(toolkit_bin.parent),
                                          add_dll_directory=add)
-            with patch.object(voice_app, "os", windows_os), \
-                 patch.object(voice_app.sysconfig, "get_path", return_value=temporary), \
-                 patch.object(voice_app, "_cuda_dll_directories", []):
-                voice_app.prepare_windows_cuda()
-                voice_app.prepare_windows_cuda()
+            with patch.object(platform_runtime, "os", windows_os), \
+                 patch.object(platform_runtime.sysconfig, "get_path", return_value=temporary), \
+                 patch.object(platform_runtime, "_cuda_dll_directories", []):
+                platform_runtime.prepare_windows_cuda()
+                platform_runtime.prepare_windows_cuda()
             self.assertEqual({call.args[0] for call in add.call_args_list},
                              {str(package_bin), str(toolkit_bin)})
             self.assertEqual(add.call_count, 2)
@@ -73,9 +74,9 @@ class PlatformSupportTests(unittest.TestCase):
         lease = Mock()
         lease.fileno.return_value = 42
         windows_lock = SimpleNamespace(LK_NBLCK=2, locking=Mock())
-        with patch.object(voice_app, "os", SimpleNamespace(name="nt")), \
-             patch.object(voice_app, "msvcrt", windows_lock, create=True):
-            voice_app.lock_data_directory(lease)
+        with patch.object(platform_runtime, "os", SimpleNamespace(name="nt")), \
+             patch.object(platform_runtime, "msvcrt", windows_lock, create=True):
+            platform_runtime.lock_data_directory(lease)
         lease.seek.assert_called_once_with(0)
         windows_lock.locking.assert_called_once_with(42, 2, 1)
 
@@ -85,7 +86,7 @@ class PlatformSupportTests(unittest.TestCase):
             path.write_text("keep", encoding="ascii")
             script = (
                 "import sys\n"
-                "from voice_app import lock_data_directory\n"
+                "from platform_runtime import lock_data_directory\n"
                 "with open(sys.argv[1], 'a') as lease:\n"
                 "    try:\n"
                 "        lock_data_directory(lease)\n"
@@ -96,7 +97,7 @@ class PlatformSupportTests(unittest.TestCase):
                 return subprocess.run([sys.executable, "-c", script, str(path)],
                                       capture_output=True, timeout=15).returncode
             with path.open("a") as lease:
-                voice_app.lock_data_directory(lease)
+                platform_runtime.lock_data_directory(lease)
                 self.assertEqual(child(), 17)
             self.assertEqual(child(), 0)
             self.assertEqual(path.read_text(encoding="ascii"), "keep")
