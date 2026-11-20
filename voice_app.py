@@ -19,6 +19,7 @@ import sqlite3
 import shutil
 import threading
 import tempfile
+from typing import Literal
 from urllib.parse import urlsplit
 from uuid import UUID, uuid4
 import wave
@@ -41,6 +42,9 @@ ACTIVE = ("queued", "thinking", "replying", "synthesizing")
 MAX_REASONING = 20000
 DEPTH_MODES = ("cached", "compiled")
 STREAMING_FRAME_RANGE = (1, 16)
+VOICE_TONE_INSTRUCTIONS = {
+    "gentle": "像在和熟悉的人轻声说话，温柔克制，语速略慢但不拖字，按意思自然停顿，重音轻一点，句尾轻轻收住。",
+}
 
 
 def streaming_frames(value=None):
@@ -278,12 +282,12 @@ class Breeze:
     def sample_rate(self):
         return int(self.model.sample_rate)
 
-    def synthesize(self, text, reference, transcript, target, check=lambda: None, on_pcm=None):
+    def synthesize(self, text, reference, transcript, target, check=lambda: None, on_pcm=None, *, instruct=None):
         from sentence_tone import spoken_segments
 
-        segments = spoken_segments(text)
+        segments = spoken_segments(text) if instruct is None else [(text, instruct)]
         if not any(instruction for _, instruction in segments):
-            segments = [(text, None)]
+            segments = [(text, instruct)]
         return self.synthesize_segments(segments, reference, transcript, target, check=check, on_pcm=on_pcm)
 
     def synthesize_segments(self, segments, reference, transcript, target, check=lambda: None, on_pcm=None):
@@ -292,6 +296,7 @@ class Breeze:
         check()
         samples = 0
         capped = False
+        ref_audio = str(reference) if reference is not None else None
         with wave.open(str(target), "wb") as audio:
             audio.setnchannels(1)
             audio.setsampwidth(2)
@@ -301,7 +306,7 @@ class Breeze:
                 args = synthesis_args(sentence, instruct=instruction, max_tokens=SYNTHESIS_MAX_TOKENS,
                                       streaming_interval=self.interval)
                 total_frames = 0
-                with closing(pcm_chunks(self.model, args, str(reference), transcript)) as chunks:
+                with closing(pcm_chunks(self.model, args, ref_audio, transcript)) as chunks:
                     for pcm, frames, _ in chunks:
                         check()
                         data = pcm16_bytes(pcm)
@@ -416,6 +421,8 @@ class ChatService:
                 with closing(sqlite3.connect(self.directory / f"before-adapters-{uuid4()}.sqlite3")) as backup:
                     db.backup(backup)
                 db.execute("ALTER TABLE voices ADD COLUMN adapter_id TEXT REFERENCES voice_adapters(id)")
+            if "tone_preset" not in voice_columns:
+                db.execute("ALTER TABLE voices ADD COLUMN tone_preset TEXT NOT NULL DEFAULT 'default'")
             columns = {row[1] for row in db.execute("PRAGMA table_info(messages)")}
             additions = {"reasoning": "TEXT NOT NULL DEFAULT ''", "request_key": "TEXT", "error_code": "TEXT", "attempt": "INTEGER NOT NULL DEFAULT 0",
                          "started_at": "TEXT", "finished_at": "TEXT", "timings": "TEXT NOT NULL DEFAULT '{}'",
@@ -762,6 +769,11 @@ class ChatService:
         if hasattr(self.engine, "select_adapter"):
             self.engine.select_adapter(folder)
 
+    def synthesis_reference(self, voice):
+        if voice["adapter_id"] and voice["duration"] == 0:
+            return None, None
+        return self.path(self.recordings, voice["id"]), voice["transcript"]
+
     def import_adapter(self, reference_id, name, filename, data):
         name = clean_text(name, 60, "名称")
         expected_model = os.getenv("BREEZE_MODEL", "mlx-community/Breeze-TTS-2-mlx-4bit")
@@ -784,9 +796,14 @@ class ChatService:
             target = self.path(self.recordings, voice_id)
             temporary = target.with_suffix(".tmp")
             try:
-                source = self.one("voices", reference_id)
-                source_audio = self.path(self.recordings, reference_id).read_bytes()
-                duration = validate_wav(source_audio)
+                source_audio, transcript, duration = None, "", 0
+                if reference_id is not None:
+                    source = self.one("voices", reference_id)
+                    reference, transcript = self.synthesis_reference(source)
+                    if reference is None:
+                        raise HTTPException(422, "请选择带参考录音的声音，或选择无参考录音。")
+                    source_audio = reference.read_bytes()
+                    duration = validate_wav(source_audio)
                 folder.mkdir(mode=0o700)
                 manifest_path = folder / "manifest.json"
                 adapter_path = folder / "adapter.safetensors"
@@ -801,8 +818,9 @@ class ChatService:
                     raise RuntimeError("当前语音引擎不支持 adapter。")
                 self.worker.submit(self.engine.select_adapter, folder).result()
 
-                temporary.write_bytes(source_audio)
-                temporary.replace(target)
+                if source_audio is not None:
+                    temporary.write_bytes(source_audio)
+                    temporary.replace(target)
                 created_at = timestamp()
                 with closing(self.connect()) as db, db:
                     db.execute(
@@ -829,7 +847,7 @@ class ChatService:
                         (
                             voice_id,
                             name,
-                            source["transcript"],
+                            transcript,
                             duration,
                             adapter_id,
                             created_at,
@@ -860,7 +878,7 @@ class ChatService:
         return {
             "id": voice_id,
             "name": name,
-            "transcript": source["transcript"],
+            "transcript": transcript,
             "duration": duration,
             "adapter_id": adapter_id,
             "model_id": None,
@@ -895,7 +913,7 @@ class ChatService:
         try:
             control.check()
             self.select_voice_adapter(voice)
-            reference = self.path(self.recordings, voice["id"])
+            reference, transcript = self.synthesis_reference(voice)
             variants = {"default": [(text, None) for text, _ in segments], "styled": segments}
             output = {"sentences": [{"text": text, "instruction": instruction}
                                     for text, instruction in segments], "audio": {}}
@@ -903,7 +921,7 @@ class ChatService:
                 target = Path(temporary) / "sample.wav"
                 for mode, phrases in variants.items():
                     duration, warning = self.engine.synthesize_segments(
-                        phrases, reference, voice["transcript"], target, check=control.check)
+                        phrases, reference, transcript, target, check=control.check)
                     output["audio"][mode] = {
                         "wav": base64.b64encode(target.read_bytes()).decode("ascii"),
                         "duration": duration, "warning": warning,
@@ -1241,6 +1259,8 @@ class ChatService:
             self.update(value, status="synthesizing")
             voice = self.one("voices", voice_id)
             self.select_voice_adapter(voice)
+            reference, transcript = self.synthesis_reference(voice)
+            instruct = VOICE_TONE_INSTRUCTIONS.get(voice["tone_preset"])
 
             pcm_chunks = []
             total_duration = 0.0
@@ -1266,8 +1286,7 @@ class ChatService:
                 # synthesize() returns duration in seconds, not a sample count.
                 synth_started = time.monotonic()
                 part_duration, _warning = self.engine.synthesize(
-                    sentence, self.path(self.recordings, voice_id), voice["transcript"],
-                    temp, check=control.check, on_pcm=emit_pcm)
+                    sentence, reference, transcript, temp, check=control.check, on_pcm=emit_pcm, instruct=instruct)
                 # RTF must reflect model synthesis only, not time spent waiting on
                 # the network reader for the next sentence.
                 spent = (time.monotonic() - synth_started) * 1000
@@ -1350,8 +1369,10 @@ class ChatService:
                     live.append(data)
                     if data and control.timings["first_audio_ms"] is None:
                         control.timings["first_audio_ms"] = round((time.monotonic() - control.started) * 1000, 3)
-                duration, warning = self.engine.synthesize(task["content"], self.path(self.recordings, voice_id),
-                                                          voice["transcript"], temp, check=control.check, on_pcm=emit_pcm)
+                reference, transcript = self.synthesis_reference(voice)
+                duration, warning = self.engine.synthesize(
+                    task["content"], reference, transcript, temp, check=control.check, on_pcm=emit_pcm,
+                    instruct=VOICE_TONE_INSTRUCTIONS.get(voice["tone_preset"]))
             with self.admission, control.measure("publish"):
                 control.check()
                 temp.replace(target)
@@ -1394,6 +1415,10 @@ class TonePreviewInput(BaseModel):
     @classmethod
     def trim(cls, value):
         return clean_text(value, 120, "试听文本")
+
+
+class VoiceToneInput(BaseModel):
+    tone_preset: Literal["default", "gentle"]
 
 
 class ConversationInput(BaseModel):
@@ -1443,6 +1468,7 @@ def create_app(directory=None, engine=None, reply=None, transcriber=None):
 
     @asynccontextmanager
     async def lifespan(app):
+        app.state.startup_id = str(uuid4())
         service.start()
         try:
             yield
@@ -1475,7 +1501,8 @@ def create_app(directory=None, engine=None, reply=None, transcriber=None):
 
     @app.get("/api/health")
     def health():
-        return {"model_status": service.model_status, "model_error": service.model_error,
+        return {"startup_id": app.state.startup_id,
+                "model_status": service.model_status, "model_error": service.model_error,
                 "busy": service.gate.locked(), "llm_configured": service.configured,
                 "stt_status": service.stt_status, "stt_error": service.stt_error, "active_kind": service.active_kind,
                 "accepting_tasks": service.accepting_tasks, "service_error": service.service_error}
@@ -1563,6 +1590,15 @@ def create_app(directory=None, engine=None, reply=None, transcriber=None):
         # server-side, instead of trusting it in the browser.
         return service.one("voices", value)
 
+    @app.patch("/api/voices/{value}/tone")
+    def set_voice_tone(value: str, body: VoiceToneInput):
+        value = identifier(value)
+        with closing(service.connect()) as db, db:
+            result = db.execute("UPDATE voices SET tone_preset=? WHERE id=?", (body.tone_preset, value))
+            if not result.rowcount:
+                raise HTTPException(404, "找不到该声音。")
+        return service.one("voices", value)
+
     @app.post("/api/voices", status_code=201)
     async def add_voice(name: str = Form(max_length=60), transcript: str = Form(max_length=2000), recording: UploadFile = File()):
         name, transcript = clean_text(name, 60, "名称"), clean_text(transcript, 2000, "录音原文")
@@ -1588,7 +1624,7 @@ def create_app(directory=None, engine=None, reply=None, transcriber=None):
     @app.post("/api/voice-adapters", status_code=201)
     async def import_voice_adapter(
         name: str = Form(max_length=60),
-        reference_voice_id: str = Form(),
+        reference_voice_id: str | None = Form(default=None),
         artifact: UploadFile = File(),
     ):
         if not (artifact.filename or "").lower().endswith(".zip"):

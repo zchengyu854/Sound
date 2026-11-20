@@ -55,6 +55,7 @@ class Engine:
         self.fail = False
         self.warning = ""
         self.calls = []
+        self.instructions = []
         self.threads = []
 
     def load(self):
@@ -63,9 +64,10 @@ class Engine:
     def close(self):
         self.threads.append(threading.get_ident())
 
-    def synthesize(self, text, reference, transcript, target, check=lambda: None, on_pcm=None):
+    def synthesize(self, text, reference, transcript, target, check=lambda: None, on_pcm=None, *, instruct=None):
         self.threads.append(threading.get_ident())
         self.calls.append((text, reference, transcript))
+        self.instructions.append(instruct)
         target.write_bytes(wav_bytes())
         if on_pcm:
             with wave.open(str(target)) as audio:
@@ -812,6 +814,14 @@ class VoiceAppTests(unittest.TestCase):
         self.assertAlmostEqual(duration, 6 / 24000)
         with wave.open(str(target)) as audio:
             self.assertEqual(audio.getnframes(), 6)
+
+    def test_explicit_tone_takes_precedence_over_sentence_tone(self):
+        text = "你准备好了吗？太好了！"
+        target = Path(self.temp.name) / "gentle.wav"
+        engine = Breeze()
+        with patch.object(engine, "synthesize_segments") as generate:
+            engine.synthesize(text, None, None, target, instruct="轻柔克制")
+        self.assertEqual(generate.call_args.args, ([(text, "轻柔克制")], None, None, target))
 
     def test_tone_preview_compares_same_voice_and_does_not_create_chat(self):
         import base64

@@ -17,6 +17,7 @@ from fastapi.testclient import TestClient
 from test_voice_app import Engine, create_app, wav_bytes
 from training_exchange import PACKAGE_VERSION, RECIPE_VERSION, TrainingConfig
 from voice_adapters import MAX_ARTIFACT
+from voice_app import VOICE_TONE_INSTRUCTIONS
 
 
 class AdapterEngine(Engine):
@@ -159,6 +160,64 @@ class VoiceAdapterTests(unittest.TestCase):
             self.assertEqual(response.status_code, 422, response.text)
         self.assertEqual(len(self.client.get("/api/voices").json()), 1)
         self.assertFalse(list((self.directory / "voice_adapters").iterdir()))
+
+    def test_adapter_without_reference_works_in_both_chat_modes(self):
+        response = self.client.post(
+            "/api/voice-adapters",
+            data={"name": "无参考声音", "reference_voice_id": ""},
+            files={"artifact": ("result.zip", adapter_package(), "application/zip")},
+        )
+        self.assertEqual(response.status_code, 201, response.text)
+        voice = response.json()
+        self.assertEqual(voice["duration"], 0)
+        self.assertEqual(voice["transcript"], "")
+        self.assertFalse(list((self.directory / "recordings").iterdir()))
+        adapter_folder = (self.directory / "voice_adapters" / voice["adapter_id"]).resolve()
+        conversation = self.client.post("/api/conversations", json={"voice_id": voice["id"]})
+        self.assertEqual(conversation.status_code, 201, conversation.text)
+        for mode in ("standard", "realtime"):
+            with self.subTest(mode=mode):
+                call_count = len(self.engine.calls)
+                reply = self.client.post(
+                    f"/api/conversations/{conversation.json()['id']}/messages",
+                    json={"content": "你好", "mode": mode},
+                )
+                self.assertEqual(reply.status_code, 202, reply.text)
+                self.assertEqual(self.wait_for_message(reply.json())["status"], "complete")
+                self.assertGreater(len(self.engine.calls), call_count)
+                self.assertTrue(all(call[1:] == (None, None) for call in self.engine.calls[call_count:]))
+                self.assertEqual(self.engine.selected[-1], adapter_folder)
+
+        rejected = self.import_adapter(voice, adapter_package())
+        self.assertEqual(rejected.status_code, 422, rejected.text)
+        self.assertEqual(len(self.client.get("/api/voices").json()), 1)
+
+    def test_tone_is_saved_per_voice_and_used_by_both_chat_modes(self):
+        reference = self.reference_voice()
+        imported = self.import_adapter(reference, adapter_package())
+        self.assertEqual(imported.status_code, 201, imported.text)
+        voice_id = imported.json()["id"]
+        endpoint = f"/api/voices/{voice_id}/tone"
+        self.assertEqual(self.client.patch(endpoint, json={"tone_preset": "unknown"}).status_code, 422)
+        update = self.client.patch(endpoint, json={"tone_preset": "gentle"})
+        self.assertEqual(update.status_code, 200, update.text)
+        self.assertEqual(update.json()["tone_preset"], "gentle")
+        self.assertEqual(self.client.get(f"/api/voices/{reference['id']}").json()["tone_preset"], "default")
+        conversation = self.client.post("/api/conversations", json={"voice_id": voice_id})
+        self.assertEqual(conversation.status_code, 201, conversation.text)
+        for mode in ("standard", "realtime"):
+            with self.subTest(mode=mode):
+                start = len(self.engine.instructions)
+                message = self.client.post(
+                    f"/api/conversations/{conversation.json()['id']}/messages",
+                    json={"content": "你好", "mode": mode},
+                )
+                self.assertEqual(message.status_code, 202, message.text)
+                self.assertEqual(self.wait_for_message(message.json())["status"], "complete")
+                self.assertGreater(len(self.engine.instructions), start)
+                self.assertEqual(set(self.engine.instructions[start:]), {VOICE_TONE_INSTRUCTIONS["gentle"]})
+
+        self.assertEqual(self.client.patch(endpoint, json={"tone_preset": "default"}).json()["tone_preset"], "default")
 
     def test_adapter_load_failure_rolls_back_files_and_rows(self):
         reference = self.reference_voice()

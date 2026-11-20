@@ -1,5 +1,4 @@
 "use strict";
-setTimeout(() => document.querySelector(".boot")?.remove(), 3100);
 const $ = id => document.getElementById(id);
 const SVG = "http://www.w3.org/2000/svg";
 const ACTIVE = new Set(["queued", "thinking", "replying", "synthesizing"]);
@@ -9,7 +8,10 @@ const state = {
   signatures: new Map(), thinking: new Map(), streams: new Map(), noStream: new Set(),
   listSignature: "", voiceSignature: "", online: false, pinned: true, stopping: null
 };
-const mobileQuery = matchMedia("(max-width: 900px)");
+let pendingPrompt = "";
+let homePreviewSignature = "";
+let indexSignature = "";
+let homeMemoryLoaded = 0;
 // Adaptive polling: fast while work is in flight, slow when idle, paused while hidden.
 const POLL_ACTIVE = 1200;
 const POLL_IDLE = 4000;
@@ -80,8 +82,8 @@ function updatePlayback() {
 }
 function activeMessage() { return state.messages.filter(message => message.role === "assistant" && ACTIVE.has(message.status)).at(-1); }
 function setView(view) {
+  if (view === "list") $("app").removeAttribute("data-intro");
   $("app").dataset.view = view;
-  if (!mobileQuery.matches) return;
   const target = view === "list"
     ? $("conversations").querySelector(".conversation.active") || $("conversations").querySelector(".conversation") || $("new-chat")
     : $("timeline");
@@ -112,6 +114,143 @@ function autosizeInput() {
   input.style.height = `${Math.min(input.scrollHeight, 160)}px`;
 }
 
+function shortDate(value) {
+  const date = new Date(value);
+  return `${String(date.getMonth() + 1).padStart(2, "0")}.${String(date.getDate()).padStart(2, "0")}`;
+}
+function clipText(value, limit = 46) {
+  const text = String(value || "").replace(/\s+/g, " ").trim();
+  return text.length > limit ? `${text.slice(0, limit)}…` : text;
+}
+function greetingText(hour = new Date().getHours()) {
+  if (hour < 5) return "夜深了";
+  if (hour < 11) return "早上好";
+  if (hour < 14) return "中午好";
+  if (hour < 18) return "下午好";
+  return "晚上好";
+}
+function primaryCharacter() { return state.characters[0] || null; }
+function primaryVoice() {
+  const character = primaryCharacter();
+  return (character && state.voices.find(voice => voice.id === character.voice_id)) || state.voices[0] || null;
+}
+function renderHome() {
+  const character = primaryCharacter();
+  const voice = primaryVoice();
+  const reference = voice?.duration ? `${voice.duration}s 参考` : "无参考录音";
+  document.querySelectorAll("[data-character-count]").forEach(element => { element.textContent = String(state.characters.length).padStart(2, "0"); });
+  document.querySelectorAll("[data-voice-count]").forEach(element => { element.textContent = String(state.voices.length).padStart(2, "0"); });
+  $("pulse-sessions").textContent = String(state.conversations.length).padStart(2, "0");
+  $("pulse-last").textContent = state.conversations.length ? `最近 ${shortDate(state.conversations[0].updated_at)}` : "还没有留下日期";
+
+  $("sidebar-voice-name").textContent = voice ? voice.name : character ? character.name : "尚未添加声音";
+  $("sidebar-voice-meta").textContent = voice ? `${reference} · 只在本机` : "添加录音或导入训练声音";
+  $("sidebar-voice-tag").textContent = state.voices.length ? `${String(state.voices.length).padStart(2, "0")} VOICES` : "VOICE";
+
+  $("composer-to").textContent = character?.name || "她";
+  $("composer-voice").textContent = voice ? `${voice.name} · ${reference}` : "等待一段声音";
+  $("home-eyebrow").textContent = character ? `${character.name} · 会生长的声音记忆` : "声音记忆";
+  $("home-lede").textContent = voice && character
+    ? `和${character.name}继续聊天，曾经聊过的事可以留在人物记忆里。`
+    : voice ? "选一个人物，或用已有的声音开始对话。" : "添加参考录音或导入训练声音后，即可开始对话。";
+
+  $("rail-monogram").textContent = character ? (character.name || "她").slice(0, 1) : "◦";
+  $("rail-character-name").textContent = character ? character.name : "还没有人物";
+  $("rail-character-meta").textContent = character ? (character.relationship || character.personality || "本地人物") : "创建人物，声音才会留下";
+  $("rail-voice-meta").querySelector("b").textContent = voice ? reference : "等待添加";
+
+  const groups = new Map();
+  for (const conversation of state.conversations) {
+    const day = shortDate(conversation.updated_at);
+    groups.set(day, (groups.get(day) || 0) + 1);
+  }
+  const rows = [...groups.entries()].slice(0, 3);
+  const signature = JSON.stringify(rows);
+  if (signature !== indexSignature) {
+    indexSignature = signature;
+    $("index-rows").replaceChildren();
+    for (const [day, count] of rows) {
+      const row = node("div");
+      row.append(node("b", "", day), node("span", "", String(count).padStart(2, "0")));
+      $("index-rows").append(row);
+    }
+    if (!rows.length) $("index-rows").append(node("p", "index-empty", "还没有可索引的回忆。"));
+  }
+  $("index-note").textContent = rows.length ? `共 ${state.conversations.length} 段 · 最近的 ${rows.length} 个日期` : "按日期归档，只统计本机已有的对话。";
+}
+function loadHomePreview() {
+  const latest = state.conversations[0];
+  $("home-resume").hidden = !latest;
+  if (!latest) {
+    homePreviewSignature = "";
+    return;
+  }
+  $("resume-date").textContent = shortDate(latest.updated_at);
+  if (homePreviewSignature === latest.id) return;
+  homePreviewSignature = latest.id;
+  $("resume-quote").textContent = latest.title;
+  api(`conversations/${latest.id}/messages`).then(messages => {
+    if (state.current || state.conversations[0]?.id !== latest.id) return;
+    const last = [...messages].reverse().find(message => message.role === "assistant" && message.content)
+      || [...messages].reverse().find(message => message.content);
+    $("resume-quote").textContent = last ? `“${clipText(last.content)}”` : "这段对话还没有留下文字。";
+  }).catch(() => {
+    if (homePreviewSignature === latest.id) homePreviewSignature = "";
+  });
+}
+async function loadHomeMemory(force = false) {
+  const character = primaryCharacter();
+  if (!character) {
+    document.querySelectorAll("[data-memory-count]").forEach(element => { element.textContent = "00"; });
+    $("rail-memory-count").textContent = "00";
+    $("rail-memory-title").textContent = "还没有记忆";
+    $("rail-memory-note").textContent = "聊过几轮后，她会慢慢记住你";
+    return;
+  }
+  if (!force && Date.now() - homeMemoryLoaded < 30000) return;
+  homeMemoryLoaded = Date.now();
+  try {
+    const data = await api(`characters/${character.id}/memories`);
+    if (character.id !== primaryCharacter()?.id) return;
+    const count = data.items.length;
+    document.querySelectorAll("[data-memory-count]").forEach(element => { element.textContent = String(count).padStart(2, "0"); });
+    $("rail-memory-count").textContent = String(count).padStart(2, "0");
+    $("rail-memory-title").textContent = count ? `${count} 条记忆` : "还没有记忆";
+    $("rail-memory-note").textContent = data.status === "updating" ? "正在从对话里提炼…" : count ? "她记得你们说过的事" : "聊过几轮后，她会慢慢记住你";
+  } catch (_) { /* Home stats stay quiet when memory is unavailable. */ }
+}
+function setHome(home) {
+  if (!home) $("app").removeAttribute("data-intro");
+  $("app").dataset.home = String(home);
+  $(home ? "home-network-start" : "chat-network").append($("neural-tree"));
+  $("top-mode").textContent = home ? "MEMORY ROOM" : "CONVERSATION";
+  setView("chat");
+}
+function goHome() {
+  pauseAudio();
+  recorder.cancel();
+  closeStreams();
+  state.noStream.clear();
+  state.current = null;
+  state.messages = [];
+  state.signatures.clear();
+  state.pinned = true;
+  homePreviewSignature = "";
+  $("messages").replaceChildren();
+  $("message-input").value = "";
+  autosizeInput();
+  setHome(true);
+  renderLists();
+  renderMessages();
+  renderHealth();
+  loadHomePreview();
+  loadHomeMemory(true);
+}
+function beginConversation(prompt = "") {
+  pendingPrompt = prompt;
+  openChat();
+}
+
 function renderLists() {
   const signature = JSON.stringify(state.conversations) + state.current;
   if (signature !== state.listSignature) {
@@ -131,7 +270,8 @@ function renderLists() {
       $("conversations").append(button);
     }
   }
-  document.querySelectorAll("[data-count]").forEach(element => { element.textContent = state.conversations.length; });
+  const total = String(state.conversations.length).padStart(2, "0");
+  document.querySelectorAll("[data-count]").forEach(element => { element.textContent = total; });
   const voicesSignature = JSON.stringify([state.voices, state.characters.map(c => [c.id, c.name])]);
   if (voicesSignature !== state.voiceSignature) {
     state.voiceSignature = voicesSignature;
@@ -148,6 +288,7 @@ function renderLists() {
   $("chat-title").textContent = conversation ? displayName(conversation) : "创建一个有声音的人物";
   $("character-settings").hidden = $("character-memories").hidden = !conversation?.character_id;
   $("chat-subtitle").textContent = conversation ? `声音：${conversation.voice_name}${conversation.character_id ? " · 虚拟人物 · 本会话设定已固定" : ""}` : "添加参考录音，选择声音开始聊天";
+  renderHome();
 }
 
 function renderHealth() {
@@ -162,7 +303,25 @@ function renderHealth() {
   $("service-status").textContent = text;
   $("service-status").classList.toggle("warning", warning);
   $("service-status").hidden = quiet;
+  if ($("app").hasAttribute("data-intro")) {
+    $("intro-status").textContent = !state.online ? "正在重连本地服务…"
+      : health?.model_status === "loading" ? "正在加载并预热语音模型…"
+      : health?.model_status === "failed" ? "语音模型加载失败"
+      : health?.stt_status === "loading" ? "正在加载语音识别模型…"
+      : "正在打开声音记忆";
+  }
   $("nav-dot").className = `nav-dot ${state.online ? (warning ? "warning" : "online") : ""}`;
+  const voiceReady = state.online && health?.model_status === "ready";
+  const setRailState = (id, active, text) => {
+    $(id).classList.toggle("active", active);
+    $(`${id}-text`).textContent = text;
+  };
+  setRailState("state-voice", voiceReady, !state.online ? "离线" : health?.model_status === "failed" ? "异常" : voiceReady ? "就绪" : "加载中");
+  setRailState("state-llm", !!health?.llm_configured, health?.llm_configured ? "已配置" : "未配置");
+  setRailState("state-local", state.online, state.online ? "已连接" : "离线");
+  $("state-label").textContent = !state.online ? "OFFLINE" : recorder.phase === "recording" ? "LISTEN" : health?.busy ? "THINKING" : "IDLE";
+  $("top-status-text").textContent = state.online ? "只在本机" : "本地服务离线";
+  $("top-status").classList.toggle("warning", !state.online);
   $("local-status").textContent = state.online ? "已连接" : "未连接";
   $("local-model").textContent = health?.model_status === "ready" ? "已加载" : health?.model_status === "failed" ? "加载失败" : "加载中";
   $("local-llm").textContent = health?.llm_configured ? "已配置" : "未配置";
@@ -174,7 +333,7 @@ function renderHealth() {
   const failedText = lastAssistant?.status === "text_failed";
   const available = state.online && !!state.current && health?.model_status === "ready" && health?.llm_configured && !health?.busy && !pending && !failedText;
   const recording = recorder.phase !== "idle";
-  $("message-input").disabled = !state.current || recording;
+  $("message-input").disabled = recording;
   $("send").disabled = !available || recording || !$("message-input").value.trim();
   $("record").disabled = recorder.phase === "transcribing" || (!recording && (!recorder.supported || !state.current || !state.online || health?.stt_status !== "ready" || health?.busy || pending || !!$("message-input").value));
   $("record").textContent = recorder.phase === "recording" ? "松开识别" : recorder.phase === "transcribing" ? "正在识别…" : "按住说话";
@@ -456,13 +615,20 @@ async function selectConversation(id) {
   state.messages = [];
   state.pinned = true;
   state.signatures.clear();
+  setHome(false);
   $("messages").replaceChildren();
   $("message-input").value = "";
   autosizeInput();
   try { localStorage.setItem("voice-current-conversation", id); } catch (_) { /* Storage can be disabled. */ }
   renderLists(); renderMessages(); renderHealth();
-  if (mobileQuery.matches) setView("chat");
   await refresh();
+  if (pendingPrompt) {
+    $("message-input").value = pendingPrompt;
+    pendingPrompt = "";
+    autosizeInput();
+    renderHealth();
+    $("message-input").focus();
+  }
 }
 async function newConversation(selection) {
   const [kind, id] = selection.includes(":") ? selection.split(":") : ["v", selection];
@@ -471,12 +637,16 @@ async function newConversation(selection) {
   await selectConversation(conversation.id);
 }
 async function refresh() {
+  const greeting = $("home-greeting");
+  const text = greetingText();
+  if (greeting.textContent !== text) greeting.textContent = text;
   const selected = state.current;
   try {
     const [health, voices, conversations, messages, characters] = await Promise.all([
       api("health"), api("voices"), api("conversations"), selected ? api(`conversations/${selected}/messages`) : Promise.resolve([]), api("characters")
     ]);
     state.health = health; state.characters = characters; state.voices = voices; state.conversations = conversations; state.online = true;
+    showStartupIntro(health.startup_id);
     if (selected === state.current) {
       state.messages = messages.map(message => state.streams.has(message.id)
         ? state.messages.find(current => current.id === message.id) || message
@@ -486,6 +656,7 @@ async function refresh() {
       }
     }
     renderLists(); renderMessages(); renderHealth();
+    if (!state.current) { loadHomePreview(); loadHomeMemory(); }
     if ($("memory-dialog").open) await loadMemories();
   } catch (error) {
     state.online = false;
@@ -495,8 +666,39 @@ async function refresh() {
 
 function openVoice() {
   $("voice-error").textContent = "";
+  const selection = $("tone-voice");
+  const chosen = selection.value || primaryVoice()?.id;
+  selection.replaceChildren(...state.voices.map(voice => new Option(voice.name, voice.id)));
+  if (state.voices.some(voice => voice.id === chosen)) selection.value = chosen;
+  $("voice-tone-settings").hidden = !state.voices.length;
+  renderVoiceTone();
   if (!$("voice-dialog").open) $("voice-dialog").showModal();
 }
+function renderVoiceTone() {
+  const selected = state.voices.find(voice => voice.id === $("tone-voice").value);
+  $("voice-tone").value = selected?.tone_preset || "default";
+  $("voice-tone-error").textContent = "";
+}
+$("tone-voice").addEventListener("change", renderVoiceTone);
+$("voice-tone-form").addEventListener("submit", async event => {
+  event.preventDefault();
+  const button = $("save-voice-tone");
+  button.disabled = true;
+  $("voice-tone-error").textContent = "";
+  try {
+    const voice = await api(`voices/${$("tone-voice").value}/tone`, {
+      method: "PATCH",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({tone_preset: $("voice-tone").value})
+    });
+    state.voices = state.voices.map(current => current.id === voice.id ? voice : current);
+    toast("说话语气已保存。");
+  } catch (error) {
+    $("voice-tone-error").textContent = error.message;
+  } finally {
+    button.disabled = false;
+  }
+});
 function openChat() {
   if (!state.voices.length) return openVoice();
   $("chat-error").textContent = "";
@@ -590,13 +792,13 @@ $("chat-transparency").addEventListener("input", event => setChatTransparency(ev
 $("add-character").addEventListener("click", () => openCharacter());
 $("new-chat").addEventListener("click", openChat);
 $("nav-voices").addEventListener("click", openVoice);
-$("nav-sessions").addEventListener("click", () => {
-  if (mobileQuery.matches) setView("list"); else openChat();
-});
-$("nav-local").addEventListener("click", () => {
+$("nav-sessions").addEventListener("click", goHome);
+function openLocalStatus() {
   renderHealth();
   if (!$("local-dialog").open) $("local-dialog").showModal();
-});
+}
+$("nav-local").addEventListener("click", openLocalStatus);
+$("top-status").addEventListener("click", openLocalStatus);
 $("nav-settings").addEventListener("click", () => {
   if ($("settings-dialog").open) return;
   $("settings-dialog").showModal();
@@ -604,16 +806,42 @@ $("nav-settings").addEventListener("click", () => {
 });
 $("brand-home").addEventListener("click", () => {
   closeDialogs();
-  if (mobileQuery.matches) setView("list");
+  goHome();
+});
+$("mobile-list").addEventListener("click", () => setView("list"));
+$("close-history").addEventListener("click", () => {
+  setView("chat");
+  $("mobile-list").focus();
+});
+$("home-voices").addEventListener("click", openVoice);
+$("home-characters").addEventListener("click", () => openLibrary());
+$("home-network-start").addEventListener("click", () => beginConversation($("message-input").value.trim()));
+$("home-resume").addEventListener("click", () => {
+  const latest = state.conversations[0];
+  if (latest) selectConversation(latest.id); else beginConversation();
+});
+$("home-character-settings").addEventListener("click", () => openLibrary());
+$("home-voice-library").addEventListener("click", openVoice);
+$("sidebar-voice").addEventListener("click", openVoice);
+$("chat-dialog").addEventListener("close", () => { if (!state.current) pendingPrompt = ""; });
+const clearAbandonedPrompt = () => setTimeout(() => {
+  if (!state.current && !$("voice-dialog").open && !$("character-dialog").open && !$("chat-dialog").open) pendingPrompt = "";
+}, 0);
+$("voice-dialog").addEventListener("close", clearAbandonedPrompt);
+$("character-dialog").addEventListener("close", clearAbandonedPrompt);
+document.addEventListener("keydown", event => {
+  if ((!event.metaKey && !event.ctrlKey) || event.shiftKey || event.key.toLowerCase() !== "n") return;
+  if (document.querySelector("dialog[open]")) return;
+  event.preventDefault();
+  beginConversation();
 });
 $("mobile-back").addEventListener("click", () => setView("list"));
 document.addEventListener("keydown", event => {
-  if (event.key !== "Escape" || !mobileQuery.matches) return;
-  if ($("app").dataset.view !== "chat" || document.querySelector("dialog[open]")) return;
-  setView("list");
+  if (event.key !== "Escape" || $("app").dataset.view !== "list" || document.querySelector("dialog[open]")) return;
+  $("close-history").click();
 });
 $("empty-add").addEventListener("click", () => state.voices.length ? openChat() : openVoice());
-document.querySelectorAll(".close-dialog").forEach(button => button.addEventListener("click", () => button.closest("dialog").close()));
+document.querySelectorAll("dialog .close-dialog").forEach(button => button.addEventListener("click", () => button.closest("dialog").close()));
 document.querySelectorAll("dialog").forEach(dialog => dialog.addEventListener("click", event => {
   if (event.target === dialog) dialog.close();
 }));
@@ -646,13 +874,12 @@ $("voice-form").addEventListener("submit", async event => {
   } finally { $("save-voice").disabled = false; $("save-voice").textContent = "保存声音"; }
 });
 function openAdapterImport() {
-  if (!state.voices.length) {
-    $("voice-error").textContent = "请先保存一段参考录音，再导入训练产物。";
-    return;
-  }
   const select = $("adapter-reference");
-  select.replaceChildren();
-  for (const voice of state.voices) select.add(new Option(voice.name, voice.id));
+  select.replaceChildren(new Option("无参考录音", ""));
+  for (const voice of state.voices) {
+    if (voice.duration > 0) select.add(new Option(voice.name, voice.id));
+  }
+  if (select.options.length > 1) select.selectedIndex = 1;
   $("adapter-error").textContent = "";
   if ($("voice-dialog").open) $("voice-dialog").close();
   if (!$("adapter-dialog").open) $("adapter-dialog").showModal();
@@ -696,6 +923,10 @@ $("chat-form").addEventListener("submit", async event => {
 });
 $("composer").addEventListener("submit", async event => {
   event.preventDefault();
+  if (!state.current) {
+    beginConversation($("message-input").value.trim());
+    return;
+  }
   if ($("send").disabled) return;
   const selected = state.current, content = $("message-input").value.trim();
   $("send").disabled = true;
@@ -755,7 +986,8 @@ $("message-input").addEventListener("keydown", event => {
 });
 function pollDelay() {
   if (!state.online) return POLL_OFFLINE;
-  return state.health?.busy || activeMessage() || recorder.phase !== "idle" ? POLL_ACTIVE : POLL_IDLE;
+  const warming = state.health?.model_status === "loading" || state.health?.stt_status === "loading";
+  return warming || state.health?.busy || activeMessage() || recorder.phase !== "idle" ? POLL_ACTIVE : POLL_IDLE;
 }
 function schedulePoll(delay = pollDelay()) {
   clearTimeout(pollTimer);
@@ -778,13 +1010,22 @@ function startPolling() {
   });
   schedulePoll();
 }
+function showStartupIntro(startupId) {
+  const app = $("app");
+  if (!startupId || app.dataset.home !== "true" || app.dataset.view !== "chat" ||
+      matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+  try {
+    if (localStorage.getItem("voice-startup-intro") === startupId) return;
+    localStorage.setItem("voice-startup-intro", startupId);
+  } catch (_) { return; }
+  app.setAttribute("data-intro", "");
+  setTimeout(() => app.removeAttribute("data-intro"), 3600);
+}
+
 async function start() {
   await refresh();
-  let saved;
-  try { saved = localStorage.getItem("voice-current-conversation"); } catch (_) { /* Storage can be disabled. */ }
-  const conversation = state.conversations.find(c => c.id === saved) || state.conversations[0];
-  if (conversation) await selectConversation(conversation.id);
-  else setView("list");
+  renderMessages();
+  renderHealth();
   startPolling();
 }
 

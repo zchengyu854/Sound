@@ -192,7 +192,9 @@ uv run --python 3.12 --with-requirements requirements-ubuntu.txt \
 
 控制台上传 multipart 字段 `task` 指向的冻结任务 ZIP，完成后从对应任务下载结果 ZIP。`TRAINING_WEB_HOST`、`TRAINING_WEB_PORT`、`TRAINING_DATA_DIR`、`BREEZE_BASE_DIR` 和 `TRAINING_MAX_UPLOAD_BYTES` 用于配置监听、任务数据、基座缓存和上传上限。
 
-Mac 不提交或控制 Ubuntu 训练任务。Ubuntu 完成训练后，用户下载仅含 `result.json` 和 `adapter.safetensors` 的 `result.zip`，在 Mac 主页面选择已有参考声音并导入。Mac 会校验包结构、配方版本、基座型号、adapter 摘要和本地基座权重摘要，随后复制参考 WAV 与原文，创建独立声音并加载 adapter。原声音不被改写，导入后的声音可直接建立会话并用于语音合成。
+Mac 不提交或控制 Ubuntu 训练任务。Ubuntu 完成训练后，下载仅含 `result.json` 和 `adapter.safetensors` 的 `result.zip`，在 Mac 主页面的「声音」中导入训练声音。可绑定已有参考声音，也可选「无参考录音」。两种模式都需要兼容的 Breeze 基座，都会校验包结构、配方版本、基座型号、adapter 摘要和本地基座权重摘要。绑定模式会复制参考 WAV 与原文，无参考模式直接使用基座加 LoRA 按文本合成。两种模式各自创建独立声音档案，可分别用于普通和实时对话。
+
+在首页「声音」→「说话语气」可为已有声音选择「轻柔克制」或「原始语气」。设置适用于该声音之后生成的普通和实时语音，已有音频保持原样。
 
 当前没有跨机任务调度、远端训练控制和 A/B 工作台，也不需要这些能力来完成“Ubuntu 训练、Mac 使用产物”。现有旧训练声音仍按原 `model_id` 兼容加载。导入只证明训练产物已通过格式校验并能被本机模型加载，不代替主观音色验收。
 
