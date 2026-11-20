@@ -29,13 +29,17 @@
         <button class="nav-link mobile-list" id="mobile-list" type="button" aria-label="打开回忆列表"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h10"/></svg><span>回忆</span></button>
         <button class="nav-link home-nav" id="home-voices" type="button">声音</button>
         <button class="nav-link home-nav" id="home-characters" type="button">人物</button>
-        <span class="status" id="top-status"><i aria-hidden="true"></i><span id="top-status-text">LOCAL / PRIVATE</span></span>
+        <button class="status" id="top-status" type="button" aria-label="查看本地服务状态" aria-haspopup="dialog" aria-controls="local-dialog"><i aria-hidden="true"></i><span id="top-status-text">只在本机</span></button>
         <button class="nav-link settings-button" id="nav-settings" type="button" aria-label="设置" aria-haspopup="dialog" aria-controls="settings-dialog" title="设置"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h6m4 0h6M4 17h10m4 0h2"/><circle cx="12" cy="7" r="2"/><circle cx="16" cy="17" r="2"/></svg><span>设置</span></button>
       </div>
     </header>
 
     <div class="workspace">
       <aside class="sidebar" aria-label="回忆与会话">
+        <div class="drawer-heading home-history-heading">
+          <h2>回忆</h2>
+          <button class="close-dialog" id="close-history" type="button" aria-label="返回首页"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18 6L6 18M6 6l12 12"/></svg></button>
+        </div>
         <button class="new-session" id="new-chat" type="button" aria-label="开始一段新的对话"><span class="plus" aria-hidden="true">＋</span><span>开始一段对话</span><span class="shortcut" aria-hidden="true">⌘N</span></button>
         <button class="rail-add" id="add-character" type="button">＋ 创建人物</button>
 
@@ -59,6 +63,7 @@
       </aside>
 
       <main class="chat">
+        <div class="chat-network" id="chat-network" aria-hidden="true"></div>
         <header class="chat-header">
           <button class="mobile-back" id="mobile-back" type="button" aria-label="返回回忆列表"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 18l-6-6 6-6"/></svg><span>回忆</span></button>
           <div class="chat-heading"><h2 id="chat-title">开始一段对话</h2><p id="chat-subtitle">添加参考录音，选择声音开始聊天</p></div>
@@ -81,7 +86,7 @@
 
               <figure class="home-network">
                 <button id="home-network-start" type="button" aria-label="开始一段对话">
-                <svg class="neural-tree" viewBox="0 0 680 410" aria-hidden="true">
+                <svg class="neural-tree" id="neural-tree" viewBox="0 0 680 410" aria-hidden="true">
                   <defs>
                     <linearGradient id="neural-gradient" x1="0" y1="0" x2="1" y2="1">
                       <stop offset="0" stop-color="#709ba6"/>
@@ -93,7 +98,7 @@
                       <stop offset="1" stop-color="#93c1cc" stop-opacity="0"/>
                     </radialGradient>
                   </defs>
-                  <circle cx="310" cy="195" r="180" fill="url(#neural-halo)"/>
+                  <circle class="neural-halo" cx="310" cy="195" r="180" fill="url(#neural-halo)"/>
                   <g class="neural-line strong">
                     <path d="M310 354C307 308 307 265 306 217"/>
                     <path d="M306 217C274 187 244 174 207 158"/>
@@ -191,10 +196,11 @@
                     <circle class="neural-node warm" cx="171" cy="327" r="1.8"/>
                     <circle class="neural-node" cx="443" cy="333" r="1.8"/>
                   </g>
-                  <path class="neural-wave" d="M216 334H251L259 326L268 346L277 319L286 351L295 327L304 340L314 333H351L360 320L369 348L378 328L387 337L396 333H424"/>
+                  <path class="neural-wave" pathLength="1" d="M216 334H251L259 326L268 346L277 319L286 351L295 327L304 340L314 333H351L360 320L369 348L378 328L387 337L396 333H424"/>
                 </svg>
                 </button>
                 <figcaption>神经网络记忆 · 每一次交流都会长出新的连接</figcaption>
+                <p class="intro-status" id="intro-status" aria-hidden="true">正在连接本地服务…</p>
               </figure>
             </div>
 
@@ -215,7 +221,6 @@
           <textarea id="message-input" maxlength="2000" placeholder="想说什么，就写下来…" rows="1" disabled></textarea>
           <p id="recording-status" class="recording-status" role="status" aria-live="polite"></p>
           <div class="composer-bottom">
-            <span id="composer-hint">聊天文字会发送至你配置的大模型服务</span>
             <div class="composer-actions">
               <button type="submit" class="home-start" id="home-start">开始对话<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h14M13 6l6 6-6 6"/></svg></button>
               <button type="button" class="record-button" id="record" aria-label="按住录音，松开识别，最长30秒" disabled>按住说话</button>
@@ -224,7 +229,7 @@
             </div>
           </div>
         </form>
-        <p class="home-privacy">参考录音与语音合成不离开本机</p>
+        <p class="home-privacy"><span>参考录音与语音合成不离开本机</span><span id="composer-hint">聊天文字会发送至你配置的大模型服务</span></p>
       </main>
 
       <aside class="memory-rail" aria-label="她的声音与回忆">
@@ -288,24 +293,37 @@
   </div>
 
   <dialog id="voice-dialog" class="drawer" aria-labelledby="voice-dialog-title">
+    <div class="drawer-heading"><h2 id="voice-dialog-title">声音</h2><button type="button" class="close-dialog" aria-label="关闭"><svg viewBox="0 0 24 24"><path d="M18 6L6 18M6 6l12 12"/></svg></button></div>
+    <details class="voice-tone-settings" id="voice-tone-settings" hidden>
+      <summary>说话语气</summary>
+      <form id="voice-tone-form">
+        <label for="tone-voice">声音</label><select id="tone-voice" required></select>
+        <label for="voice-tone">语气</label>
+        <select id="voice-tone">
+          <option value="default">原始语气</option>
+          <option value="gentle">轻柔克制</option>
+        </select>
+        <button class="primary wide" id="save-voice-tone" type="submit">保存语气</button>
+        <p id="voice-tone-error" class="error" role="alert"></p>
+      </form>
+    </details>
     <form id="voice-form">
-      <div class="drawer-heading"><div><p class="drawer-kicker">VOICE LIBRARY</p><h2 id="voice-dialog-title" class="font-orbitron">ADD VOICE</h2></div><button type="button" class="close-dialog" aria-label="关闭"><svg viewBox="0 0 24 24"><path d="M18 6L6 18M6 6l12 12"/></svg></button></div>
       <p class="dialog-intro">使用本人或已获授权的声音。选择安静环境下、只有一位说话者的清晰录音。</p>
       <label for="voice-name">声音名称</label><input id="voice-name" name="name" maxlength="60" required placeholder="例如：我的声音">
       <label for="voice-file">参考录音 <span>PCM WAV，3–30 秒，≤10 MB</span></label><input id="voice-file" name="recording" type="file" accept=".wav,audio/wav,audio/x-wav" required>
       <label for="voice-transcript">录音原文</label><textarea id="voice-transcript" name="transcript" maxlength="2000" rows="4" required placeholder="逐字填写录音中说出的内容，不要填写希望 AI 说的话。"></textarea>
       <p class="form-note">保存后分配独立 UUID。此标识代表声音档案，音色通过参考录音生成，相似度需要试听确认。</p>
       <p id="voice-error" class="error" role="alert"></p><button class="primary wide" id="save-voice" type="submit">保存声音</button>
-      <button class="quiet wide" id="open-adapter-import" type="button">已有训练产物？绑定到参考声音</button>
+      <button class="quiet wide" id="open-adapter-import" type="button">导入训练声音</button>
     </form>
   </dialog>
 
   <dialog id="adapter-dialog" class="drawer" aria-labelledby="adapter-dialog-title">
     <form id="adapter-form">
-      <div class="drawer-heading"><div><p class="drawer-kicker">TRAINED ARTIFACT</p><h2 id="adapter-dialog-title" class="font-orbitron">IMPORT VOICE</h2></div><button type="button" class="close-dialog" aria-label="关闭"><svg viewBox="0 0 24 24"><path d="M18 6L6 18M6 6l12 12"/></svg></button></div>
-      <p class="dialog-intro">选择 Ubuntu 导出的 result.zip，并绑定一个已有声音作为参考录音和原文。导入后生成独立声音档案。</p>
+      <div class="drawer-heading"><h2 id="adapter-dialog-title">导入训练声音</h2><button type="button" class="close-dialog" aria-label="关闭"><svg viewBox="0 0 24 24"><path d="M18 6L6 18M6 6l12 12"/></svg></button></div>
+      <p class="dialog-intro">选择 Ubuntu 导出的 result.zip。LoRA 权重需加载到兼容的 Breeze 基座，参考录音可选。</p>
       <label for="adapter-name">新声音名称</label><input id="adapter-name" name="name" maxlength="60" required placeholder="例如：我的声音 · 训练版">
-      <label for="adapter-reference">参考声音</label><select id="adapter-reference" name="reference_voice_id" required></select>
+      <label for="adapter-reference">参考声音</label><select id="adapter-reference" name="reference_voice_id"><option value="">无参考录音</option></select>
       <label for="adapter-file">训练结果 ZIP <span>adapter + result.json，≤41 MiB</span></label><input id="adapter-file" name="artifact" type="file" accept=".zip,application/zip" required>
       <p class="form-note">Mac 不执行训练。导入时校验产物结构、adapter 摘要、基座型号和权重摘要，首次试听会加载 adapter。原参考声音保持不变。</p>
       <p id="adapter-error" class="error" role="alert"></p><button class="primary wide" id="import-adapter" type="submit">导入并使用</button>
@@ -314,14 +332,14 @@
 
   <dialog id="chat-dialog" class="drawer" aria-labelledby="chat-dialog-title">
     <form id="chat-form">
-      <div class="drawer-heading"><div><p class="drawer-kicker">SESSIONS</p><h2 id="chat-dialog-title" class="font-orbitron">NEW SESSION</h2></div><button type="button" class="close-dialog" aria-label="关闭"><svg viewBox="0 0 24 24"><path d="M18 6L6 18M6 6l12 12"/></svg></button></div>
+      <div class="drawer-heading"><h2 id="chat-dialog-title">新对话</h2><button type="button" class="close-dialog" aria-label="关闭"><svg viewBox="0 0 24 24"><path d="M18 6L6 18M6 6l12 12"/></svg></button></div>
       <p class="dialog-intro">选择人物开始聊天。人物设定与声音在创建会话时固定；长期记忆跨会话共享。</p>
       <label for="new-voice-select">选择人物或声音</label><select id="new-voice-select" required></select><p id="chat-error" class="error" role="alert"></p><button type="submit" class="primary wide">开始对话</button>
     </form>
   </dialog>
 
   <dialog id="local-dialog" class="drawer" aria-labelledby="local-dialog-title">
-    <div class="drawer-heading"><div><p class="drawer-kicker">LOCAL</p><h2 id="local-dialog-title" class="font-orbitron">LOCAL STATUS</h2></div><button type="button" class="close-dialog" aria-label="关闭"><svg viewBox="0 0 24 24"><path d="M18 6L6 18M6 6l12 12"/></svg></button></div>
+    <div class="drawer-heading"><h2 id="local-dialog-title">本地状态</h2><button type="button" class="close-dialog" aria-label="关闭"><svg viewBox="0 0 24 24"><path d="M18 6L6 18M6 6l12 12"/></svg></button></div>
     <p class="dialog-intro">这台 Mac 上的声音服务状态。</p>
     <div class="status-row"><span>服务</span><strong id="local-status">正在连接…</strong></div>
     <div class="status-row"><span>语音模型</span><strong id="local-model">加载中</strong></div>
@@ -329,11 +347,10 @@
     <div class="status-row"><span>语音识别</span><strong id="local-stt">加载中</strong></div>
     <div class="status-row"><span>任务</span><strong id="local-busy">空闲</strong></div>
     <p class="privacy-note">聊天文字、人物设定及相关记忆会发送至配置的 LLM；参考录音与语音合成留在本机。页面字体与背景图来自 Google Fonts / Higgs，首次加载需要联网。</p>
-    <p class="drawer-footer">VOICE˚ © 2026 — LOCAL VOICE CHAT</p>
   </dialog>
 
   <dialog id="settings-dialog" class="drawer" aria-labelledby="app-settings-title">
-    <div class="drawer-heading"><div><p class="drawer-kicker">SETTINGS</p><h2 id="app-settings-title">设置</h2></div><button type="button" class="close-dialog" aria-label="关闭设置"><svg viewBox="0 0 24 24"><path d="M18 6L6 18M6 6l12 12"/></svg></button></div>
+    <div class="drawer-heading"><h2 id="app-settings-title">设置</h2><button type="button" class="close-dialog" aria-label="关闭设置"><svg viewBox="0 0 24 24"><path d="M18 6L6 18M6 6l12 12"/></svg></button></div>
     <p class="dialog-intro">配置聊天大模型与界面显示。</p>
     <section class="llm-setting" aria-labelledby="llm-title">
       <h3 id="llm-title">大模型</h3>
@@ -358,10 +375,10 @@
     </section>
     <section class="appearance-setting" aria-labelledby="appearance-title">
       <h3 id="appearance-title">界面显示</h3>
-      <label for="chat-transparency">聊天面板透明度 <output id="chat-transparency-value" for="chat-transparency">35%</output></label>
+      <label for="chat-transparency">回复气泡透明度 <output id="chat-transparency-value" for="chat-transparency">35%</output></label>
       <input id="chat-transparency" type="range" min="0" max="85" step="5" value="35" aria-describedby="chat-transparency-hint">
       <div class="range-labels" aria-hidden="true"><span>不透明</span><span>更透明</span></div>
-      <p id="chat-transparency-hint">只调整聊天区域的背景，文字保持清晰。设置会保存在当前浏览器。</p>
+      <p id="chat-transparency-hint">调整回复气泡的背景，文字保持清晰。设置会保存在当前浏览器。</p>
     </section>
   </dialog>
 

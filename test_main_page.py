@@ -107,6 +107,14 @@ class MainPageTests(unittest.TestCase):
         rejected = self.client.post("/api/voices", headers={"Origin": "https://other.example"})
         self.assertEqual(rejected.status_code, 403)
 
+    def test_startup_id_stays_stable_until_application_restart(self):
+        startup_id = self.client.get("/api/health").json()["startup_id"]
+        self.assertTrue(startup_id)
+        self.assertEqual(self.client.get("/api/health").json()["startup_id"], startup_id)
+        restarted = create_app(Path(self.temp.name) / "restarted", Engine(), transcriber=Transcriber())
+        with TestClient(restarted, base_url="http://127.0.0.1") as client:
+            self.assertNotEqual(client.get("/api/health").json()["startup_id"], startup_id)
+
 
 if __name__ == "__main__":
     unittest.main()

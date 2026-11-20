@@ -1,5 +1,4 @@
 "use strict";
-setTimeout(() => document.querySelector(".boot")?.remove(), 3100);
 const $ = id => document.getElementById(id);
 const SVG = "http://www.w3.org/2000/svg";
 const ACTIVE = new Set(["queued", "thinking", "replying", "synthesizing"]);
@@ -13,7 +12,6 @@ let pendingPrompt = "";
 let homePreviewSignature = "";
 let indexSignature = "";
 let homeMemoryLoaded = 0;
-const mobileQuery = matchMedia("(max-width: 900px)");
 // Adaptive polling: fast while work is in flight, slow when idle, paused while hidden.
 const POLL_ACTIVE = 1200;
 const POLL_IDLE = 4000;
@@ -84,8 +82,8 @@ function updatePlayback() {
 }
 function activeMessage() { return state.messages.filter(message => message.role === "assistant" && ACTIVE.has(message.status)).at(-1); }
 function setView(view) {
+  if (view === "list") $("app").removeAttribute("data-intro");
   $("app").dataset.view = view;
-  if (!mobileQuery.matches && $("app").dataset.home !== "true") return;
   const target = view === "list"
     ? $("conversations").querySelector(".conversation.active") || $("conversations").querySelector(".conversation") || $("new-chat")
     : $("timeline");
@@ -139,26 +137,27 @@ function primaryVoice() {
 function renderHome() {
   const character = primaryCharacter();
   const voice = primaryVoice();
+  const reference = voice?.duration ? `${voice.duration}s 参考` : "无参考录音";
   document.querySelectorAll("[data-character-count]").forEach(element => { element.textContent = String(state.characters.length).padStart(2, "0"); });
   document.querySelectorAll("[data-voice-count]").forEach(element => { element.textContent = String(state.voices.length).padStart(2, "0"); });
   $("pulse-sessions").textContent = String(state.conversations.length).padStart(2, "0");
   $("pulse-last").textContent = state.conversations.length ? `最近 ${shortDate(state.conversations[0].updated_at)}` : "还没有留下日期";
 
   $("sidebar-voice-name").textContent = voice ? voice.name : character ? character.name : "尚未添加声音";
-  $("sidebar-voice-meta").textContent = voice ? `${voice.duration || "—"}s 参考 · 只在本机` : "添加一段参考录音，让声音留下来";
+  $("sidebar-voice-meta").textContent = voice ? `${reference} · 只在本机` : "添加录音或导入训练声音";
   $("sidebar-voice-tag").textContent = state.voices.length ? `${String(state.voices.length).padStart(2, "0")} VOICES` : "VOICE";
 
   $("composer-to").textContent = character?.name || "她";
-  $("composer-voice").textContent = voice ? `${voice.name}${voice.duration ? ` · ${voice.duration}s 参考` : ""}` : "等待一段声音";
+  $("composer-voice").textContent = voice ? `${voice.name} · ${reference}` : "等待一段声音";
   $("home-eyebrow").textContent = character ? `${character.name} · 会生长的声音记忆` : "声音记忆";
   $("home-lede").textContent = voice && character
     ? `和${character.name}继续聊天，曾经聊过的事可以留在人物记忆里。`
-    : voice ? "选一个人物，或用已有的声音开始对话。" : "先添加一段参考录音，就能开始对话。";
+    : voice ? "选一个人物，或用已有的声音开始对话。" : "添加参考录音或导入训练声音后，即可开始对话。";
 
   $("rail-monogram").textContent = character ? (character.name || "她").slice(0, 1) : "◦";
   $("rail-character-name").textContent = character ? character.name : "还没有人物";
   $("rail-character-meta").textContent = character ? (character.relationship || character.personality || "本地人物") : "创建人物，声音才会留下";
-  $("rail-voice-meta").querySelector("b").textContent = voice ? `${voice.duration || "—"}s 参考` : "等待添加";
+  $("rail-voice-meta").querySelector("b").textContent = voice ? reference : "等待添加";
 
   const groups = new Map();
   for (const conversation of state.conversations) {
@@ -221,7 +220,9 @@ async function loadHomeMemory(force = false) {
   } catch (_) { /* Home stats stay quiet when memory is unavailable. */ }
 }
 function setHome(home) {
+  if (!home) $("app").removeAttribute("data-intro");
   $("app").dataset.home = String(home);
+  $(home ? "home-network-start" : "chat-network").append($("neural-tree"));
   $("top-mode").textContent = home ? "MEMORY ROOM" : "CONVERSATION";
   setView("chat");
 }
@@ -302,6 +303,13 @@ function renderHealth() {
   $("service-status").textContent = text;
   $("service-status").classList.toggle("warning", warning);
   $("service-status").hidden = quiet;
+  if ($("app").hasAttribute("data-intro")) {
+    $("intro-status").textContent = !state.online ? "正在重连本地服务…"
+      : health?.model_status === "loading" ? "正在加载并预热语音模型…"
+      : health?.model_status === "failed" ? "语音模型加载失败"
+      : health?.stt_status === "loading" ? "正在加载语音识别模型…"
+      : "正在打开声音记忆";
+  }
   $("nav-dot").className = `nav-dot ${state.online ? (warning ? "warning" : "online") : ""}`;
   const voiceReady = state.online && health?.model_status === "ready";
   const setRailState = (id, active, text) => {
@@ -613,7 +621,6 @@ async function selectConversation(id) {
   autosizeInput();
   try { localStorage.setItem("voice-current-conversation", id); } catch (_) { /* Storage can be disabled. */ }
   renderLists(); renderMessages(); renderHealth();
-  if (mobileQuery.matches) setView("chat");
   await refresh();
   if (pendingPrompt) {
     $("message-input").value = pendingPrompt;
@@ -639,6 +646,7 @@ async function refresh() {
       api("health"), api("voices"), api("conversations"), selected ? api(`conversations/${selected}/messages`) : Promise.resolve([]), api("characters")
     ]);
     state.health = health; state.characters = characters; state.voices = voices; state.conversations = conversations; state.online = true;
+    showStartupIntro(health.startup_id);
     if (selected === state.current) {
       state.messages = messages.map(message => state.streams.has(message.id)
         ? state.messages.find(current => current.id === message.id) || message
@@ -658,8 +666,39 @@ async function refresh() {
 
 function openVoice() {
   $("voice-error").textContent = "";
+  const selection = $("tone-voice");
+  const chosen = selection.value || primaryVoice()?.id;
+  selection.replaceChildren(...state.voices.map(voice => new Option(voice.name, voice.id)));
+  if (state.voices.some(voice => voice.id === chosen)) selection.value = chosen;
+  $("voice-tone-settings").hidden = !state.voices.length;
+  renderVoiceTone();
   if (!$("voice-dialog").open) $("voice-dialog").showModal();
 }
+function renderVoiceTone() {
+  const selected = state.voices.find(voice => voice.id === $("tone-voice").value);
+  $("voice-tone").value = selected?.tone_preset || "default";
+  $("voice-tone-error").textContent = "";
+}
+$("tone-voice").addEventListener("change", renderVoiceTone);
+$("voice-tone-form").addEventListener("submit", async event => {
+  event.preventDefault();
+  const button = $("save-voice-tone");
+  button.disabled = true;
+  $("voice-tone-error").textContent = "";
+  try {
+    const voice = await api(`voices/${$("tone-voice").value}/tone`, {
+      method: "PATCH",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({tone_preset: $("voice-tone").value})
+    });
+    state.voices = state.voices.map(current => current.id === voice.id ? voice : current);
+    toast("说话语气已保存。");
+  } catch (error) {
+    $("voice-tone-error").textContent = error.message;
+  } finally {
+    button.disabled = false;
+  }
+});
 function openChat() {
   if (!state.voices.length) return openVoice();
   $("chat-error").textContent = "";
@@ -754,10 +793,12 @@ $("add-character").addEventListener("click", () => openCharacter());
 $("new-chat").addEventListener("click", openChat);
 $("nav-voices").addEventListener("click", openVoice);
 $("nav-sessions").addEventListener("click", goHome);
-$("nav-local").addEventListener("click", () => {
+function openLocalStatus() {
   renderHealth();
   if (!$("local-dialog").open) $("local-dialog").showModal();
-});
+}
+$("nav-local").addEventListener("click", openLocalStatus);
+$("top-status").addEventListener("click", openLocalStatus);
 $("nav-settings").addEventListener("click", () => {
   if ($("settings-dialog").open) return;
   $("settings-dialog").showModal();
@@ -768,6 +809,10 @@ $("brand-home").addEventListener("click", () => {
   goHome();
 });
 $("mobile-list").addEventListener("click", () => setView("list"));
+$("close-history").addEventListener("click", () => {
+  setView("chat");
+  $("mobile-list").focus();
+});
 $("home-voices").addEventListener("click", openVoice);
 $("home-characters").addEventListener("click", () => openLibrary());
 $("home-network-start").addEventListener("click", () => beginConversation($("message-input").value.trim()));
@@ -792,12 +837,11 @@ document.addEventListener("keydown", event => {
 });
 $("mobile-back").addEventListener("click", () => setView("list"));
 document.addEventListener("keydown", event => {
-  if (event.key !== "Escape" || !mobileQuery.matches) return;
-  if ($("app").dataset.view !== "chat" || document.querySelector("dialog[open]")) return;
-  setView("list");
+  if (event.key !== "Escape" || $("app").dataset.view !== "list" || document.querySelector("dialog[open]")) return;
+  $("close-history").click();
 });
 $("empty-add").addEventListener("click", () => state.voices.length ? openChat() : openVoice());
-document.querySelectorAll(".close-dialog").forEach(button => button.addEventListener("click", () => button.closest("dialog").close()));
+document.querySelectorAll("dialog .close-dialog").forEach(button => button.addEventListener("click", () => button.closest("dialog").close()));
 document.querySelectorAll("dialog").forEach(dialog => dialog.addEventListener("click", event => {
   if (event.target === dialog) dialog.close();
 }));
@@ -830,13 +874,12 @@ $("voice-form").addEventListener("submit", async event => {
   } finally { $("save-voice").disabled = false; $("save-voice").textContent = "保存声音"; }
 });
 function openAdapterImport() {
-  if (!state.voices.length) {
-    $("voice-error").textContent = "请先保存一段参考录音，再导入训练产物。";
-    return;
-  }
   const select = $("adapter-reference");
-  select.replaceChildren();
-  for (const voice of state.voices) select.add(new Option(voice.name, voice.id));
+  select.replaceChildren(new Option("无参考录音", ""));
+  for (const voice of state.voices) {
+    if (voice.duration > 0) select.add(new Option(voice.name, voice.id));
+  }
+  if (select.options.length > 1) select.selectedIndex = 1;
   $("adapter-error").textContent = "";
   if ($("voice-dialog").open) $("voice-dialog").close();
   if (!$("adapter-dialog").open) $("adapter-dialog").showModal();
@@ -943,7 +986,8 @@ $("message-input").addEventListener("keydown", event => {
 });
 function pollDelay() {
   if (!state.online) return POLL_OFFLINE;
-  return state.health?.busy || activeMessage() || recorder.phase !== "idle" ? POLL_ACTIVE : POLL_IDLE;
+  const warming = state.health?.model_status === "loading" || state.health?.stt_status === "loading";
+  return warming || state.health?.busy || activeMessage() || recorder.phase !== "idle" ? POLL_ACTIVE : POLL_IDLE;
 }
 function schedulePoll(delay = pollDelay()) {
   clearTimeout(pollTimer);
@@ -966,12 +1010,22 @@ function startPolling() {
   });
   schedulePoll();
 }
+function showStartupIntro(startupId) {
+  const app = $("app");
+  if (!startupId || app.dataset.home !== "true" || app.dataset.view !== "chat" ||
+      matchMedia("(prefers-reduced-motion: reduce)").matches) return;
+  try {
+    if (localStorage.getItem("voice-startup-intro") === startupId) return;
+    localStorage.setItem("voice-startup-intro", startupId);
+  } catch (_) { return; }
+  app.setAttribute("data-intro", "");
+  setTimeout(() => app.removeAttribute("data-intro"), 3600);
+}
+
 async function start() {
   await refresh();
-  setHome(true);
   renderMessages();
   renderHealth();
-  if (mobileQuery.matches) setView("chat");
   startPolling();
 }
 

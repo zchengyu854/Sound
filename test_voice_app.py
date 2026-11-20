@@ -55,6 +55,7 @@ class Engine:
         self.fail = False
         self.warning = ""
         self.calls = []
+        self.instructions = []
         self.threads = []
 
     def load(self):
@@ -63,9 +64,10 @@ class Engine:
     def close(self):
         self.threads.append(threading.get_ident())
 
-    def synthesize(self, text, reference, transcript, target, check=lambda: None, on_pcm=None):
+    def synthesize(self, text, reference, transcript, target, check=lambda: None, on_pcm=None, *, instruct=None):
         self.threads.append(threading.get_ident())
         self.calls.append((text, reference, transcript))
+        self.instructions.append(instruct)
         target.write_bytes(wav_bytes())
         if on_pcm:
             with wave.open(str(target)) as audio:
