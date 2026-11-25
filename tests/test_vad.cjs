@@ -86,4 +86,44 @@ check("reset clears state but keeps last result", () => {
   assert.strictEqual(vad.samples(), before);
 });
 
+check("calibration learns quiet background and stops when the user speaks", () => {
+  const vad = new VoiceVad({calibrationMs: 1000});
+  for (let i = 0; i < 20; i++) vad.push(frame(200));
+  assert.strictEqual(vad.calibrating, true);
+  assert.ok(vad.noise > 190 && vad.noise < 210);
+  let starts = 0;
+  for (let i = 0; i < 8; i++) if (vad.push(frame(2000)) === "start") starts++;
+  assert.strictEqual(vad.calibrating, false);
+  assert.strictEqual(starts, 1);
+  assert.strictEqual(vad.continuousSpeechMs, 160);
+  for (let i = 0; i < 10; i++) vad.push(frame(2000));
+  assert.strictEqual(vad.continuousSpeechMs, 360);
+  vad.push(frame(200));
+  assert.strictEqual(vad.continuousSpeechMs, 0);
+});
+
+check("one second of calibration finishes without generating a turn", () => {
+  const vad = new VoiceVad({calibrationMs: 1000});
+  for (let i = 0; i < 50; i++) assert.strictEqual(vad.push(frame(80)), null);
+  assert.strictEqual(vad.calibrating, false);
+  assert.strictEqual(vad.phase, "idle");
+});
+
+check("slow-pause settings apply at the next utterance boundary", () => {
+  const vad = new VoiceVad();
+  for (let i = 0; i < 30; i++) vad.push(frame(2000));
+  vad.configure({endMs: 1100, minMs: 150});
+  assert.strictEqual(vad.endMs, 700);
+  for (let i = 0; i < 35; i++) vad.push(frame(0));
+  assert.strictEqual(vad.endMs, 1100);
+  assert.strictEqual(vad.minMs, 150);
+  for (let i = 0; i < 30; i++) vad.push(frame(2000));
+  for (let i = 0; i < 35; i++) assert.notStrictEqual(vad.push(frame(0)), "end");
+  let end;
+  for (let i = 0; i < 20; i++) end = vad.push(frame(0));
+  assert.strictEqual(end, "end");
+  assert.strictEqual(vad.resultVoicedMs, 600);
+  assert.throws(() => vad.configure({endMs: NaN}), /无效/);
+});
+
 console.log(`VAD checks passed: ${passed}`);

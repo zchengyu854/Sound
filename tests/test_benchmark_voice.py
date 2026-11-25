@@ -2,7 +2,10 @@
 import sqlite3
 import tempfile
 import unittest
+from contextlib import redirect_stderr
+from io import StringIO
 from pathlib import Path
+from unittest.mock import patch
 
 import benchmark_voice as bench
 
@@ -44,15 +47,17 @@ class BenchmarkTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             engine = FakeEngine([2.0, 2.0, 4.0])
             cases, cold = bench.run_cases(engine, "ref.wav", "原文",
-                                          [("短句", "你好。")], 3, directory)
-            self.assertEqual(len(cases), 1)
+                                          [("短句", "你好。"), ("中句", "你好。")], 3, directory)
+            self.assertEqual(len(cases), 2)
             self.assertEqual(len(cases[0]["runs"]), 3)
             self.assertEqual(cold["case"], "短句")
             self.assertIsNotNone(cold["rtf"])
             self.assertTrue(all(run["rtf"] is not None for run in cases[0]["runs"]))
             self.assertTrue(all(run["audio_seconds"] == 2.0 or run["audio_seconds"] == 4.0
                                 for run in cases[0]["runs"]))
-            self.assertEqual(cases[0]["warm"]["rtf"]["count"], 3)
+            self.assertEqual(cases[0]["warm"]["rtf"]["raw"], [run["rtf"] for run in cases[0]["runs"][1:]])
+            self.assertEqual(cases[0]["warm"]["rtf"]["count"], 2)
+            self.assertEqual(cases[1]["warm"]["rtf"]["count"], 3)
             self.assertIsNotNone(cases[0]["warm"]["first_audio_ms"]["median"])
 
     def test_missing_first_chunk_is_tolerated(self):
@@ -70,6 +75,16 @@ class BenchmarkTests(unittest.TestCase):
         self.assertIn("| 用例 | 轮次 | 音频秒 | 合成毫秒 | 首块毫秒 | RTF |", table)
         self.assertIn("| 用例 | 样本数 | RTF 原始值 | 中位数 | 最大值 | 首块中位数 |", table)
         self.assertIn("| 短句 | 1 | 2.00 |", table)
+
+    def test_single_run_does_not_claim_realtime_without_warm_short_sample(self):
+        engine = FakeEngine([2.0])
+        engine.load = lambda: None
+        engine.close = lambda: None
+        with tempfile.TemporaryDirectory() as directory, patch("voice_app.Breeze", return_value=engine):
+            output = StringIO()
+            with redirect_stderr(output):
+                bench.main(["--reference", "ref.wav", "--transcript", "原文", "--runs", "1", "--out", directory])
+            self.assertIn("热态样本不足", output.getvalue())
 
     def test_load_voice_reads_transcript_recording_and_adapter(self):
         with tempfile.TemporaryDirectory() as directory:

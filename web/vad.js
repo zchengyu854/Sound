@@ -21,18 +21,35 @@
       this.maxMs = options.maxMs ?? MAX_MS;
       this.minMs = options.minMs ?? MIN_MS;
       this.threshold = options.threshold ?? 180; // initial RMS on 0..32767 scale
+      this.calibrationMs = options.calibrationMs ?? 0;
+      this.calibrating = this.calibrationMs > 0;
+      this.calibrationFrames = 0;
+      this.calibrationTotal = 0;
+      this.pendingOptions = null;
       this.result = null;
       this.reset();
+    }
+
+    configure(options) {
+      for (const [key, value] of Object.entries(options)) {
+        if (!["endMs", "minMs"].includes(key) || !Number.isFinite(value) || value <= 0) throw new Error("无效的语音停顿参数");
+      }
+      if (this.phase === "idle") Object.assign(this, options);
+      else this.pendingOptions = {...this.pendingOptions, ...options};
     }
 
     reset() {
       this.phase = "idle"; // idle | starting | speaking | ending
       this.frames = 0;
-      this.noise = this.threshold * 0.6;
+      this.noise ??= this.threshold * 0.6;
       this.loudCount = 0;
       this.quietCount = 0;
+      this.voicedMs = 0;
+      this.continuousSpeechMs = 0;
       this.preroll = [];
       this.buffer = [];
+      if (this.pendingOptions) Object.assign(this, this.pendingOptions);
+      this.pendingOptions = null;
     }
 
     static rms(frame) {
@@ -54,9 +71,21 @@
       const startFrames = Math.max(1, Math.round(this.startMs / this.frameMs));
       const endFrames = Math.max(1, Math.round(this.endMs / this.frameMs));
       const maxFrames = Math.max(1, Math.floor(this.maxMs / this.frameMs));
+      if (this.calibrating) {
+        if (rms > Math.max(this.threshold, this.noise * 3)) this.calibrating = false;
+        else {
+          this.calibrationTotal += rms;
+          this.calibrationFrames++;
+          this.noise = this.calibrationTotal / this.calibrationFrames;
+          if (this.calibrationFrames * this.frameMs >= this.calibrationMs) this.calibrating = false;
+        }
+      }
       // Adapt the noise floor slowly toward quiet input only.
       if (rms < this.threshold * 1.5) this.noise = this.noise * 0.98 + rms * 0.02;
       const active = rms > Math.max(this.threshold, this.noise * 3);
+      this.lastActive = active;
+      this.continuousSpeechMs = active ? this.continuousSpeechMs + this.frameMs : 0;
+      if (active) this.voicedMs += this.frameMs;
 
       if (this.phase === "idle") {
         if (active) {
@@ -99,12 +128,18 @@
         if (this.buffer.length >= maxFrames) {
           const tooShort = this.frames * this.frameMs < this.minMs;
           this.result = tooShort ? null : this.flatten();
+          this.resultVoicedMs = this.voicedMs;
+          this.resultEndMs = this.endMs;
+          this.resultSilenceMs = this.quietCount * this.frameMs;
           this.reset();
           return tooShort ? null : "timeout";
         }
         if (this.quietCount >= endFrames) {
           const tooShort = this.frames * this.frameMs < this.minMs;
           this.result = tooShort ? null : this.flatten();
+          this.resultVoicedMs = this.voicedMs;
+          this.resultEndMs = this.endMs;
+          this.resultSilenceMs = this.quietCount * this.frameMs;
           this.reset();
           return tooShort ? null : "end";
         }

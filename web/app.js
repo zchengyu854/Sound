@@ -57,7 +57,12 @@ async function api(path, {timeoutMs = 30000, ...options} = {}) {
   try {
     const response = await fetch(`/api/${path}`, {...options, signal: controller.signal});
     const data = await response.json();
-    if (!response.ok) throw new Error(typeof data.detail === "string" ? data.detail : "输入不符合要求，请检查后重试。");
+    if (!response.ok) {
+      const error = new Error(typeof data.detail === "string" ? data.detail : "输入不符合要求，请检查后重试。");
+      error.status = response.status;
+      error.memoryConflict = response.headers.get("X-Memory-Conflict");
+      throw error;
+    }
     return data;
   } catch (error) {
     if (error.name === "AbortError") throw new Error("请求超时，请刷新确认是否已保存，再重试。");
@@ -204,7 +209,7 @@ async function loadHomeMemory(force = false) {
     document.querySelectorAll("[data-memory-count]").forEach(element => { element.textContent = "00"; });
     $("rail-memory-count").textContent = "00";
     $("rail-memory-title").textContent = "还没有记忆";
-    $("rail-memory-note").textContent = "聊过几轮后，她会慢慢记住你";
+    $("rail-memory-note").textContent = "可以手动添加记忆";
     return;
   }
   if (!force && Date.now() - homeMemoryLoaded < 30000) return;
@@ -216,7 +221,7 @@ async function loadHomeMemory(force = false) {
     document.querySelectorAll("[data-memory-count]").forEach(element => { element.textContent = String(count).padStart(2, "0"); });
     $("rail-memory-count").textContent = String(count).padStart(2, "0");
     $("rail-memory-title").textContent = count ? `${count} 条记忆` : "还没有记忆";
-    $("rail-memory-note").textContent = data.status === "updating" ? "正在从对话里提炼…" : count ? "她记得你们说过的事" : "聊过几轮后，她会慢慢记住你";
+    $("rail-memory-note").textContent = data.status === "updating" ? "正在从对话里提炼…" : count ? "已确认的记忆在人物会话间共享" : "确认建议后，记忆会出现在这里";
   } catch (_) { /* Home stats stay quiet when memory is unavailable. */ }
 }
 function setHome(home) {
@@ -292,7 +297,8 @@ function renderLists() {
   $("voice-select").value = conversation ? (conversation.character_id ? `c:${conversation.character_id}` : `v:${conversation.voice_id}`) : (state.characters[0] ? `c:${state.characters[0].id}` : state.voices[0] ? `v:${state.voices[0].id}` : "");
   $("voice-select").disabled = !state.voices.length;
   $("chat-title").textContent = conversation ? displayName(conversation) : "创建一个有声音的人物";
-  $("character-settings").hidden = $("character-memories").hidden = !conversation?.character_id;
+  $("conversation-summary").hidden = !conversation;
+  $("character-settings").hidden = $("character-memories").hidden = $("character-evolution").hidden = !conversation?.character_id;
   $("chat-subtitle").textContent = conversation ? `声音：${conversation.voice_name}${conversation.character_id ? " · 虚拟人物 · 本会话设定已固定" : ""}` : "添加参考录音，选择声音开始聊天";
   renderHome();
 }
@@ -641,6 +647,7 @@ async function newConversation(selection) {
   const conversation = await post("conversations", kind === "c" ? {character_id: id} : {voice_id: id});
   state.conversations = await api("conversations");
   await selectConversation(conversation.id);
+  return conversation.id;
 }
 async function refresh() {
   const greeting = $("home-greeting");
@@ -664,6 +671,8 @@ async function refresh() {
     renderLists(); renderMessages(); renderHealth();
     if (!state.current) { loadHomePreview(); loadHomeMemory(); }
     if ($("memory-dialog").open) await loadMemories();
+    if ($("summary-dialog").open) await loadSummary();
+    if ($("evolution-dialog").open) await loadEvolution();
   } catch (error) {
     state.online = false;
     renderHealth();
@@ -674,9 +683,12 @@ function openVoice() {
   $("voice-error").textContent = "";
   const selection = $("tone-voice");
   const chosen = selection.value || primaryVoice()?.id;
-  selection.replaceChildren(...state.voices.map(voice => new Option(voice.name, voice.id)));
-  if (state.voices.some(voice => voice.id === chosen)) selection.value = chosen;
-  $("voice-tone-settings").hidden = !state.voices.length;
+  const trainedVoices = state.voices.filter(voice => voice.adapter_id || voice.model_id);
+  selection.replaceChildren(...trainedVoices.map(voice => new Option(voice.name, voice.id)));
+  if (trainedVoices.some(voice => voice.id === chosen)) selection.value = chosen;
+  $("voice-tone-settings").hidden = !trainedVoices.length;
+  $("trained-voice-empty").hidden = !!trainedVoices.length;
+  $("voice-reference-settings").open = false;
   renderVoiceTone();
   if (!$("voice-dialog").open) $("voice-dialog").showModal();
 }
@@ -821,7 +833,6 @@ $("close-history").addEventListener("click", () => {
 });
 $("home-voices").addEventListener("click", openVoice);
 $("home-characters").addEventListener("click", () => openLibrary());
-$("home-network-start").addEventListener("click", () => beginConversation($("message-input").value.trim()));
 $("home-resume").addEventListener("click", () => {
   const latest = state.conversations[0];
   if (latest) selectConversation(latest.id); else beginConversation();
@@ -869,15 +880,14 @@ $("voice-form").addEventListener("submit", async event => {
   $("save-voice").textContent = "正在校验并保存…";
   $("voice-error").textContent = "";
   try {
-    const voice = await api("voices", {method: "POST", body: new FormData(event.target)});
+    await api("voices", {method: "POST", body: new FormData(event.target)});
     await refresh();
-    $("voice-dialog").close(); event.target.reset();
-    if ($("character-dialog").open) fillCharacterVoices(voice.id);
-    else openCharacter(null, voice.id);
-    toast("声音已保存，请绑定到人物。");
+    event.target.reset();
+    $("voice-reference-settings").open = false;
+    toast("参考录音已保存，导入训练 ZIP 时可选用。");
   } catch (error) {
     if ($("voice-dialog").open) $("voice-error").textContent = error.message; else toast(error.message);
-  } finally { $("save-voice").disabled = false; $("save-voice").textContent = "保存声音"; }
+  } finally { $("save-voice").disabled = false; $("save-voice").textContent = "保存参考录音"; }
 });
 function openAdapterImport() {
   const select = $("adapter-reference");
@@ -927,14 +937,36 @@ $("chat-form").addEventListener("submit", async event => {
   catch (error) { $("chat-error").textContent = error.message; }
   finally { button.disabled = false; }
 });
+let startingHomeConversation = false;
 $("composer").addEventListener("submit", async event => {
   event.preventDefault();
+  if (startingHomeConversation) return;
+  const content = $("message-input").value.trim();
   if (!state.current) {
-    beginConversation($("message-input").value.trim());
-    return;
+    const voice = primaryVoice();
+    if (!voice) return beginConversation(content);
+    const character = primaryCharacter();
+    const selection = character?.voice_id === voice.id ? `c:${character.id}` : `v:${voice.id}`;
+    const start = $("home-start");
+    startingHomeConversation = true;
+    start.disabled = true;
+    try {
+      const created = await newConversation(selection);
+      if (state.current !== created) return;
+      $("message-input").value = content;
+      autosizeInput();
+      renderHealth();
+      $("message-input").focus();
+    } catch (error) {
+      toast(error.message);
+      return;
+    } finally {
+      startingHomeConversation = false;
+      start.disabled = false;
+    }
   }
   if ($("send").disabled) return;
-  const selected = state.current, content = $("message-input").value.trim();
+  const selected = state.current;
   $("send").disabled = true;
   try {
     await post(`conversations/${selected}/messages`, {content});
@@ -1035,7 +1067,9 @@ async function start() {
   startPolling();
 }
 
-let editingCharacter = null, memoryCharacter = null, editingMemory = null, memorySignature = "";
+let editingCharacter = null, editingCharacterRevision = null, memoryCharacter = null, editingMemory = null, memorySignature = "";
+const candidateRows = new Map();
+let memoryRequest = 0;
 const characterFields = ["name", "background", "personality", "relationship", "speech_style"];
 for (let i = 0; i < 3; i++) {
   const label = node("label", "", `示例 ${i + 1}：用户`), input = node("textarea");
@@ -1051,6 +1085,7 @@ function fillCharacterVoices(selected) {
 }
 function openCharacter(character = null, voiceId = null) {
   editingCharacter = character?.id || null;
+  editingCharacterRevision = character?.profile_revision_id || null;
   $("character-title").textContent = character ? "编辑人物（新会话生效）" : "创建人物";
   $("character-form").reset(); $("character-error").textContent = "";
   for (const field of characterFields) $("character-" + field).value = character?.[field] || "";
@@ -1063,11 +1098,13 @@ async function openLibrary() {
   if (!state.characters.length) $("character-library").append(node("p", "dialog-intro", "还没有人物，先创建一个。"));
   for (const character of state.characters) {
     const row = node("section", "character-row");
+    const actions = node("div", "character-row-actions");
     row.append(node("h3", "", character.name), node("p", "", character.personality || "尚未填写性格"));
-    for (const [label, action] of [["开始对话", async () => { await newConversation(`c:${character.id}`); $("characters-dialog").close(); }], ["编辑", () => openCharacter(character)], ["记忆", () => openMemories(character.id)]]) {
+    for (const [label, action] of [["开始对话", async () => { await newConversation(`c:${character.id}`); $("characters-dialog").close(); }], ["编辑", () => openCharacter(character)], ["记忆", () => openMemories(character.id)], ["交流风格与版本", () => openEvolution(character.id)]]) {
       const button = node("button", "", label); button.type = "button";
-      button.addEventListener("click", () => Promise.resolve(action()).catch(error => toast(error.message))); row.append(button);
+      button.addEventListener("click", () => Promise.resolve(action()).catch(error => toast(error.message))); actions.append(button);
     }
+    row.append(actions);
     $("character-library").append(row);
   }
   if (!$("characters-dialog").open) $("characters-dialog").showModal();
@@ -1080,6 +1117,7 @@ $("character-form").addEventListener("submit", async event => {
   try {
     const body = Object.fromEntries(characterFields.map(field => [field, $("character-" + field).value]));
     body.voice_id = $("character-voice").value; body.examples = [];
+    if (editingCharacter) body.base_revision_id = editingCharacterRevision;
     for (let i = 0; i < 3; i++) {
       const user = $(`example-user-${i}`).value.trim(), assistant = $(`example-assistant-${i}`).value.trim();
       if (user || assistant) { if (!user || !assistant) throw new Error("示例需同时填写用户和人物发言。"); body.examples.push({user, assistant}); }
@@ -1094,7 +1132,8 @@ $("character-form").addEventListener("submit", async event => {
   finally { button.disabled = false; }
 });
 $("character-settings").addEventListener("click", () => {
-  const profile = profileOf(currentConversation()); if (!profile) return;
+  const conversation = currentConversation(), profile = profileOf(conversation); if (!profile) return;
+  $("character-snapshot-version").textContent = conversation.character_revision_id ? `本会话版本：${conversation.character_revision_id}` : "本会话使用历史快照";
   $("character-snapshot").replaceChildren();
   const labels = {name: "姓名", background: "背景", personality: "性格", relationship: "与你的关系", speech_style: "说话习惯"};
   for (const field of characterFields) $("character-snapshot").append(node("h3", "", labels[field]), node("p", "profile-text", profile[field] || "未填写"));
@@ -1104,40 +1143,160 @@ $("character-settings").addEventListener("click", () => {
 $("edit-current-character").addEventListener("click", async () => {
   try { openCharacter(await api(`characters/${currentConversation().character_id}`)); } catch (error) { toast(error.message); }
 });
+$("start-latest-character").addEventListener("click", async () => {
+  const selected = currentConversation()?.character_id;
+  if (!selected) return;
+  try { await newConversation(`c:${selected}`); $("character-settings-dialog").close(); }
+  catch (error) { toast(error.message); }
+});
 function resetMemoryForm() { editingMemory = null; $("memory-form").reset(); $("memory-form-title").textContent = "添加记忆"; $("memory-error").textContent = ""; }
+function showMemoryPanel(pending) {
+  $("confirmed-memory").hidden = pending;
+  $("pending-memory").hidden = !pending;
+  $("show-confirmed-memory").setAttribute("aria-pressed", String(!pending));
+  $("show-pending-memory").setAttribute("aria-pressed", String(pending));
+}
 async function openMemories(value) {
   memoryCharacter = value; memorySignature = ""; resetMemoryForm();
+  candidateRows.clear();
+  for (const id of ["memory-list", "candidate-list", "memory-refresh-error", "confirmed-list-error", "candidate-list-error"]) $(id).replaceChildren();
+  $("candidate-empty").hidden = true;
+  $("show-confirmed-memory").textContent = "已记住";
+  $("show-pending-memory").textContent = "待确认";
+  $("memory-status").textContent = "正在读取记忆…";
+  $("refresh-memory").disabled = true;
+  showMemoryPanel(false);
   $("memory-title").textContent = `${state.characters.find(c => c.id === value)?.name || "人物"}的记忆`;
   if (!$("memory-dialog").open) $("memory-dialog").showModal();
   await loadMemories();
 }
-async function loadMemories() {
-  const selected = memoryCharacter;
-  try {
-    const data = await api(`characters/${selected}/memories`);
-    if (selected !== memoryCharacter) return;
-    $("memory-status").textContent = ({idle: "记忆已同步", updating: "正在提炼记忆…", warning: "需要检查记忆", failed: "提炼失败"}[data.status] || data.status) + (data.error ? `：${data.error}` : "") + `（${data.items.length}/30 条）`;
-    $("refresh-memory").disabled = data.busy;
-    const signature = JSON.stringify(data.items); if (signature === memorySignature) return; memorySignature = signature;
-    $("memory-list").replaceChildren();
-    if (!data.items.length) $("memory-list").append(node("p", "dialog-intro", "暂无长期记忆。可以手动添加，或聊天后点击更新记忆。"));
-    for (const item of data.items) {
-      const row = node("section", "memory-row");
-      row.append(node("h3", "", item.key), node("p", "profile-text", item.content), node("p", "memory-origin", `${item.origin === "manual" ? "手动" : "自动提炼"} · ${new Date(item.updated_at).toLocaleString("zh-CN")}`));
-      const sourceMessage = item.source_id && state.messages.find(message => message.id === item.source_id);
-      if (sourceMessage) row.append(node("small", "", `来源消息 · ${new Date(sourceMessage.created_at).toLocaleTimeString("zh-CN", {hour: "2-digit", minute: "2-digit"})}`));
-      const edit = node("button", "", "修改"), remove = node("button", "", "删除"); edit.type = remove.type = "button";
-      edit.addEventListener("click", () => { editingMemory = item.id; $("memory-key").value = item.key; $("memory-content").value = item.content; $("memory-form-title").textContent = "修改记忆（保存后优先于自动提炼）"; $("memory-content").focus(); });
-      remove.addEventListener("click", async () => {
-        if (!confirm("删除这条记忆？已处理的历史不会重新提炼它。")) return;
-        try { await api(`characters/${selected}/memories/${item.id}`, {method: "DELETE"}); if (editingMemory === item.id) resetMemoryForm(); await loadMemories(); } catch (error) { $("memory-error").textContent = error.message; }
-      }); row.append(edit, remove); $("memory-list").append(row);
+function renderConfirmedMemories(selected, data) {
+  $("show-confirmed-memory").textContent = `已记住（${data.items.length}/30）`;
+  $("memory-status").textContent = ({idle: "已就绪", updating: "正在提炼候选…", warning: "需要检查记忆", failed: "提炼失败"}[data.status] || data.status) + (data.error ? `：${data.error}` : "");
+  $("refresh-memory").disabled = data.busy;
+  const signature = JSON.stringify(data.items);
+  if (signature === memorySignature) return;
+  memorySignature = signature;
+  $("memory-list").replaceChildren();
+  if (!data.items.length) $("memory-list").append(node("p", "dialog-intro", "暂无长期记忆。可以手动添加，或在「待确认」中查看提炼建议。"));
+  for (const item of data.items) {
+    const row = node("section", "memory-row");
+    row.append(node("h3", "", item.key), node("p", "profile-text", item.content), node("p", "memory-origin", `${item.origin === "manual" ? "手动" : "来自对话"} · ${new Date(item.updated_at).toLocaleString("zh-CN")}`));
+    const sourceMessage = item.source_id && state.messages.find(message => message.id === item.source_id);
+    if (sourceMessage) row.append(node("small", "", `来源消息 · ${new Date(sourceMessage.created_at).toLocaleTimeString("zh-CN", {hour: "2-digit", minute: "2-digit"})}`));
+    const edit = node("button", "", "修改"), remove = node("button", "", "删除长期记忆"); edit.type = remove.type = "button";
+    edit.addEventListener("click", () => { editingMemory = item.id; $("memory-key").value = item.key; $("memory-content").value = item.content; $("memory-form-title").textContent = "修改记忆"; $("memory-content").focus(); });
+    remove.addEventListener("click", async () => {
+      if (!confirm("删除这条长期记忆？原始聊天记录仍在会话中。")) return;
+      try { await api(`characters/${selected}/memories/${item.id}`, {method: "DELETE"}); if (editingMemory === item.id) resetMemoryForm(); await loadMemories(); } catch (error) { $("memory-error").textContent = error.message; }
+    }); row.append(edit, remove); $("memory-list").append(row);
+  }
+}
+function candidateRow(selected, item, draft) {
+  const row = node("section", "memory-row");
+  const comparison = node("div", "memory-compare");
+  const oldValue = node("div");
+  oldValue.append(node("span", "memory-value-label", "原有记忆"), node("p", "profile-text", item.old_content ?? "首次记录"));
+  const suggestion = node("div");
+  const label = node("label", "", "建议记忆（可编辑）"), input = node("textarea");
+  input.id = `memory-candidate-${item.id}`;
+  input.rows = 3;
+  input.maxLength = 200;
+  input.value = draft ?? item.content;
+  label.htmlFor = input.id;
+  suggestion.append(label, input);
+  comparison.append(oldValue, suggestion);
+
+  const source = node("div", "memory-source");
+  const sourceTime = item.source_created_at || item.created_at;
+  const time = node("time", "", new Date(sourceTime).toLocaleString("zh-CN"));
+  time.dateTime = sourceTime;
+  const sourceLabel = node("small", "", "来源消息 · ");
+  sourceLabel.append(time);
+  source.append(sourceLabel, node("blockquote", "profile-text", item.source_text));
+  const error = node("p", "error");
+  error.setAttribute("role", "alert");
+  const approve = node("button", "", "确认"), reject = node("button", "", "驳回"), review = node("button", "", "重新审阅");
+  approve.type = reject.type = review.type = "button";
+  let busy = false, stale = false;
+  function update() {
+    approve.textContent = input.value === item.content ? "确认" : "按修改确认";
+    approve.disabled = busy || stale || !input.value.trim();
+    input.disabled = reject.disabled = review.disabled = busy;
+    review.hidden = !stale;
+  }
+  async function submit(action) {
+    busy = true;
+    error.textContent = "";
+    update();
+    const body = {action};
+    if (action === "approve") {
+      body.review_token = item.review_token;
+      if (input.value !== item.content) body.content = input.value;
     }
-  } catch (error) { $("memory-status").textContent = error.message; }
+    try {
+      const data = await post(`characters/${selected}/memory-candidates/${item.id}`, body);
+      if (selected !== memoryCharacter) return;
+      ++memoryRequest;
+      renderMemoryCandidates(selected, data.items);
+      if (action === "review") candidateRows.get(item.id)?.input.focus();
+      else $("show-pending-memory").focus();
+      await loadMemories();
+    } catch (exception) {
+      if (action === "approve" && exception.memoryConflict === "stale") stale = true;
+      error.textContent = exception.message;
+    } finally {
+      busy = false;
+      update();
+    }
+  }
+  input.addEventListener("input", update);
+  approve.addEventListener("click", () => submit("approve"));
+  reject.addEventListener("click", () => submit("reject"));
+  review.addEventListener("click", () => submit("review"));
+  row.append(node("h3", "", item.key), comparison, source, error, approve, reject, review);
+  update();
+  return {row, input, item};
+}
+function renderMemoryCandidates(selected, items) {
+  const pendingIds = new Set(items.map(item => item.id));
+  for (const [id, entry] of candidateRows) {
+    if (pendingIds.has(id)) continue;
+    entry.row.remove();
+    candidateRows.delete(id);
+  }
+  for (const item of items) {
+    const previous = candidateRows.get(item.id);
+    if (previous && JSON.stringify(previous.item) === JSON.stringify(item)) continue;
+    const draft = previous && previous.input.value !== previous.item.content ? previous.input.value : undefined;
+    const entry = candidateRow(selected, item, draft);
+    if (previous) previous.row.replaceWith(entry.row);
+    else $("candidate-list").append(entry.row);
+    candidateRows.set(item.id, entry);
+  }
+  $("show-pending-memory").textContent = `待确认（${items.length}）`;
+  $("candidate-empty").hidden = items.length > 0;
+}
+async function loadMemories() {
+  const selected = memoryCharacter, request = ++memoryRequest;
+  const [confirmed, candidates] = await Promise.allSettled([
+    api(`characters/${selected}/memories`), api(`characters/${selected}/memory-candidates`)
+  ]);
+  if (selected !== memoryCharacter || request !== memoryRequest) return;
+  $("confirmed-list-error").textContent = confirmed.status === "rejected" ? confirmed.reason.message : "";
+  $("candidate-list-error").textContent = candidates.status === "rejected" ? candidates.reason.message : "";
+  if (confirmed.status === "fulfilled") renderConfirmedMemories(selected, confirmed.value);
+  else $("memory-status").textContent = confirmed.reason.message;
+  if (candidates.status === "fulfilled") renderMemoryCandidates(selected, candidates.value.items);
 }
 $("character-memories").addEventListener("click", () => openMemories(currentConversation().character_id));
+$("show-confirmed-memory").addEventListener("click", () => showMemoryPanel(false));
+$("show-pending-memory").addEventListener("click", () => showMemoryPanel(true));
 $("refresh-memory").addEventListener("click", async () => {
-  try { await post(`characters/${memoryCharacter}/memories/refresh`, {}); await loadMemories(); } catch (error) { $("memory-error").textContent = error.message; }
+  const selected = memoryCharacter;
+  $("memory-refresh-error").textContent = "";
+  try { await post(`characters/${selected}/memories/refresh`, {}); await loadMemories(); }
+  catch (error) { if (selected === memoryCharacter) $("memory-refresh-error").textContent = error.message; }
 });
 $("reset-memory-form").addEventListener("click", resetMemoryForm);
 $("memory-form").addEventListener("submit", async event => {
@@ -1147,5 +1306,274 @@ $("memory-form").addEventListener("submit", async event => {
     resetMemoryForm(); await loadMemories();
   } catch (error) { $("memory-error").textContent = error.message; }
   finally { button.disabled = false; }
+});
+let summaryConversation = null, summaryData = null, summaryBase = null, summarySignature = "";
+let summaryDirty = false, summaryConflict = false, summaryBusy = false, summaryRequest = 0;
+let summaryRevisionRequest = 0, summaryNextOffset = null;
+const summaryEditors = [];
+const summaryKinds = {user_statement: "用户陈述", assistant_suggestion: "人物建议", open_thread: "待继续讨论"};
+const profileLabels = {speech_style: "说话习惯", personality: "性格"};
+const revisionOrigins = {auto: "自动整理", manual: "手动修改", rollback: "恢复版本", clear: "清空", initial: "初始档案", migration: "历史档案", growth: "确认建议"};
+function backgroundStatus(data) {
+  return ({idle: "已就绪", queued: "等待后台整理", updating: "正在后台整理…", failed: "整理失败", warning: "需要检查"}[data.status] || data.status || "已就绪") + (data.error ? `：${data.error}` : "");
+}
+function sourceDetails(sources) {
+  const details = node("details", "memory-source");
+  details.append(node("summary", "", `查看来源（${sources.length}）`));
+  for (const source of sources) {
+    const role = source.role === "assistant" ? "人物" : "用户";
+    details.append(node("small", "", `${role} · ${source.created_at ? new Date(source.created_at).toLocaleString("zh-CN") : source.source_id || source.id}`),
+      node("blockquote", "profile-text", source.text ?? source.content ?? "来源原文暂不可用"));
+  }
+  return details;
+}
+function summarySources(item, data = summaryData) {
+  if (Array.isArray(item.sources)) return item.sources;
+  const available = Array.isArray(data?.sources) ? data.sources : [];
+  return item.source_message_ids.map(id => available.find(source => (source.source_id || source.id) === id)
+    || state.messages.find(message => message.id === id) || {id});
+}
+function updateSummaryControls() {
+  $("save-summary").disabled = summaryBusy || !summaryDirty || summaryConflict;
+  $("reload-summary").hidden = !summaryDirty && !summaryConflict;
+  $("reload-summary").disabled = summaryBusy;
+  $("clear-summary").disabled = summaryBusy || !summaryData;
+  $("refresh-summary").disabled = summaryBusy || !summaryData || ["queued", "updating"].includes(summaryData.status);
+  for (const entry of summaryEditors) {
+    entry.input.disabled = summaryBusy;
+    entry.row.querySelector("button").disabled = summaryBusy;
+  }
+}
+function renderSummary(data) {
+  summaryData = data;
+  $("summary-status").textContent = backgroundStatus(data);
+  const covered = state.messages.find(message => message.id === data.covered_until_assistant_id);
+  $("summary-coverage").textContent = data.covered_until_assistant_id
+    ? `已整理至 ${covered?.created_at ? new Date(covered.created_at).toLocaleString("zh-CN") : data.covered_until_assistant_id}${data.pending_pairs ? ` · ${data.pending_pairs} 组问答待整理` : ""}`
+    : data.origin === "clear" ? "摘要已清空，可以手动重新整理历史。" : "尚未生成摘要，达到 20 组有效问答后开始整理较早内容。";
+  if (summaryDirty) {
+    if (summaryBase !== data.current_revision_id) {
+      summaryConflict = true;
+      $("summary-error").textContent = "摘要已有新版本，草稿已保留。请重新读取后审阅再保存。";
+    }
+  } else {
+    summaryBase = data.current_revision_id;
+    const signature = JSON.stringify([summaryBase, data.items]);
+    if (signature !== summarySignature) {
+      summarySignature = signature;
+      summaryEditors.length = 0;
+      $("summary-items").replaceChildren();
+      if (!data.items.length) $("summary-items").append(node("p", "dialog-intro", "本会话还没有摘要条目。"));
+      for (const [index, item] of data.items.entries()) {
+        const row = node("section", "memory-row"), input = node("textarea");
+        input.id = `summary-item-${index}`; input.rows = 3; input.maxLength = 160; input.value = item.text; input.required = true;
+        const label = node("label", "", summaryKinds[item.kind] || item.kind); label.htmlFor = input.id;
+        const entry = {item, input, row}; summaryEditors.push(entry);
+        const remove = node("button", "", "删除条目"); remove.type = "button";
+        input.addEventListener("input", () => { summaryDirty = true; updateSummaryControls(); });
+        remove.addEventListener("click", () => { summaryEditors.splice(summaryEditors.indexOf(entry), 1); row.remove(); summaryDirty = true; updateSummaryControls(); });
+        row.append(label, input, sourceDetails(summarySources(item, data)), remove); $("summary-items").append(row);
+      }
+    }
+  }
+  updateSummaryControls();
+}
+async function loadSummary() {
+  if (!summaryConversation || summaryBusy) return;
+  const selected = summaryConversation, request = ++summaryRequest;
+  try {
+    const data = await api(`conversations/${selected}/summary`);
+    if (selected !== summaryConversation || request !== summaryRequest) return;
+    const changed = summaryData?.current_revision_id !== data.current_revision_id;
+    renderSummary(data);
+    if (changed) await loadSummaryRevisions(true);
+  } catch (error) { if (selected === summaryConversation && request === summaryRequest) $("summary-error").textContent = error.message; }
+}
+async function openSummary() {
+  const conversation = currentConversation(); if (!conversation) return;
+  summaryConversation = conversation.id; summaryData = null; summaryBase = null; summarySignature = "";
+  summaryDirty = summaryConflict = summaryBusy = false; summaryEditors.length = 0; ++summaryRevisionRequest;
+  $("summary-title").textContent = `${displayName(conversation)} · 会话摘要`;
+  for (const id of ["summary-items", "summary-revisions", "summary-error", "summary-revisions-error", "summary-coverage"]) $(id).replaceChildren();
+  $("summary-status").textContent = "正在读取摘要…"; $("more-summary-revisions").hidden = true; updateSummaryControls();
+  if (!$("summary-dialog").open) $("summary-dialog").showModal();
+  await loadSummary();
+}
+async function summaryMutation(method, suffix, body) {
+  const selected = summaryConversation; if (!selected || summaryBusy) return;
+  const request = ++summaryRequest;
+  summaryBusy = true; $("summary-error").textContent = ""; updateSummaryControls();
+  try {
+    const data = await api(`conversations/${selected}/summary${suffix}`, {method, headers: {"Content-Type": "application/json"}, body: JSON.stringify(body)});
+    if (selected !== summaryConversation || request !== summaryRequest) return;
+    summaryDirty = summaryConflict = false; summarySignature = ""; renderSummary(data);
+    await loadSummaryRevisions(true);
+    toast(suffix === "/rollback" ? "已恢复摘要，历史版本仍保留。" : method === "DELETE" ? "摘要已清空，原始聊天记录保留。" : "摘要已保存。");
+  } catch (error) {
+    if (selected !== summaryConversation || request !== summaryRequest) return;
+    if (error.status === 409) summaryConflict = true;
+    $("summary-error").textContent = error.message;
+  } finally { if (selected === summaryConversation && request === summaryRequest) { summaryBusy = false; updateSummaryControls(); } }
+}
+async function loadSummaryRevisions(reset = false) {
+  const selected = summaryConversation, request = ++summaryRevisionRequest;
+  const offset = reset ? 0 : summaryNextOffset; if (!selected || offset === null) return;
+  try {
+    const data = await api(`conversations/${selected}/summary/revisions?offset=${offset}`);
+    if (selected !== summaryConversation || request !== summaryRevisionRequest) return;
+    $("summary-revisions-error").textContent = "";
+    if (reset) $("summary-revisions").replaceChildren();
+    for (const revision of data.items) {
+      const row = node("section", "memory-row"), details = node("details");
+      details.append(node("summary", "", `${revisionOrigins[revision.origin] || revision.origin} · ${new Date(revision.created_at).toLocaleString("zh-CN")}`), node("small", "", revision.id));
+      for (const item of revision.items) details.append(node("p", "profile-text", `${summaryKinds[item.kind] || item.kind}：${item.text}`), sourceDetails(summarySources(item, revision)));
+      const restore = node("button", "", "恢复此版本"); restore.type = "button";
+      restore.disabled = revision.id === summaryData?.current_revision_id || revision.valid === false;
+      if (revision.valid === false) details.append(node("p", "error", "来源已变更，此版本不能恢复。"));
+      restore.addEventListener("click", () => {
+        if (summaryDirty) { $("summary-error").textContent = "请先保存修改，或重新读取以放弃草稿，再恢复版本。"; return; }
+        summaryMutation("POST", "/rollback", {base_revision_id: summaryBase, target_revision_id: revision.id});
+      });
+      row.append(details, restore); $("summary-revisions").append(row);
+    }
+    summaryNextOffset = data.next_offset ?? null; $("more-summary-revisions").hidden = summaryNextOffset === null;
+  } catch (error) { if (selected === summaryConversation && request === summaryRevisionRequest) $("summary-revisions-error").textContent = error.message; }
+}
+$("conversation-summary").addEventListener("click", openSummary);
+$("summary-dialog").addEventListener("close", () => { summaryConversation = null; ++summaryRequest; ++summaryRevisionRequest; });
+$("summary-form").addEventListener("submit", async event => {
+  event.preventDefault(); if (!summaryDirty || summaryConflict) return;
+  const items = summaryEditors.map(({item, input}) => ({kind: item.kind, text: input.value.trim(), source_message_ids: item.source_message_ids}));
+  if (items.some(item => !item.text) || items.reduce((sum, item) => sum + [...item.text].length, 0) > 1200) {
+    $("summary-error").textContent = "每条摘要不能为空，全部条目合计最多 1200 字。"; return;
+  }
+  await summaryMutation("PUT", "", {base_revision_id: summaryBase, items});
+});
+$("reload-summary").addEventListener("click", () => { summaryDirty = summaryConflict = false; summarySignature = ""; $("summary-error").textContent = ""; loadSummary(); });
+$("clear-summary").addEventListener("click", () => summaryMutation("DELETE", "", {base_revision_id: summaryBase}));
+$("refresh-summary").addEventListener("click", async () => {
+  const selected = summaryConversation; $("summary-error").textContent = "";
+  try { await post(`conversations/${selected}/summary/refresh`, {}); if (selected === summaryConversation) await loadSummary(); }
+  catch (error) { if (selected === summaryConversation) $("summary-error").textContent = error.message; }
+});
+$("more-summary-revisions").addEventListener("click", () => loadSummaryRevisions());
+
+let evolutionCharacter = null, evolutionProfile = null, evolutionRequest = 0, evolutionBusy = false;
+let profileRevisionRequest = 0, profileNextOffset = null;
+const growthRows = new Map();
+function growthCandidateRow(selected, item, draft) {
+  const row = node("section", "memory-row"), comparison = node("div", "memory-compare"), before = node("div"), after = node("div");
+  before.append(node("span", "memory-value-label", "当前设定"), node("p", "profile-text", item.old_value || "未填写"));
+  const label = node("label", "", "建议设定（可编辑）"), input = node("textarea");
+  input.id = `growth-${item.id}`; input.rows = 4; input.maxLength = 1000; input.value = draft ?? item.new_value; label.htmlFor = input.id;
+  after.append(label, input); comparison.append(before, after);
+  const error = node("p", "error"); error.setAttribute("role", "alert");
+  const approve = node("button", "", "确认"), reject = node("button", "", "驳回"), review = node("button", "", "重新审阅");
+  approve.type = reject.type = review.type = "button";
+  let busy = false, stale = false;
+  function update() {
+    approve.textContent = input.value === item.new_value ? "确认" : "按修改确认";
+    approve.disabled = busy || stale || !input.value.trim(); input.disabled = reject.disabled = review.disabled = busy; review.hidden = !stale;
+  }
+  async function submit(action) {
+    if (evolutionBusy) return;
+    const request = ++evolutionRequest;
+    evolutionBusy = busy = true; error.textContent = ""; update();
+    const body = {action};
+    if (action === "approve") Object.assign(body, {review_token: item.review_token, base_revision_id: item.base_revision_id, new_value: input.value});
+    try {
+      const data = await post(`characters/${selected}/profile-candidates/${item.id}`, body);
+      if (selected !== evolutionCharacter || request !== evolutionRequest) return;
+      renderGrowthCandidates(selected, data.items);
+      if (action === "review") growthRows.get(item.id)?.input.focus();
+      else $("refresh-evolution").focus();
+    } catch (exception) { if (action === "approve" && exception.status === 409) stale = true; error.textContent = exception.message; }
+    finally {
+      busy = false; update();
+      if (selected === evolutionCharacter && request === evolutionRequest) { evolutionBusy = false; await loadEvolution(); }
+    }
+  }
+  input.addEventListener("input", update); approve.addEventListener("click", () => submit("approve")); reject.addEventListener("click", () => submit("reject")); review.addEventListener("click", () => submit("review"));
+  row.append(node("h3", "", profileLabels[item.field] || item.field), comparison, node("p", "profile-text", item.reason),
+    node("small", "", `建议时间：${new Date(item.created_at).toLocaleString("zh-CN")}`), sourceDetails(item.sources || []), error, approve, reject, review);
+  update(); return {row, input, item};
+}
+function renderGrowthCandidates(selected, items) {
+  const ids = new Set(items.map(item => item.id));
+  for (const [id, entry] of growthRows) if (!ids.has(id)) { entry.row.remove(); growthRows.delete(id); }
+  $("evolution-candidates").querySelector(".growth-empty")?.remove();
+  for (const item of items) {
+    const previous = growthRows.get(item.id);
+    if (previous && JSON.stringify(previous.item) === JSON.stringify(item)) continue;
+    const draft = previous && previous.input.value !== previous.item.new_value ? previous.input.value : undefined;
+    const entry = growthCandidateRow(selected, item, draft);
+    if (previous) previous.row.replaceWith(entry.row); else $("evolution-candidates").append(entry.row);
+    growthRows.set(item.id, entry);
+  }
+  if (!items.length) $("evolution-candidates").append(node("p", "dialog-intro growth-empty", "暂无待确认建议。需要跨会话的多次明确反馈作为依据。"));
+}
+async function loadEvolution() {
+  if (!evolutionCharacter || evolutionBusy) return;
+  const selected = evolutionCharacter, request = ++evolutionRequest;
+  try {
+    const [profile, data] = await Promise.all([api(`characters/${selected}`), api(`characters/${selected}/profile-candidates`)]);
+    if (selected !== evolutionCharacter || request !== evolutionRequest) return;
+    const changed = evolutionProfile?.profile_revision_id !== profile.profile_revision_id; evolutionProfile = profile;
+    $("evolution-status").textContent = backgroundStatus(data);
+    $("refresh-evolution").disabled = ["queued", "updating"].includes(data.status) || data.items.length > 0;
+    renderGrowthCandidates(selected, data.items);
+    if (changed) await loadProfileRevisions(true);
+  } catch (error) { if (selected === evolutionCharacter && request === evolutionRequest) $("evolution-error").textContent = error.message; }
+}
+async function openEvolution(value) {
+  evolutionCharacter = value; evolutionProfile = null; evolutionBusy = false; growthRows.clear(); ++profileRevisionRequest;
+  $("evolution-title").textContent = `${state.characters.find(character => character.id === value)?.name || "人物"} · 交流风格与版本`;
+  for (const id of ["evolution-candidates", "profile-revisions", "evolution-error", "profile-revisions-error"]) $(id).replaceChildren();
+  $("evolution-status").textContent = "正在读取建议与版本…"; $("refresh-evolution").disabled = true; $("more-profile-revisions").hidden = true;
+  if (!$("evolution-dialog").open) $("evolution-dialog").showModal(); await loadEvolution();
+}
+async function loadProfileRevisions(reset = false) {
+  const selected = evolutionCharacter, request = ++profileRevisionRequest, offset = reset ? 0 : profileNextOffset;
+  if (!selected || offset === null) return;
+  try {
+    const data = await api(`characters/${selected}/profile-revisions?offset=${offset}`);
+    if (selected !== evolutionCharacter || request !== profileRevisionRequest) return;
+    $("profile-revisions-error").textContent = ""; if (reset) $("profile-revisions").replaceChildren();
+    for (const revision of data.items) {
+      const row = node("section", "memory-row"), details = node("details");
+      details.append(node("summary", "", `${revisionOrigins[revision.origin] || revision.origin} · ${new Date(revision.created_at).toLocaleString("zh-CN")}`),
+        node("small", "", revision.id), node("p", "profile-text", revision.reason || ""));
+      const labels = {name: "姓名", background: "背景", personality: "性格", relationship: "与你的关系", speech_style: "说话习惯"};
+      for (const field of characterFields) details.append(node("p", "profile-text", `${labels[field]}：${revision.profile[field] || "未填写"}`));
+      details.append(node("p", "profile-text", `声音：${state.voices.find(voice => voice.id === revision.profile.voice_id)?.name || revision.profile.voice_id}`));
+      for (const example of revision.profile.examples || []) details.append(node("p", "profile-text", `用户：${example.user}\n人物：${example.assistant}`));
+      if (revision.sources?.length) details.append(sourceDetails(revision.sources));
+      const restore = node("button", "", "恢复此版本"); restore.type = "button"; restore.disabled = revision.id === evolutionProfile?.profile_revision_id;
+      restore.addEventListener("click", async () => {
+        if (evolutionBusy) return;
+        evolutionBusy = true; ++evolutionRequest; restore.disabled = true; $("evolution-error").textContent = "";
+        try {
+          await post(`characters/${selected}/profile-rollback`, {base_revision_id: evolutionProfile.profile_revision_id, target_revision_id: revision.id});
+          if (selected === evolutionCharacter) { evolutionProfile = null; toast("已恢复人物设定，新会话生效。"); }
+        } catch (error) { if (selected === evolutionCharacter) $("evolution-error").textContent = error.message; }
+        finally { if (selected === evolutionCharacter) { evolutionBusy = false; restore.disabled = false; await loadEvolution(); } }
+      });
+      row.append(details, restore); $("profile-revisions").append(row);
+    }
+    profileNextOffset = data.next_offset ?? null; $("more-profile-revisions").hidden = profileNextOffset === null;
+  } catch (error) { if (selected === evolutionCharacter && request === profileRevisionRequest) $("profile-revisions-error").textContent = error.message; }
+}
+$("character-evolution").addEventListener("click", () => openEvolution(currentConversation().character_id));
+$("evolution-dialog").addEventListener("close", () => { evolutionCharacter = null; ++evolutionRequest; ++profileRevisionRequest; });
+$("refresh-evolution").addEventListener("click", async () => {
+  const selected = evolutionCharacter; $("evolution-error").textContent = "";
+  try { await post(`characters/${selected}/profile-candidates/refresh`, {}); if (selected === evolutionCharacter) await loadEvolution(); }
+  catch (error) { if (selected === evolutionCharacter) $("evolution-error").textContent = error.message; }
+});
+$("more-profile-revisions").addEventListener("click", () => loadProfileRevisions());
+$("evolution-start-latest").addEventListener("click", async () => {
+  const selected = evolutionCharacter; if (!selected) return;
+  try { await newConversation(`c:${selected}`); $("evolution-dialog").close(); if ($("characters-dialog").open) $("characters-dialog").close(); }
+  catch (error) { if (selected === evolutionCharacter) $("evolution-error").textContent = error.message; }
 });
 start();

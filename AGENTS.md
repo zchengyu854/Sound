@@ -6,18 +6,20 @@
 - `platform_runtime.py`: process-level CUDA setup, data-directory locking, and streaming/depth environment configuration.
 - `realtime_runtime.py`: incremental Chinese sentence splitting, bounded segment queue, and turn/round control for realtime replies. Pure logic; keep it free of model and I/O dependencies.
 - `breezetts2_mac_fast.py`: streaming inference CLI and shared helpers such as `FastDepth`, `pcm_chunks`, and `pcm16_bytes`. Preserve existing CLI behavior when changing shared code.
-- `character_store.py`: character profiles, immutable conversation snapshots, and bounded memory extraction.
+- `character_store.py`: character profiles, immutable conversation snapshots, bounded memory extraction, and pending memory-candidate review.
+- `conversation_summary.py`: per-conversation summary revisions, source validation, coverage cursor, manual edit/clear/rollback, and the background summary prompt. Storage and validation only; the LLM transport is shared through `ChatService`.
+- `character_growth.py`: immutable character profile revisions, cross-session growth suggestions, review tokens, rollback, and the bounded `growth_cursor`. Reuses the shared background worker.
 - `media_processing.py`: bounded MP3/MP4/WAV probe, decode to 24 kHz mono PCM16, and silence-aware slicing.
+- `web/`: chat frontend (native HTML/CSS/JS, no build step), including the summary drawer and character "交流风格与版本" panel. `web/vad.js` and `web/realtime-worklet.js` are shared with the realtime page.
+- `ubuntu` branch：独立训练控制台、任务队列、CUDA worker 和结果下载。Mac `main` 不包含 `training_web/`。
+- `realtime_web/`: standalone realtime voice page served at `/realtime/`. Implements calibration, two pause presets, `suspected`/`dismissed`/`confirmed` interruption states, and browser-side metrics in `window.__realtime.state.metrics`.
+- `tests/test_voice_app.py`: backend regression tests and fake inference/provider implementations. `tests/test_characters.py`、`tests/test_conversation_summary.py` and `tests/test_character_growth.py` cover memory approval, summary, and profile-version behavior. `tests/test_realtime_runtime.py` covers splitting/queue/turn logic; `tests/test_vad.cjs`, `tests/test_audio_ui.cjs`, `tests/test_realtime_ui.cjs` and `tests/test_evolution_ui.cjs` cover the browser logic with DOM/API doubles.
 - `training_store.py`, `training_service.py`: Mac-side adapter registry and result validation used by the interaction app. The Mac app does not expose a training page or training HTTP routes.
 - `training_exchange.py` and `breeze_training.py`: shared package format and adapter primitives. Keep these compatible with the `ubuntu` branch, which owns the training console, CUDA worker, and checkpoint tests.
 - `tests/test_training_hardware.py`: opt-in cross-machine validation using the worker checkout selected by `BREEZE_TRAINING_WORKER`.
 - `separate_vocals.py` + `requirements-separator.txt`: standalone vocal separation CLI that runs in its own `.venv-separator` and calls `demucs-mlx`; outputs a review WAV plus an uploadable MP3. Not part of the web service.
 - `benchmark_voice.py`: local TTS benchmark (cold/warm RTF, first-chunk latency, raw values + medians) written to ignored `web-test-artifacts/`. `--depth-mode {cached,compiled,native}` compares decoder modes, `--verify` checks numerical parity. Pure helpers `summarize`/`rtf` are unit-tested; the CLI loads the real engine, so stop the app first to avoid two GPU processes. The app reads `BREEZE_DEPTH_MODE` (default `cached`).
-- `web/`: chat frontend (native HTML/CSS/JS, no build step). `web/vad.js` and `web/realtime-worklet.js` are shared with the realtime page.
-- `ubuntu` branch：独立训练控制台、任务队列、CUDA worker 和结果下载。Mac `main` 不包含 `training_web/`。
-- `realtime_web/`: standalone realtime voice page served at `/realtime/`.
-- `tests/test_voice_app.py`: backend regression tests and fake inference/provider implementations. `tests/test_realtime_runtime.py` covers splitting/queue/turn logic; `tests/test_vad.cjs` and `tests/test_realtime_ui.cjs` cover the realtime browser logic with DOM/API doubles.
-- `README.md` describes streaming inference; `docs/WEB_APP.md` covers web configuration, APIs, training/realtime behavior, and the manual acceptance checklist. `docs/MANUAL_TESTS.md` is the human acceptance checklist (audio listening, microphone, barge-in, latency) with recording tables. `fish_s2_mac_stream.py.py` is a separate Fish streaming script.
+- `README.md` describes streaming inference; `docs/WEB_APP.md` covers web configuration, APIs, training/realtime behavior, and the manual acceptance checklist. `docs/MANUAL_TESTS.md` is the human acceptance checklist (audio listening, microphone, barge-in, latency, summaries, character growth) with recording tables. `fish_s2_mac_stream.py.py` is a separate Fish streaming script.
 - Ignored `data/` holds private recordings, generated audio, SQLite state, and migration backups. Keep verification artifacts in ignored `web-test-artifacts/`.
 
 ## Build, Test, and Development Commands
@@ -30,16 +32,16 @@ uv pip install --python .venv/bin/python -r requirements-web.txt
 .venv/bin/python voice_app.py
 .venv/bin/python -m unittest discover -s tests -v
 node --check web/app.js
-node --check web/vad.js && node --check web/realtime-worklet.js && node --check realtime_web/app.js
-node tests/test_audio_ui.cjs && node tests/test_reply_ui.cjs
+node --check web/vad.js && node --check web/audio.js && node --check web/realtime-worklet.js && node --check realtime_web/app.js
+node tests/test_audio_ui.cjs && node tests/test_reply_ui.cjs && node tests/test_evolution_ui.cjs
 node tests/test_vad.cjs && node tests/test_realtime_ui.cjs
 .venv/bin/python -m py_compile voice_app.py breezetts2_mac_fast.py realtime_runtime.py \
   media_processing.py training_store.py training_service.py separate_vocals.py \
-  benchmark_voice.py voice_metrics.py
+  benchmark_voice.py voice_metrics.py character_store.py conversation_summary.py character_growth.py
 ```
 
 These commands install dependencies, serve localhost port 8000, run the backend
-tests plus four Node suites, and check syntax. No build step is required. Optional
+tests plus five Node suites, and check syntax. No build step is required. Optional
 vocal separation uses a separate environment (`.venv-separator`, git-ignored) so the
 pinned `mlx==0.32.2` / `mlx-audio==0.5.1` of `.venv` stays untouched:
 

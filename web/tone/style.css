@@ -1,11 +1,11 @@
 :root {
   color-scheme: dark;
-  --base: #0a1116;
-  --panel: #131d25;
-  --line: #334651;
-  --ink: #edf3f5;
-  --muted: #a8bac3;
-  --signal: #92e7d8;
+  --base: #0f0f0f;
+  --panel: #1a1a18;
+  --line: #49493f;
+  --ink: #f5f3ee;
+  --muted: #b4b1aa;
+  --signal: #dafa9c;
   background: var(--base);
   color: var(--ink);
   font: 16px/1.55 system-ui, sans-serif;
@@ -20,7 +20,7 @@ h1 { margin: 0; font-size: clamp(2rem, 5vw, 3rem); letter-spacing: .025em; }
 h2 { margin: 0 0 12px; font-size: 1rem; }
 .intro { margin: 6px 0 28px; color: var(--muted); }
 .layout, .comparison { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 18px; }
-form, .layout section, article { padding: clamp(15px, 3vw, 24px); background: var(--panel); border: 1px solid var(--line); }
+form, .layout section, article { padding: clamp(15px, 3vw, 24px); background: var(--panel); border: 1px solid var(--line); border-radius: 16px; }
 label { display: block; margin-bottom: 6px; font-weight: 600; }
 select, textarea, button { font: inherit; }
 select, textarea { display: block; width: 100%; padding: 9px; color: var(--ink); background: var(--base); border: 1px solid var(--line); border-radius: 4px; }

@@ -8,11 +8,20 @@
     const state = {
       voices: [], characters: [], voiceId: "", characterId: "", conversationId: "",
       round: 0, listening: false, playing: false, busy: false, ended: false,
-      activeMessageId: "", status: "未开始", lastText: "",
+      activeMessageId: "", activeAttempt: 0, status: "未开始", lastText: "",
+      interruption: "none", metrics: [],
     };
     let capture = null, captureVersion = 0, capturePending = false;
     let player = null, source = null, session = 0, starting = false;
     let cancelPending = null;
+    let suspicion = null, playback = null;
+    const now = () => (win.performance || globalThis.performance).now();
+    const pauseWindow = () => $("pause-preset")?.value === "slow" ? 1100 : 700;
+
+    function metric(kind, data = {}) {
+      state.metrics.push({kind, at_ms: now(), ...data});
+      if (state.metrics.length > 100) state.metrics.shift();
+    }
 
     async function api(path, init = {}) {
       let response;
@@ -98,6 +107,7 @@
     }
 
     function stopListening() {
+      dismissInterruption();
       captureVersion++;
       const current = capture;
       capture = null;
@@ -137,7 +147,8 @@
         sink.gain.value = 0;
         media.connect(node);
         node.connect(sink).connect(context.destination);
-        const current = {context, stream, node, media, sink, vad: new win.VoiceVad.VoiceVad()};
+        const current = {context, stream, node, media, sink,
+          vad: new win.VoiceVad.VoiceVad({calibrationMs: 1000, endMs: pauseWindow()})};
         capture = current;
         context = null;
         stream = null;
@@ -145,13 +156,28 @@
         updateControls();
         node.port.onmessage = event => {
           if (capture !== current || state.busy || state.ended) return;
+          current.vad.configure({endMs: pauseWindow(), minMs: state.playing || state.activeMessageId ? 150 : 500});
+          const wasCalibrating = current.vad.calibrating;
           const result = current.vad.push(event.data);
+          if (wasCalibrating && !current.vad.calibrating && result !== "start" && !state.playing) setStatus("正在听…说完后会自动回复");
           if (result === "start") {
-            if (state.activeMessageId || state.playing) interruptReply();
+            if (state.activeMessageId || state.playing) suspectInterruption(current.vad);
             else setStatus("正在听你说话…");
+          }
+          if (suspicion) {
+            // shortcut: 先按持续人声确认插话，中文语义检测通过录音集和真机验收后替换。
+            if (current.vad.continuousSpeechMs >= 350) confirmInterruption();
+            else if (current.vad.quietCount * (current.vad.frameMs || 20) >= 180 || result === "end" || result === "timeout") {
+              dismissInterruption();
+              current.vad.reset();
+              return;
+            }
           }
           if (result === "end" || result === "timeout") {
             const samples = current.vad.samples();
+            metric("endpoint", {preset: current.vad.resultEndMs === 1100 ? "slow" : "normal",
+              voiced_ms: current.vad.resultVoicedMs || 0, last_voice_at_ms: now() - (current.vad.resultSilenceMs || 0)});
+            state.interruption = "none";
             if (samples?.length) void submitUtterance(samples, current.context.sampleRate);
           }
         };
@@ -163,7 +189,9 @@
     }
 
     function stopPlayback() {
+      dismissInterruption(false);
       if (player) player.stop();
+      playback = null;
     }
 
     function closeSource() {
@@ -182,9 +210,45 @@
       return false;
     }
 
-    function interruptReply() {
-      if (!state.activeMessageId && !state.playing) return;
-      const active = state.activeMessageId;
+    function suspectInterruption(vad) {
+      if (suspicion || (!state.activeMessageId && !state.playing)) return;
+      const current = {session, round: state.round, player,
+        id: playback?.id || state.activeMessageId, attempt: playback?.attempt || state.activeAttempt,
+        started: now(), onset: now() - (vad.continuousSpeechMs || 160), timer: null};
+      suspicion = current;
+      state.interruption = "suspected";
+      setStatus("听到你的声音，正在确认…");
+      metric("suspected", {message_id: current.id, attempt: current.attempt});
+      if (current.player) void current.player.pause(current.id, current.attempt).then(paused => {
+        if (paused && suspicion === current) metric("pause", {response_ms: now() - current.onset});
+      });
+      current.timer = win.setTimeout(() => { if (suspicion === current) confirmInterruption(); }, 2000);
+    }
+
+    function dismissInterruption(resume = true) {
+      const current = suspicion;
+      if (!current) return;
+      suspicion = null;
+      win.clearTimeout(current.timer);
+      state.interruption = "dismissed";
+      metric("dismissed", {elapsed_ms: now() - current.started});
+      const dismissedAt = now();
+      if (resume && current.session === session && current.round === state.round && player === current.player && player) {
+        void player.resume(current.id, current.attempt).then(resumed => {
+          if (resumed && current.session === session && current.round === state.round) metric("resume", {response_ms: now() - dismissedAt});
+        });
+      }
+      if (resume && !state.ended) setStatus(state.playing ? "继续说话…可以开口打断" : state.listening ? "正在听…" : "已暂停监听");
+    }
+
+    function confirmInterruption() {
+      const current = suspicion;
+      if (!current || current.session !== session || current.round !== state.round) return;
+      suspicion = null;
+      win.clearTimeout(current.timer);
+      state.interruption = "confirmed";
+      metric("confirmed", {elapsed_ms: now() - current.started});
+      const active = current.id;
       state.round++;
       state.activeMessageId = "";
       closeSource();
@@ -194,7 +258,7 @@
       const currentSession = session;
       cancelPending = (async () => {
         if (active) {
-          try { await api(`messages/${active}/cancel`, json("POST", {})); } catch (_) {}
+          try { await api(`messages/${active}/cancel?attempt=${current.attempt}`, json("POST", {})); } catch (_) {}
         }
         return waitIdle(currentSession);
       })();
@@ -207,6 +271,8 @@
       state.ended = false;
       state.busy = true;
       state.activeMessageId = "";
+      state.activeAttempt = 0;
+      state.interruption = "none";
       state.round++;
       cancelPending = null;
       const currentSession = ++session;
@@ -232,7 +298,7 @@
         $("mic-toggle").disabled = false;
         state.busy = false;
         updateControls();
-        setStatus("正在听…说完后会自动回复");
+        setStatus(capture?.vad.calibrating ? "正在校准环境…可以随时开始说话" : "正在听…说完后会自动回复");
       } catch (error) {
         stopListening();
         state.busy = false;
@@ -245,6 +311,7 @@
 
     async function end(keepalive = false) {
       const active = state.activeMessageId;
+      const attempt = state.activeAttempt;
       state.ended = true;
       state.round++;
       session++;
@@ -259,7 +326,7 @@
       notice("对话已结束。可以选择人物或声音，再开始一段对话。");
       updateControls();
       if (active) {
-        try { await api(`messages/${active}/cancel`, {...json("POST", {}), keepalive}); } catch (_) {}
+        try { await api(`messages/${active}/cancel?attempt=${attempt}`, {...json("POST", {}), keepalive}); } catch (_) {}
       }
     }
 
@@ -350,10 +417,11 @@
         }
       }
       if (currentSession !== session || state.ended || round !== state.round) {
-        try { await api(`messages/${created.id}/cancel`, {...json("POST", {}), keepalive: true}); } catch (_) {}
+        try { await api(`messages/${created.id}/cancel?attempt=${created.attempt || 1}`, {...json("POST", {}), keepalive: true}); } catch (_) {}
         return;
       }
       state.activeMessageId = created.id;
+      state.activeAttempt = created.attempt || 1;
       updateControls();
       const row = message("assistant", "", created.id);
       follow(created.id, created.attempt || 1, row, round);
@@ -365,6 +433,13 @@
       const valid = () => currentSession === session && !state.ended && round === state.round;
       function apply(data) {
         if (!valid()) return true;
+        if (data.attempt != null && data.attempt !== attempt) {
+          stopPlayback();
+          if (state.activeMessageId === messageId && state.activeAttempt === attempt) state.activeMessageId = "";
+          setStatus("回复已在其他页面重试，请等待模型空闲后继续。");
+          updateControls();
+          return true;
+        }
         if (typeof data.content === "string") row.textContent = data.content;
         if (!started && data.mode === "realtime" && data.status === "synthesizing") {
           started = true;
@@ -432,7 +507,13 @@
         if (error && round === state.round && !state.ended) setStatus(error);
       });
       player = current;
-      void current.play(messageId, attempt).then(() => {
+      playback = {id: messageId, attempt, round, session};
+      const playing = current.play(messageId, attempt);
+      if (suspicion && suspicion.id === messageId && suspicion.round === round) {
+        suspicion.player = current;
+        void current.pause(messageId, attempt);
+      }
+      void playing.then(() => {
         if (player === current && !current.playing(messageId)) {
           player = null;
           state.playing = false;
@@ -454,7 +535,11 @@
           }).catch(error => setStatus(error.message));
         }
       });
-      $("stop-play").addEventListener("click", stopPlayback);
+      $("stop-play").addEventListener("click", () => {
+        stopPlayback();
+        capture?.vad.reset();
+        setStatus(state.activeMessageId ? "已停止播放，回复仍在生成…" : state.listening ? "正在听…" : "已暂停监听");
+      });
       $("end").addEventListener("click", () => { void end(); });
       $("manual-send").addEventListener("click", () => {
         const input = $("manual-input");

@@ -23,6 +23,7 @@ const starts = [], contexts = [], failures = [];
 global.AudioContext = class {
   constructor() { this.currentTime = 0; contexts.push(this); }
   async resume() {}
+  async suspend() {}
   async close() { this.closed = true; }
   createBuffer(channels, length, rate) { return {getChannelData: () => new Float32Array(length), duration: length / rate}; }
   createBufferSource() { return {connect() {}, start(time) { starts.push(time); }}; }
@@ -54,6 +55,71 @@ async function main() {
   player.stop();
   assert.equal(contexts[0].closed, true);
   assert.equal(player.playing("message"), false);
+  assert.deepEqual(failures, []);
+
+  const timers = new Map(), pauseContexts = [], pauseStarts = [];
+  let timerId = 0, eof;
+  class PausableContext extends AudioContext {
+    constructor() { super(); pauseContexts.push(this); }
+    async resume() { this.suspended = false; }
+    async suspend() { this.suspended = true; }
+    createBufferSource() { return {connect() {}, start: time => pauseStarts.push(time)}; }
+  }
+  let read = 0;
+  const audioContext = vm.createContext({AudioContext: PausableContext, AbortController,
+    setTimeout: (fn, delay) => { const key = ++timerId; timers.set(key, {fn, delay}); return key; },
+    clearTimeout: key => timers.delete(key),
+    fetch: async url => url.includes("/stream") ? {
+      ok: true, headers: new Map([["X-Audio-Sample-Rate", "8000"], ["X-Audio-Channels", "1"], ["X-Audio-Format", "pcm_s16le"]]),
+      body: {getReader: () => ({read: async () => ++read === 1 ? {value: new Uint8Array(3200), done: false}
+        : new Promise(resolve => { eof = () => resolve({done: true}); })})},
+    } : {json: async () => ({status: "complete", attempt: 1})}});
+  vm.runInContext(fs.readFileSync(path.join(ROOT, "web/audio.js"), "utf8"), audioContext);
+  const pausedPlayer = new audioContext.VoiceAudio.Player(() => {}, error => failures.push(error));
+  const pausedPlay = pausedPlayer.play("pause-test", 1);
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(await pausedPlayer.pause("pause-test", 1), true);
+  assert.equal(pauseContexts[0].suspended, true);
+  eof(); await pausedPlay;
+  assert.equal(pausedPlayer.current.complete, true);
+  assert.equal(timers.size, 0, "EOF during pause must not finish or discard queued audio");
+  assert.equal(await pausedPlayer.resume("pause-test", 2), false, "a stale attempt cannot resume playback");
+  assert.equal(await pausedPlayer.resume("pause-test", 1), true);
+  assert.equal(pauseStarts.length, 1, "resume must not reschedule or repeat PCM");
+  assert.equal(timers.size, 1, "completion timer is armed after resume");
+  pauseContexts[0].currentTime = 1;
+  [...timers.values()][0].fn();
+  assert.equal(pausedPlayer.current, null);
+  assert.equal(await pausedPlayer.resume("pause-test", 1), false, "stopped playback cannot be revived");
+  assert.deepEqual(failures, []);
+
+  let boundedReads = 0;
+  audioContext.fetch = async url => url.includes("/stream") ? {
+    ok: true, headers: new Map([["X-Audio-Sample-Rate", "8000"], ["X-Audio-Channels", "1"], ["X-Audio-Format", "pcm_s16le"]]),
+    body: {getReader: () => ({read: async () => ++boundedReads === 1
+      ? {value: new Uint8Array(48000), done: false} : {done: true}})},
+  } : {json: async () => ({status: "complete", attempt: 1})};
+  const boundedPlayer = new audioContext.VoiceAudio.Player(() => {}, error => failures.push(error));
+  const startsBefore = pauseStarts.length;
+  const boundedPlay = boundedPlayer.play("bounded", 1);
+  await new Promise(resolve => setImmediate(resolve));
+  await boundedPlayer.pause("bounded", 1);
+  const boundedContext = pauseContexts.at(-1);
+  assert.ok(boundedPlayer.current.nextTime <= 2.25, "paused scheduled PCM stays bounded even within a large network read");
+  const flushReadWait = () => {
+    const entry = [...timers.entries()].find(([, timer]) => timer.delay === 20);
+    assert.ok(entry, "PCM backpressure is waiting");
+    timers.delete(entry[0]); entry[1].fn();
+  };
+  flushReadWait();
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(boundedReads, 1, "paused playback must not continue draining the network");
+  boundedContext.currentTime = 2;
+  await boundedPlayer.resume("bounded", 1);
+  flushReadWait();
+  await boundedPlay;
+  assert.equal(pauseStarts.length - startsBefore, 15, "each 200 ms PCM piece is scheduled once across pause and resume");
+  boundedPlayer.stop();
   assert.deepEqual(failures, []);
 
   const recorderSource = fs.readFileSync(path.join(ROOT, "web/recorder.js"), "utf8") + "\nglobalThis.TestRecorder = VoiceRecorder;";

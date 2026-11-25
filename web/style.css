@@ -1215,7 +1215,7 @@ dialog.drawer::backdrop { background: var(--backdrop); backdrop-filter: blur(2px
 
 /* Character and memory panels reuse the existing drawer and line palette. */
 .character-actions { display: flex; gap: 10px; flex-wrap: wrap; }
-.character-actions button, .character-row button, .memory-row button,
+.character-actions button, .character-row button, .memory-row button, .memory-switch button,
 #refresh-memory, #reset-memory-form, #character-add-voice { border: 1px solid var(--line-2); background: transparent; color: var(--ink); padding: 8px 10px; cursor: pointer; font-size: 12px; }
 .character-row, .memory-row { padding: 18px 0; border-bottom: 1px solid var(--line); overflow-wrap: anywhere; }
 .character-row h3, .memory-row h3, #character-snapshot h3 { font-size: 14px; margin: 12px 0; }
@@ -1223,8 +1223,27 @@ dialog.drawer::backdrop { background: var(--backdrop); backdrop-filter: blur(2px
 .character-row button, .memory-row button { margin: 8px 8px 0 0; }
 .profile-text { white-space: pre-wrap; line-height: 1.8; font-size: 13px; overflow-wrap: anywhere; }
 .memory-row small { display: block; color: var(--muted); font-size: 11px; }
+.memory-switch { display: flex; gap: 8px; margin: 20px 0; }
+.memory-switch button[aria-pressed="true"] { border-color: var(--ink); background: var(--ink); color: var(--ink-inverse); }
+.memory-row button:disabled, #refresh-memory:disabled { opacity: 0.5; cursor: default; }
+.memory-compare { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 10px; }
+.memory-compare > div { border: 1px solid var(--line); padding: 10px; }
+.memory-compare .memory-value-label, .drawer .memory-compare label { display: block; margin: 0 0 8px; color: var(--muted); font-size: 11px; }
+.drawer .memory-compare textarea { padding: 8px; }
+.memory-source { margin: 12px 0 0; }
+.memory-source blockquote { margin: 4px 0 0; padding-left: 10px; border-left: 1px solid var(--line-2); }
 #character-examples { border: 1px solid var(--line); margin: 24px 0; padding: 12px; }
 #character-examples legend { font-size: 12px; }
 #memory-form { margin-top: 24px; }
 .message.assistant .voice-card { width: min(100%, 340px); }
 .message.assistant .thinking { max-width: 100%; margin-bottom: 10px; }
+.evolution-actions { display: flex; flex-wrap: wrap; gap: 8px; margin: 16px 0; }
+.evolution-actions button, #reload-summary, #more-summary-revisions, #more-profile-revisions,
+#start-latest-character { border: 1px solid var(--line-2); background: transparent; color: var(--ink); padding: 10px; cursor: pointer; font-size: 12px; }
+#summary-status, #evolution-status { color: var(--muted); font-size: 12px; line-height: 1.8; }
+.memory-row details > summary { cursor: pointer; font-size: 12px; line-height: 1.8; overflow-wrap: anywhere; }
+.drawer button:disabled { cursor: default; opacity: 0.5; }
+@media (max-width: 640px) {
+  .memory-compare { grid-template-columns: minmax(0, 1fr); }
+  .drawer .memory-row button, .evolution-actions button { min-height: 44px; }
+}

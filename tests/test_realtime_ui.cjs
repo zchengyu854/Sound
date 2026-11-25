@@ -36,8 +36,15 @@ class FakeEventSource {
 FakeEventSource.instances = [];
 
 class FakeVad {
-  constructor() { this.queue = []; FakeVad.last = this; }
-  push() { return this.queue.shift() ?? null; }
+  constructor(options) { this.queue = []; this.options = options; this.frameMs = 20; this.continuousSpeechMs = 0; this.quietCount = 0; FakeVad.last = this; }
+  configure(options) { Object.assign(this.options, options); }
+  reset() { this.continuousSpeechMs = 0; this.quietCount = 0; }
+  push() {
+    const next = this.queue.shift();
+    if (typeof next === "object" && next) { const {event, ...fields} = next; Object.assign(this, fields); return event || null; }
+    if (next === "start") { this.continuousSpeechMs = 160; this.quietCount = 0; }
+    return next ?? null;
+  }
   samples() { return Int16Array.from([0, 16384, -16384, 32767, -32768]); }
 }
 class FakeNode {
@@ -60,13 +67,15 @@ function fixture(voiceId, characters = [], characterId = null) {
   const doc = fakeDocument();
   const calls = [];
   const messages = new Map();
+  const timers = new Map();
+  let timerId = 0;
   const voices = [{id: "v1", name: "声音一"}, {id: "v2", name: "声音二"}];
   const win = {
     crypto: {randomUUID}, FormData: class { append() {} }, Blob: class { constructor(p) { this.parts = p; } },
     URL: class { constructor(u) { this.href = u; } searchParams = {get: key => key === "voice_id" ? voiceId : key === "character_id" ? characterId : null}; },
     Option: class { constructor(text, value) { this.text = text; this.value = value; } },
     location: {href: `http://localhost/realtime/?voice_id=${voiceId || ""}`},
-    setTimeout: () => 1, clearTimeout() {},
+    setTimeout: (fn, delay) => { const id = ++timerId; timers.set(id, {fn, delay}); return id; }, clearTimeout: id => timers.delete(id),
     EventSource: FakeEventSource,
     AudioContext: FakeContext, AudioWorkletNode: FakeNode,
     navigator: {mediaDevices: {getUserMedia: async () => ({getTracks: () => [{stop() {}}]})}},
@@ -74,6 +83,8 @@ function fixture(voiceId, characters = [], characterId = null) {
       constructor(changed) { this.changed = changed; this.active = false; }
       playing() { return this.active; }
       play() { this.active = true; calls.push(["play"]); this.changed(); return Promise.resolve(); }
+      pause(id, attempt) { this.paused = true; calls.push(["pause", id, attempt]); return Promise.resolve(true); }
+      resume(id, attempt) { this.paused = false; calls.push(["resume", id, attempt]); return Promise.resolve(this.active); }
       stop() { calls.push(["stop"]); this.active = false; this.changed(); }
     }, encodeWav: samples => { calls.push(["encoded", [...samples]]); return new ArrayBuffer(44); }},
     VoiceVad: {VoiceVad: FakeVad},
@@ -98,19 +109,27 @@ function fixture(voiceId, characters = [], characterId = null) {
       if (msgNew && method === "POST") { messages.set("msg-1", {id: "msg-1", attempt: 1, status: "queued", content: ""}); return {ok: true, json: async () => ({id: "msg-1", attempt: 1})}; }
       const msgGet = url.match(/^\/api\/messages\/([^/]+)$/);
       if (msgGet) return {ok: true, json: async () => messages.get(msgGet[1])};
-      const cancel = url.match(/^\/api\/messages\/([^/]+)\/cancel$/);
+      const cancel = url.match(/^\/api\/messages\/([^/]+)\/cancel\?attempt=\d+$/);
       if (cancel && method === "POST") return {ok: true, json: async () => ({cancel_requested: true})};
       if (url === "/api/transcriptions") return {ok: true, json: async () => ({text: "你好"})};
       return {ok: false, status: 404, json: async () => ({detail: "not found"})};
     },
   };
-  return {doc, win, calls, messages, app: createRealtime(doc, win)};
+  return {doc, win, calls, messages, timers, app: createRealtime(doc, win)};
 }
 
 
 async function main() {
   let passed = 0;
   const check = async (name, fn) => { await fn(); passed++; console.log("ok -", name); };
+  async function speaking(f) {
+    await f.app.init(); await f.app.start();
+    await f.app.send("说一句", 1);
+    const source = FakeEventSource.instances.at(-1);
+    source.emit({id: "msg-1", attempt: 1, status: "synthesizing", mode: "realtime", content: "你好"});
+    await new Promise(resolve => setImmediate(resolve));
+    return source;
+  }
 
   await check("loads voices and selects URL voice_id", async () => {
     const f = fixture("v2");
@@ -145,6 +164,20 @@ async function main() {
     const called = f.calls.find(call => call[1] === "/api/conversations" && call[0] === "POST");
     assert.deepEqual(called[2], {character_id: "c1"});
     assert.ok(f.calls.some(call => call[1] === "/api/characters/c1"));
+  });
+
+  await check("characters sharing a voice and the voice alone keep separate selections", async () => {
+    const f = fixture(null, [{id: "c1", name: "小林", voice_id: "v1"}, {id: "c2", name: "小许", voice_id: "v1"}]);
+    await f.app.init();
+    const select = f.doc.elements.get("voice-select");
+    for (const value of ["c:c1", "c:c2", "v1"]) {
+      select.value = value;
+      await select.emit("change");
+      await f.app.start();
+      await f.app.end();
+    }
+    assert.deepEqual(f.calls.filter(([method, url]) => method === "POST" && url === "/api/conversations").map(call => call[2]),
+      [{character_id: "c1"}, {character_id: "c2"}, {voice_id: "v1"}]);
   });
 
   await check("send uses idempotency key and plays after completion", async () => {
@@ -245,7 +278,7 @@ async function main() {
     assert.match(bad.doc.elements.get("setup-hint").textContent, /不可用/);
   });
 
-  await check("barge-in stops playback, cancels the reply and submits a new turn", async () => {
+  await check("suspected speech pauses first; sustained speech cancels and submits once", async () => {
     const f = fixture("v1");
     await f.app.init(); await f.app.start();
     const tick = () => new Promise(r => setImmediate(r));
@@ -257,9 +290,14 @@ async function main() {
     assert.ok(f.calls.some(c => c[0] === "play"), "playback started");
     FakeVad.last.queue = ["start"];
     FakeNode.last.port.onmessage({data: new Int16Array(320)});
+    assert.ok(f.calls.some(c => c[0] === "pause"), "suspected interruption pauses playback");
+    assert.ok(!source.closed, "SSE must stay open until interruption is confirmed");
+    assert.ok(!f.calls.some(c => /\/cancel/.test(c[1] || "")), "suspected speech must not cancel the reply");
+    FakeVad.last.queue = [{continuousSpeechMs: 360}];
+    FakeNode.last.port.onmessage({data: new Int16Array(320)});
     for (let i = 0; i < 60 && !f.calls.some(c => c[0] === "stop"); i++) await tick();
     assert.ok(f.calls.some(c => c[0] === "stop"), "playback stopped on barge-in");
-    assert.ok(f.calls.some(c => c[0] === "POST" && /\/api\/messages\/msg-1\/cancel$/.test(c[1])),
+    assert.ok(f.calls.some(c => c[0] === "POST" && /\/api\/messages\/msg-1\/cancel\?attempt=1$/.test(c[1])),
       "running reply cancelled");
     FakeVad.last.queue = ["end"];
     FakeNode.last.port.onmessage({data: new Int16Array(320)});
@@ -274,6 +312,92 @@ async function main() {
     void pending;
   });
 
+  await check("short noise resumes the same player and preserves the reply stream", async () => {
+    const f = fixture("v1");
+    const source = await speaking(f);
+    const node = FakeNode.last;
+    FakeVad.last.queue = ["start", {quietCount: 9, continuousSpeechMs: 0}];
+    node.port.onmessage({data: new Int16Array(320)});
+    node.port.onmessage({data: new Int16Array(320)});
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(f.app.state.interruption, "dismissed");
+    assert.equal(f.app.state.round, 1);
+    assert.ok(!source.closed, "noise must preserve the original SSE");
+    assert.equal(f.calls.filter(call => call[0] === "pause").length, 1);
+    assert.equal(f.calls.filter(call => call[0] === "resume").length, 1);
+    assert.equal(f.calls.filter(call => call[0] === "play").length, 1, "resuming does not replay the message");
+    assert.ok(!f.calls.some(call => /\/cancel/.test(call[1] || "")));
+    assert.ok(!f.calls.some(call => call[1] === "/api/transcriptions"));
+  });
+
+  await check("completion during a suspected interruption still resumes buffered audio", async () => {
+    const f = fixture("v1");
+    const source = await speaking(f);
+    FakeVad.last.queue = ["start"];
+    FakeNode.last.port.onmessage({data: new Int16Array(320)});
+    source.emit({id: "msg-1", attempt: 1, status: "complete", mode: "realtime", content: "你好呀"});
+    assert.equal(f.app.state.activeMessageId, "");
+    FakeVad.last.queue = [{event: "end", continuousSpeechMs: 0}];
+    FakeNode.last.port.onmessage({data: new Int16Array(320)});
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(f.calls.filter(call => call[0] === "resume").length, 1);
+    assert.equal(f.app.state.playing, true);
+    assert.ok(!f.calls.some(call => /\/cancel/.test(call[1] || "")));
+  });
+
+  await check("unclassified interruption times out and targets the original attempt", async () => {
+    const f = fixture("v1");
+    const source = await speaking(f);
+    FakeVad.last.queue = ["start"];
+    FakeNode.last.port.onmessage({data: new Int16Array(320)});
+    const timer = [...f.timers.values()].find(timer => timer.delay === 2000);
+    assert.ok(timer);
+    timer.fn();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(f.app.state.interruption, "confirmed");
+    assert.ok(source.closed);
+    assert.ok(f.calls.some(call => call[1] === "/api/messages/msg-1/cancel?attempt=1"));
+    assert.ok(f.app.state.metrics.some(item => item.kind === "confirmed" && item.elapsed_ms >= 0));
+  });
+
+  await check("ending discards a pending pause and its delayed timeout", async () => {
+    const f = fixture("v1");
+    await speaking(f);
+    FakeVad.last.queue = ["start"];
+    FakeNode.last.port.onmessage({data: new Int16Array(320)});
+    const timer = [...f.timers.values()].find(timer => timer.delay === 2000);
+    await f.app.end();
+    timer.fn();
+    await new Promise(resolve => setImmediate(resolve));
+    assert.equal(f.calls.filter(call => /\/cancel/.test(call[1] || "")).length, 1);
+    assert.equal(f.calls.filter(call => call[0] === "resume").length, 0);
+    assert.equal(f.app.state.ended, true);
+  });
+
+  await check("a retried reply cannot overwrite or resume an old attempt", async () => {
+    const f = fixture("v1");
+    const source = await speaking(f);
+    source.emit({id: "msg-1", attempt: 2, status: "complete", mode: "realtime", content: "其他页面重试的内容"});
+    assert.equal(source.closed, true);
+    assert.equal(f.app.state.activeMessageId, "");
+    assert.match(f.doc.elements.get("status").textContent, /其他页面重试/);
+    assert.ok(!f.doc.elements.get("conversation").textContent.includes("其他页面重试的内容"));
+  });
+
+  await check("capture requests calibration and follows the selected pause preset", async () => {
+    const f = fixture("v1");
+    await f.app.init(); await f.app.start();
+    assert.equal(FakeVad.last.options.calibrationMs, 1000);
+    assert.equal(FakeVad.last.options.endMs, 700);
+    f.doc.elements.get("pause-preset").value = "slow";
+    FakeNode.last.port.onmessage({data: new Int16Array(320)});
+    assert.equal(FakeVad.last.options.endMs, 1100);
+    assert.equal(FakeVad.last.options.minMs, 500);
+    await f.app.send("说一句", 1);
+    FakeNode.last.port.onmessage({data: new Int16Array(320)});
+    assert.equal(FakeVad.last.options.minMs, 150, "interruption capture can retain short takeover words for future semantic validation");
+  });
+
   await check("end cancels the running reply", async () => {
     const f = fixture("v1");
     await f.app.init(); await f.app.start();
@@ -281,7 +405,7 @@ async function main() {
     const pending = f.app.send("问一句", 1);
     for (let i = 0; i < 40 && FakeEventSource.instances.length === 0; i++) await tick();
     await f.app.end();
-    assert.ok(f.calls.some(c => c[0] === "POST" && /\/api\/messages\/msg-1\/cancel$/.test(c[1])),
+    assert.ok(f.calls.some(c => c[0] === "POST" && /\/api\/messages\/msg-1\/cancel\?attempt=1$/.test(c[1])),
       "ending the conversation releases the model");
     void pending;
   });

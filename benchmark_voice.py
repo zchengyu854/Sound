@@ -83,6 +83,7 @@ def run_cases(engine, reference, transcript, texts, runs, out_dir, check=lambda:
     cold = None
     for name, text in texts:
         case = {"name": name, "text": text, "runs": []}
+        has_cold = cold is None
         for index in range(runs):
             check()
             first = {"ms": None}
@@ -103,10 +104,11 @@ def run_cases(engine, reference, transcript, texts, runs, out_dir, check=lambda:
             case["runs"].append(record)
             if cold is None:
                 cold = {"case": name, **record}
+        warm_runs = case["runs"][1:] if has_cold else case["runs"]
         case["warm"] = {
-            "rtf": summarize([r["rtf"] for r in case["runs"]]),
-            "first_audio_ms": summarize([r["first_audio_ms"] for r in case["runs"]]),
-            "synthesis_ms": summarize([r["synthesis_ms"] for r in case["runs"]]),
+            "rtf": summarize([r["rtf"] for r in warm_runs]),
+            "first_audio_ms": summarize([r["first_audio_ms"] for r in warm_runs]),
+            "synthesis_ms": summarize([r["synthesis_ms"] for r in warm_runs]),
         }
         cases.append(case)
     return cases, cold
@@ -117,7 +119,7 @@ def main(argv=None):
     parser.add_argument("--voice", help="已发布声音 UUID；从 VOICE_DATA_DIR 读取参考录音与原文")
     parser.add_argument("--reference", help="参考录音 WAV 路径（与 --transcript 同用）")
     parser.add_argument("--transcript", help="参考录音逐字原文")
-    parser.add_argument("--runs", type=int, default=5, help="每个文本的运行次数（默认 5，至少 1）")
+    parser.add_argument("--runs", type=int, default=5, help="每个文本的运行次数（默认 5，至少 1；首轮为冷启动）")
     parser.add_argument("--out", default=None, help="输出目录（默认 web-test-artifacts/benchmark-<时间>）")
     parser.add_argument("--data-dir", default=None, help="数据目录（默认 VOICE_DATA_DIR 或 data）")
     parser.add_argument("--depth-mode", choices=["cached", "compiled", "native"], default="cached",
@@ -195,8 +197,10 @@ def main(argv=None):
         f"{'-' if cold['rtf'] is None else f'{cold['rtf']:.3f}'}\n\n{table}\n", encoding="utf-8")
     print(table)
     print(f"\n结果已写入 {out_dir}/benchmark.json 与 benchmark.md")
-    worst = max((case["warm"]["rtf"]["median"] or 0) for case in cases)
-    if worst >= 1:
+    medians = [case["warm"]["rtf"]["median"] for case in cases]
+    if any(value is None for value in medians):
+        print("结论：热态样本不足，无法判断持续播放能力。", file=sys.stderr)
+    elif (worst := max(medians)) >= 1:
         print(f"结论：热态 RTF 中位数最高 {worst:.3f} ≥ 1，当前硬件无法持续实时输出；"
               "请如实记录，不要靠加大缓冲掩盖。", file=sys.stderr)
     else:

@@ -58,6 +58,7 @@ Windows CPU performance has not been verified. Synthesis and transcription may b
 2. In **Voices** (「声音」), upload a recording of your own voice or one you have permission to use (3–30 seconds of PCM WAV, up to 10 MB) and enter its exact transcript. You can also import a trained voice. To use character settings and memories, create a character under **Characters** (「人物」) and assign it a voice.
 3. Select a voice or character to start chatting. Standard chat supports typing, push-to-talk, audio playback, and WAV downloads.
 4. Select **Real-time Voice** (「实时语音」) at the top of the home page to start a new session with the current character or voice. Allow microphone access for automatic replies; you can interrupt by speaking or type a message. Headphones are recommended. After refreshing, start listening again.
+5. After a long chat, open **Conversation Summary** (「会话摘要」) to review earlier context and unresolved topics. Summaries are per conversation and can be edited or restored. Once you have repeatedly given clear feedback on a character's communication style, review suggestions under **Speaking Style & Versions** (「交流风格与版本」). Confirmed changes apply only to new sessions; existing sessions keep their creation-time snapshot.
 
 Open **Tone Preview** (「语气试听」) in the top bar to compare plain and sentence-by-sentence delivery with the same voice.
 

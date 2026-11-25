@@ -1,10 +1,14 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="zh-CN" data-type="software">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="color-scheme" content="dark">
   <meta name="theme-color" content="#08090b">
+  <meta name="page-type" content="software">
+  <meta name="site-kind" content="software">
+  <meta property="og:title" content="VOICE˚ — 声音记忆">
+  <meta property="og:description" content="用你的声音库开启对话。参考录音与语音合成留在本机。">
   <meta name="description" content="VOICE˚ — 本地声音记忆。留住说过的话，和她的声音。参考录音与语音合成留在本机；聊天文字会发送至配置的 LLM。">
   <title>VOICE˚ — 声音记忆</title>
   <link rel="stylesheet" href="/style.css">
@@ -16,6 +20,7 @@
   <script src="/app.js" defer></script>
 </head>
 <body>
+  <a class="home-skip" href="#message-input">跳到对话输入</a>
   <div class="background" aria-hidden="true"></div>
 
   <div class="app" id="app" data-home="true" data-view="chat">
@@ -30,7 +35,6 @@
         <button class="nav-link home-nav" id="home-voices" type="button">声音</button>
         <button class="nav-link home-nav" id="home-characters" type="button">人物</button>
         <a class="nav-link home-nav" href="/tone/">语气试听</a>
-        <a class="nav-link realtime-link" id="realtime-link" href="/realtime/">实时语音</a>
         <button class="status" id="top-status" type="button" aria-label="查看本地服务状态" aria-haspopup="dialog" aria-controls="local-dialog"><i aria-hidden="true"></i><span id="top-status-text">只在本机</span></button>
         <button class="nav-link settings-button" id="nav-settings" type="button" aria-label="设置" aria-haspopup="dialog" aria-controls="settings-dialog" title="设置"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h6m4 0h6M4 17h10m4 0h2"/><circle cx="12" cy="7" r="2"/><circle cx="16" cy="17" r="2"/></svg><span>设置</span></button>
       </div>
@@ -69,25 +73,26 @@
         <header class="chat-header">
           <button class="mobile-back" id="mobile-back" type="button" aria-label="返回回忆列表"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 18l-6-6 6-6"/></svg><span>回忆</span></button>
           <div class="chat-heading"><h2 id="chat-title">开始一段对话</h2><p id="chat-subtitle">添加参考录音，选择声音开始聊天</p></div>
-          <div class="character-actions"><button id="character-settings" type="button" hidden>人物设定</button><button id="character-memories" type="button" hidden>记忆</button></div><label class="voice-picker"><span>人物 / 声音</span><select id="voice-select" aria-label="选择人物或声音，切换时新建会话"><option value="">尚未添加声音</option></select></label>
+          <div class="character-actions"><button id="conversation-summary" type="button" hidden>会话摘要</button><button id="character-settings" type="button" hidden>人物设定</button><button id="character-memories" type="button" hidden>记忆</button><button id="character-evolution" type="button" hidden>交流风格</button></div><label class="voice-picker"><span>人物 / 声音</span><select id="voice-select" aria-label="选择人物或声音，切换时新建会话"><option value="">尚未添加声音</option></select></label>
         </header>
         <div id="service-status" class="service-status" role="status" aria-live="polite">正在连接本地服务…</div>
 
         <section class="timeline" id="timeline" aria-label="聊天记录" tabindex="0">
           <div class="empty-state" id="empty-state">
-            <div class="memory-home" id="memory-home">
+            <div class="memory-home hero" id="memory-home" data-enter>
               <div class="memory-head">
                 <p class="eyebrow" id="home-eyebrow">声音记忆</p>
-                <h1><span id="home-greeting">你好</span>。每一次交谈，<br>都会留下新的连接。</h1>
+                <p class="home-greeting" id="home-greeting">你好</p>
+                <h1>和熟悉的声音聊聊</h1>
                 <p class="lede" id="home-lede">先添加一段参考录音，就能开始对话。</p>
                 <button class="home-resume" id="home-resume" type="button" hidden>
-                  <span>上次 · <time id="resume-date"></time></span>
+                  <span>继续上次对话 · <time id="resume-date"></time></span>
                   <span id="resume-quote"></span>
                 </button>
               </div>
 
               <figure class="home-network">
-                <button id="home-network-start" type="button" aria-label="开始一段对话">
+                <div class="home-waveform" id="home-network-start" aria-hidden="true">
                 <svg class="neural-tree" id="neural-tree" viewBox="0 0 680 410" aria-hidden="true">
                   <defs>
                     <linearGradient id="neural-gradient" x1="0" y1="0" x2="1" y2="1">
@@ -200,8 +205,7 @@
                   </g>
                   <path class="neural-wave" pathLength="1" d="M216 334H251L259 326L268 346L277 319L286 351L295 327L304 340L314 333H351L360 320L369 348L378 328L387 337L396 333H424"/>
                 </svg>
-                </button>
-                <figcaption>神经网络记忆 · 每一次交流都会长出新的连接</figcaption>
+                </div>
                 <p class="intro-status" id="intro-status" aria-hidden="true">正在连接本地服务…</p>
               </figure>
             </div>
@@ -219,11 +223,12 @@
 
         <form class="composer" id="composer">
           <div class="composer-top" aria-hidden="true"><span>TO</span><b id="composer-to">她</b><span>·</span><span>VOICE</span><b class="voice" id="composer-voice">等待一段声音</b></div>
-          <label for="message-input" class="sr-only">输入消息</label>
+          <label for="message-input" class="composer-label">输入消息</label>
           <textarea id="message-input" maxlength="2000" placeholder="想说什么，就写下来…" rows="1" disabled></textarea>
           <p id="recording-status" class="recording-status" role="status" aria-live="polite"></p>
           <div class="composer-bottom">
             <div class="composer-actions">
+              <a class="realtime-link" id="realtime-link" href="/realtime/"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 10v4m4-7v10m5-14v18m5-14v10m4-7v4"/></svg>实时语音</a>
               <button type="submit" class="home-start" id="home-start">开始对话<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h14M13 6l6 6-6 6"/></svg></button>
               <button type="button" class="record-button" id="record" aria-label="按住录音，松开识别，最长30秒" disabled>按住说话</button>
               <button type="button" class="stop" id="stop" hidden>停止</button>
@@ -263,9 +268,9 @@
           <div class="rail-head"><span>记忆</span><span class="tag">AUTO</span></div>
           <div class="memory-empty">
             <span class="memory-ring" id="rail-memory-count" aria-hidden="true">0</span>
-            <div class="memory-copy"><strong id="rail-memory-title">还没有记忆</strong><span id="rail-memory-note">聊过几轮后，她会慢慢记住你</span></div>
+            <div class="memory-copy"><strong id="rail-memory-title">还没有记忆</strong><span id="rail-memory-note">确认建议后，记忆会出现在这里</span></div>
           </div>
-          <p class="memory-note">每 3 轮成功回复后自动提炼 · 可手动纠正</p>
+          <p class="memory-note">每 3 轮符合条件的回复后提炼 · 确认后记住</p>
         </section>
 
         <section class="rail-card">
@@ -295,8 +300,10 @@
   </div>
 
   <dialog id="voice-dialog" class="drawer" aria-labelledby="voice-dialog-title">
-    <div class="drawer-heading"><h2 id="voice-dialog-title">声音</h2><button type="button" class="close-dialog" aria-label="关闭"><svg viewBox="0 0 24 24"><path d="M18 6L6 18M6 6l12 12"/></svg></button></div>
-    <details class="voice-tone-settings" id="voice-tone-settings" hidden>
+    <div class="drawer-heading"><h2 id="voice-dialog-title">训练声音</h2><button type="button" class="close-dialog" aria-label="关闭"><svg viewBox="0 0 24 24"><path d="M18 6L6 18M6 6l12 12"/></svg></button></div>
+    <p class="dialog-intro" id="trained-voice-empty" hidden>还没有训练声音。导入 Ubuntu 导出的训练结果 ZIP 后即可使用。</p>
+    <button class="primary wide" id="open-adapter-import" type="button">导入训练 ZIP</button>
+    <details class="voice-tone-settings" id="voice-tone-settings" open hidden>
       <summary>说话语气</summary>
       <form id="voice-tone-form">
         <label for="tone-voice">声音</label><select id="tone-voice" required></select>
@@ -309,15 +316,16 @@
         <p id="voice-tone-error" class="error" role="alert"></p>
       </form>
     </details>
+    <details class="voice-tone-settings" id="voice-reference-settings">
+    <summary>添加导入用的参考录音</summary>
     <form id="voice-form">
       <p class="dialog-intro">使用本人或已获授权的声音。选择安静环境下、只有一位说话者的清晰录音。</p>
       <label for="voice-name">声音名称</label><input id="voice-name" name="name" maxlength="60" required placeholder="例如：我的声音">
       <label for="voice-file">参考录音 <span>PCM WAV，3–30 秒，≤10 MB</span></label><input id="voice-file" name="recording" type="file" accept=".wav,audio/wav,audio/x-wav" required>
       <label for="voice-transcript">录音原文</label><textarea id="voice-transcript" name="transcript" maxlength="2000" rows="4" required placeholder="逐字填写录音中说出的内容，不要填写希望 AI 说的话。"></textarea>
-      <p class="form-note">保存后分配独立 UUID。此标识代表声音档案，音色通过参考录音生成，相似度需要试听确认。</p>
-      <p id="voice-error" class="error" role="alert"></p><button class="primary wide" id="save-voice" type="submit">保存声音</button>
-      <button class="quiet wide" id="open-adapter-import" type="button">导入训练声音</button>
+      <p id="voice-error" class="error" role="alert"></p><button class="primary wide" id="save-voice" type="submit">保存参考录音</button>
     </form>
+    </details>
   </dialog>
 
   <dialog id="adapter-dialog" class="drawer" aria-labelledby="adapter-dialog-title">
@@ -409,18 +417,59 @@
   <dialog id="character-settings-dialog" class="drawer" aria-labelledby="settings-title">
     <div class="drawer-heading"><h2 id="settings-title">本会话人物设定</h2><button class="close-dialog" type="button" aria-label="关闭"><svg viewBox="0 0 24 24"><path d="M18 6L6 18M6 6l12 12"/></svg></button></div>
     <p class="dialog-intro">下方为创建会话时的快照。编辑人物后，新建会话才使用新设定。</p>
+    <p id="character-snapshot-version" class="form-note"></p>
     <div id="character-snapshot"></div><button id="edit-current-character" class="primary wide" type="button">编辑人物最新设定</button>
+    <button id="start-latest-character" class="wide" type="button">用最新设定开始对话</button>
   </dialog>
   <dialog id="memory-dialog" class="drawer" aria-labelledby="memory-title">
     <div class="drawer-heading"><h2 id="memory-title">人物记忆</h2><button class="close-dialog" type="button" aria-label="关闭"><svg viewBox="0 0 24 24"><path d="M18 6L6 18M6 6l12 12"/></svg></button></div>
-    <p class="dialog-intro">同一人物跨会话共享。每 3 轮成功文字回复自动提炼，可能增加 LLM 费用；请及时纠正错误记忆。</p>
-    <p id="memory-status" role="status" aria-live="polite"></p><button id="refresh-memory" type="button">更新记忆</button>
-    <div id="memory-list"></div>
-    <form id="memory-form"><h3 id="memory-form-title">添加记忆</h3>
-      <label for="memory-key">主题</label><input id="memory-key" maxlength="60" required placeholder="例如：饮食偏好">
-      <label for="memory-content">事实</label><textarea id="memory-content" maxlength="200" rows="3" required></textarea>
-      <p id="memory-error" class="error" role="alert"></p><button type="submit" class="primary wide">保存记忆</button><button id="reset-memory-form" type="button">取消编辑</button>
+    <p class="dialog-intro">同一人物的文字和实时语音会话共享已确认记忆。每 3 轮符合条件的回复后提炼建议，可能产生 LLM 费用。</p>
+    <div class="memory-switch" role="group" aria-label="记忆视图">
+      <button id="show-confirmed-memory" type="button" aria-controls="confirmed-memory" aria-pressed="true">已记住</button>
+      <button id="show-pending-memory" type="button" aria-controls="pending-memory" aria-pressed="false">待确认</button>
+    </div>
+    <section id="confirmed-memory" aria-labelledby="show-confirmed-memory">
+      <p class="dialog-intro">删除长期记忆后，下一轮对话就会停止使用这条记忆。原始聊天记录仍在会话中。</p>
+      <p id="confirmed-list-error" class="error" role="alert"></p>
+      <div id="memory-list"></div>
+      <form id="memory-form"><h3 id="memory-form-title">添加记忆</h3>
+        <label for="memory-key">主题</label><input id="memory-key" maxlength="60" required placeholder="例如：饮食偏好">
+        <label for="memory-content">事实</label><textarea id="memory-content" maxlength="200" rows="3" required></textarea>
+        <p id="memory-error" class="error" role="alert"></p><button type="submit" class="primary wide">保存记忆</button><button id="reset-memory-form" type="button">取消编辑</button>
+      </form>
+    </section>
+    <section id="pending-memory" aria-labelledby="show-pending-memory" hidden>
+      <p id="memory-status" role="status" aria-live="polite"></p><button id="refresh-memory" type="button">提炼待确认记忆</button>
+      <p id="memory-refresh-error" class="error" role="alert"></p>
+      <p id="candidate-list-error" class="error" role="alert"></p>
+      <p id="candidate-empty" class="dialog-intro" hidden>暂无待确认记忆。</p>
+      <div id="candidate-list"></div>
+    </section>
+  </dialog>
+
+  <dialog id="summary-dialog" class="drawer" aria-labelledby="summary-title">
+    <div class="drawer-heading"><h2 id="summary-title">会话摘要</h2><button class="close-dialog" type="button" aria-label="关闭"><svg viewBox="0 0 24 24"><path d="M18 6L6 18M6 6l12 12"/></svg></button></div>
+    <p class="dialog-intro">保留本会话较早的经过与未完成事项，补充最近的问答。可以改写或删除条目；跨会话的事实请使用人物记忆。</p>
+    <p id="summary-status" role="status" aria-live="polite"></p>
+    <p id="summary-coverage" class="form-note"></p>
+    <div class="evolution-actions"><button id="refresh-summary" type="button">重新整理历史</button><button id="clear-summary" type="button">清空摘要</button></div>
+    <form id="summary-form">
+      <div id="summary-items"></div>
+      <p id="summary-error" class="error" role="alert"></p>
+      <button id="reload-summary" type="button" hidden>重新读取（放弃草稿）</button>
+      <button id="save-summary" class="primary wide" type="submit" disabled>保存修改</button>
     </form>
+    <h3>摘要版本历史</h3><p id="summary-revisions-error" class="error" role="alert"></p>
+    <div id="summary-revisions"></div><button id="more-summary-revisions" type="button" hidden>更多摘要版本</button>
+  </dialog>
+  <dialog id="evolution-dialog" class="drawer" aria-labelledby="evolution-title">
+    <div class="drawer-heading"><h2 id="evolution-title">交流风格与版本</h2><button class="close-dialog" type="button" aria-label="关闭"><svg viewBox="0 0 24 24"><path d="M18 6L6 18M6 6l12 12"/></svg></button></div>
+    <p class="dialog-intro">多次明确反馈可以形成性格、说话习惯的调整建议。确认后仅新会话生效，已有会话保留原设定。</p>
+    <p id="evolution-status" role="status" aria-live="polite"></p>
+    <div class="evolution-actions"><button id="refresh-evolution" type="button">整理交流风格建议</button><button id="evolution-start-latest" type="button">用最新设定开始对话</button></div>
+    <p id="evolution-error" class="error" role="alert"></p><div id="evolution-candidates"></div>
+    <h3>人物版本历史</h3><p id="profile-revisions-error" class="error" role="alert"></p>
+    <div id="profile-revisions"></div><button id="more-profile-revisions" type="button" hidden>更多人物版本</button>
   </dialog>
 
   <div class="toast" id="toast" role="alert" hidden><svg class="toast-check" viewBox="0 0 24 24"><path d="M20 6L9 17l-5-5"/></svg><span id="toast-text"></span></div>

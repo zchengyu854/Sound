@@ -80,14 +80,25 @@ class CharacterTests(unittest.TestCase):
         self.assertEqual(response.status_code,201,response.text)
         return response.json()
 
-    def send(self, conversation, text='我喜欢清淡的食物。'):
-        response=self.client.post(f"/api/conversations/{conversation['id']}/messages",json={'content':text})
+    def send(self, conversation, text='我喜欢清淡的食物。', mode='standard'):
+        response=self.client.post(f"/api/conversations/{conversation['id']}/messages",json={'content':text,'mode':mode})
         self.assertEqual(response.status_code,202,response.text)
         self.wait(lambda:not self.service.gate.locked())
         return self.client.get('/api/messages/'+response.json()['id']).json()
 
     def memory(self, character):
         return self.client.get(f"/api/characters/{character['id']}/memories").json()
+
+    def candidates(self, character):
+        response = self.client.get(f"/api/characters/{character['id']}/memory-candidates")
+        self.assertEqual(response.status_code, 200, response.text)
+        return response.json()['items']
+
+    def review(self, character, candidate, action='approve', **fields):
+        if action == 'approve':
+            fields.setdefault('review_token', candidate['review_token'])
+        return self.client.post(f"/api/characters/{character['id']}/memory-candidates/{candidate['id']}",
+                                json={'action': action, **fields})
 
     def manual(self, character, key='饮食偏好',content='喜欢辣的食物'):
         return self.client.post(f"/api/characters/{character['id']}/memories",json={'key':key,'content':content})
@@ -129,24 +140,35 @@ class CharacterTests(unittest.TestCase):
     def test_memory_isolation_and_cross_session(self):
         first,second=self.character(),self.character('另外一个人物')
         self.manual(first)
-        self.send(self.conversation(first))
+        self.send(self.conversation(first), mode='realtime')
         self.assertIn('喜欢辣的食物',self.histories[-1][0]['content'])
-        self.send(self.conversation(second))
+        self.send(self.conversation(second), mode='realtime')
         self.assertNotIn('喜欢辣的食物',self.histories[-1][0]['content'])
+        voice_only = self.client.post('/api/conversations', json={'voice_id': self.voice['id']}).json()
+        self.send(voice_only, mode='realtime')
+        self.assertNotIn('<character_data>', self.histories[-1][0]['content'])
+        self.assertEqual(len(self.service.rows('SELECT * FROM memory_turns')), 2)
         item=self.memory(first)['items'][0]
         self.assertEqual(self.client.delete(f"/api/characters/{second['id']}/memories/{item['id']}").status_code,404)
         self.assertEqual(self.memory(second)['items'],[])
 
     def test_every_three_turns_and_audio_retry_does_not_count(self):
         character=self.character(); conversation=self.conversation(character)
-        for _ in range(2): self.send(conversation)
+        self.send(conversation)
+        self.send(self.conversation(character), mode='realtime')
         self.assertEqual(self.requests,[])
         self.engine.fail=True
-        task=self.send(conversation)
+        task=self.send(conversation, mode='realtime')
         self.wait(lambda:not self.store.gate.locked())
         self.assertEqual(task['status'],'audio_failed')
         self.assertEqual(len(self.requests),1)
-        self.assertEqual(self.memory(character)['items'][0]['origin'],'auto')
+        self.assertEqual(self.memory(character)['items'], [])
+        candidate = self.candidates(character)[0]
+        self.assertEqual(candidate['source_text'], '我喜欢清淡的食物。')
+        self.assertTrue(candidate['source_created_at'])
+        self.assertEqual(self.review(character, candidate).status_code, 200)
+        item = self.memory(character)['items'][0]
+        self.assertEqual((item['origin'], item['source_id']), ('auto', candidate['source_id']))
         self.engine.fail=False
         self.client.post('/api/messages/'+task['id']+'/retry')
         self.wait(lambda:not self.service.gate.locked())
@@ -162,32 +184,68 @@ class CharacterTests(unittest.TestCase):
         self.response=json.dumps({'items':[{'key':'bad','content':'bad','source_id':str(uuid4())}]})
         self.assertEqual(self.refresh(character)['status'],'failed')
         self.response=None
-        self.assertEqual(len(self.refresh(character)['items']),1)
+        self.assertEqual(self.refresh(character)['items'], [])
+        self.assertEqual(len(self.candidates(character)), 1)
         count=len(self.requests); self.refresh(character)
         self.assertEqual(len(self.requests),count)
 
+    def test_candidate_batch_and_cursor_roll_back_together(self):
+        character = self.character()
+        task = self.send(self.conversation(character))
+        self.response = json.dumps({'items': [
+            {'key': '地点', 'content': '靠海', 'source_id': task['reply_to']},
+            {'key': '时间', 'content': '下午', 'source_id': task['reply_to']},
+        ]})
+        with closing(self.service.connect()) as db, db:
+            db.execute("""CREATE TRIGGER reject_candidate_for_test BEFORE INSERT ON memory_candidates
+                WHEN NEW.key='时间' BEGIN SELECT RAISE(ABORT, 'test write failure'); END""")
+        self.assertEqual(self.refresh(character)['status'], 'failed')
+        self.assertEqual(self.store.get(character['id'])['memory_cursor'], 0)
+        self.assertEqual(self.candidates(character), [])
+        with closing(self.service.connect()) as db, db:
+            db.execute('DROP TRIGGER reject_candidate_for_test')
+        self.assertEqual(self.refresh(character)['status'], 'idle')
+        self.assertEqual(len(self.candidates(character)), 2)
+
     def test_memory_edits_win_and_deleted_data_not_restored(self):
         character=self.character(); self.send(self.conversation(character))
+        self.manual(character)
         self.release.clear()
         self.client.post(f"/api/characters/{character['id']}/memories/refresh")
         self.assertTrue(self.entered.wait(2))
-        self.manual(character)
         item=self.memory(character)['items'][0]
         self.client.delete(f"/api/characters/{character['id']}/memories/{item['id']}")
         self.release.set(); self.wait(lambda:not self.store.gate.locked())
         result=self.memory(character)
         self.assertEqual(result['items'],[])
+        self.assertEqual(self.candidates(character), [])
         self.assertEqual(result['status'],'warning')
         self.assertGreater(self.store.get(character['id'])['memory_cursor'],0)
         count=len(self.requests);self.refresh(character)
         self.assertEqual(len(self.requests),count)
+        self.send(self.conversation(character), '继续聊天', mode='realtime')
+        self.assertNotIn(item['content'], self.histories[-1][0]['content'])
+
+    def test_deleting_a_fact_also_removes_its_pending_update(self):
+        character = self.character()
+        self.manual(character)
+        self.send(self.conversation(character))
+        self.refresh(character)
+        candidate, = self.candidates(character)
+        item, = self.memory(character)['items']
+        url = f"/api/characters/{character['id']}/memories/{item['id']}"
+        self.assertEqual(self.client.put(url, json={'key': '新的主题', 'content': '新的内容'}).status_code, 200)
+        self.assertEqual(self.client.delete(url).status_code, 200)
+        self.assertEqual(self.candidates(character), [])
+        self.assertEqual(self.review(character, candidate).status_code, 404)
 
     def test_manual_conflicts_capacity_and_duplicates(self):
         character=self.character();self.send(self.conversation(character))
         self.manual(character)
         result=self.refresh(character)
-        self.assertEqual(result['status'],'warning')
+        self.assertEqual(result['status'],'idle')
         self.assertEqual(result['items'][0]['content'],'喜欢辣的食物')
+        self.assertEqual(self.candidates(character)[0]['old_content'],'喜欢辣的食物')
         self.assertEqual(self.manual(character).status_code,409)
         for i in range(29):self.assertEqual(self.manual(character,str(i),str(i)).status_code,201)
         self.assertEqual(self.manual(character,'overflow','overflow').status_code,409)
@@ -195,20 +253,73 @@ class CharacterTests(unittest.TestCase):
         turn=self.service.rows('SELECT source_id FROM memory_turns ORDER BY seq DESC')[0]
         self.response=json.dumps({'items':[{'key':'overflow','content':'overflow','source_id':turn['source_id']}]})
         result=self.refresh(character)
-        self.assertEqual(result['status'],'warning')
         self.assertEqual(len(result['items']),30)
+        candidate = next(item for item in self.candidates(character) if item['key'] == 'overflow')
+        self.assertEqual(self.review(character, candidate).status_code, 409)
+        self.assertEqual(self.review(character, candidate, 'reject').status_code, 200)
+        self.assertNotIn('overflow', {item['key'] for item in self.candidates(character)})
 
-    def test_auto_updates_and_duplicate_content(self):
+    def test_correction_requires_review_and_candidates_stay_out_of_chat(self):
         character=self.character();conversation=self.conversation(character)
-        self.send(conversation);first=self.refresh(character)['items'][0]
-        self.send(conversation)
+        other = self.character('另一个人物')
+        self.manual(character)
+        first = self.memory(character)['items'][0]
+        correction = '我现在改吃清淡，不再吃辣。'
+        self.send(conversation, correction)
+        self.assertEqual(self.histories[-1][-1]['content'], correction)
+        self.assertIn('本轮以用户的新说法为准', self.histories[-1][0]['content'])
         source=self.service.rows('SELECT source_id FROM memory_turns ORDER BY seq DESC')[0]['source_id']
-        self.response=json.dumps({'items':[{'key':'饮食偏好','content':'现在喜欢辣的食物','source_id':source},
-                                         {'key':'重复主题','content':'现在喜欢辣的食物','source_id':source}]})
-        result=self.refresh(character)
-        self.assertEqual(len(result['items']),1)
-        self.assertEqual(result['items'][0]['id'],first['id'])
-        self.assertEqual(result['items'][0]['content'],'现在喜欢辣的食物')
+        content = '改为偏爱清淡口味'
+        self.response=json.dumps({'items':[{'key':'饮食偏好','content':content,'source_id':source},
+                                         {'key':'重复主题','content':content,'source_id':source}]})
+        self.refresh(character)
+        candidate, = self.candidates(character)
+        self.assertEqual(candidate['old_content'], first['content'])
+        self.send(self.conversation(character), '聊聊晚饭', mode='realtime')
+        self.assertNotIn(content, self.histories[-1][0]['content'])
+        self.assertIn(first['content'], self.histories[-1][0]['content'])
+        self.assertEqual(self.candidates(other), [])
+        self.assertEqual(self.review(other, candidate).status_code, 404)
+        url = f"/api/characters/{character['id']}/memories/{first['id']}"
+        self.assertEqual(self.client.put(url, json={'key': first['key'], 'content': '暂时吃微辣'}).status_code, 200)
+        self.assertEqual(self.review(character, candidate).status_code, 409)
+        refreshed, = self.review(character, candidate, 'review').json()['items']
+        self.assertEqual(refreshed['old_content'], '暂时吃微辣')
+        self.assertEqual(self.review(character, candidate).status_code, 409)
+        self.assertEqual(self.review(character, refreshed, content='偏好清淡').status_code, 200)
+        item, = self.memory(character)['items']
+        self.assertEqual((item['id'], item['content'], item['source_id']), (first['id'], '偏好清淡', source))
+        self.send(self.conversation(character), '继续聊天')
+        self.assertIn('偏好清淡', self.histories[-1][0]['content'])
+        self.assertNotIn(first['content'], self.histories[-1][0]['content'])
+
+    def test_cancelled_replies_never_register(self):
+        character = self.character()
+        conversation = self.conversation(character)
+        entered, release = threading.Event(), threading.Event()
+        original = self.engine.synthesize
+
+        def blocked(*args, **kwargs):
+            entered.set()
+            release.wait(3)
+            return original(*args, **kwargs)
+
+        for mode in ('standard', 'realtime'):
+            entered.clear()
+            release.clear()
+            with patch.object(self.engine, 'synthesize', side_effect=blocked):
+                task = self.client.post(f"/api/conversations/{conversation['id']}/messages",
+                                        json={'content': '正在说话', 'mode': mode}).json()
+                try:
+                    self.assertTrue(entered.wait(2))
+                    self.assertTrue(self.client.post(f"/api/messages/{task['id']}/cancel").json()['cancel_requested'])
+                finally:
+                    release.set()
+                self.wait(lambda: not self.service.gate.locked())
+            saved = self.service.one('messages', task['id'])
+            self.assertTrue(saved['text_finalized'])
+            self.assertEqual(saved['error_code'], 'interrupted' if mode == 'realtime' else 'cancelled')
+        self.assertEqual(self.service.rows('SELECT * FROM memory_turns'), [])
 
     def test_global_memory_gate_and_chat_does_not_wait(self):
         first,second=self.character(),self.character('second')
@@ -231,6 +342,7 @@ class CharacterTests(unittest.TestCase):
         self.wait(lambda:not self.store.gate.locked())
         self.assertEqual(self.memory(character)['status'],'failed')
         self.release.set();self.refresh(character)
+        self.assertEqual(self.review(character, self.candidates(character)[0]).status_code, 200)
         cursor=self.store.get(character['id'])['memory_cursor']
         self.client.__exit__(None,None,None)
         self.patcher.stop()
@@ -242,7 +354,7 @@ class CharacterTests(unittest.TestCase):
 
     def test_twenty_turn_batch_limit(self):
         character=self.character();conversation=self.conversation(character)
-        with patch.object(self.store,'trigger'):
+        with patch.object(self.store,'trigger'), patch.object(self.service.summaries, 'note'):
             for _ in range(23):self.send(conversation)
         self.refresh(character)
         self.assertEqual(len(json.loads(self.requests[-1][1]['content'])['sources']),20)
@@ -280,13 +392,45 @@ class CharacterTests(unittest.TestCase):
             task=self.send(self.conversation(character))
         self.assertEqual(task['status'],'complete')
 
+    def test_retried_cancelled_sources_cannot_be_extracted_or_approved(self):
+        character = self.character()
+        task = self.send(self.conversation(character))
+        self.refresh(character)
+        candidate, = self.candidates(character)
+        with closing(self.service.connect()) as db, db:
+            db.execute("UPDATE messages SET status='interrupted',error_code='interrupted',attempt=attempt+1 WHERE id=?", (task['id'],))
+            db.execute("UPDATE characters SET memory_cursor=0 WHERE id=?", (character['id'],))
+        count = len(self.requests)
+        self.refresh(character)
+        self.assertEqual(len(self.requests), count)
+        self.assertEqual(self.review(character, candidate).status_code, 409)
+        self.assertEqual(self.review(character, candidate, 'review').status_code, 409)
+        self.assertEqual(self.review(character, candidate, 'reject').status_code, 200)
+
+    def test_source_retry_during_extraction_preserves_cursor(self):
+        character = self.character()
+        task = self.send(self.conversation(character))
+        self.release.clear()
+        self.client.post(f"/api/characters/{character['id']}/memories/refresh")
+        self.assertTrue(self.entered.wait(2))
+        with closing(self.service.connect()) as db, db:
+            db.execute("UPDATE messages SET attempt=attempt+1 WHERE id=?", (task['id'],))
+        self.release.set()
+        self.wait(lambda: not self.store.gate.locked())
+        self.assertEqual(self.candidates(character), [])
+        self.assertEqual(self.store.get(character['id'])['memory_cursor'], 0)
+        self.assertEqual(self.memory(character)['status'], 'failed')
+
     def test_character_migration_backup_and_rollback(self):
         old=Path(self.temp.name)/'old'
         shutil.copytree(self.directory,old)
         with closing(sqlite3.connect(old/'chat.sqlite3')) as db:
             db.execute('ALTER TABLE conversations DROP COLUMN character_snapshot')
             db.execute('ALTER TABLE conversations DROP COLUMN character_id')
-            for table in ('memory_turns','memories','characters'):db.execute('DROP TABLE '+table)
+            db.execute('ALTER TABLE conversations DROP COLUMN character_revision_id')
+            db.execute('DROP TABLE character_profile_revisions')
+            db.execute('DROP TABLE character_profile_candidates')
+            for table in ('memory_candidates','memory_turns','memories','characters'):db.execute('DROP TABLE '+table)
             db.commit()
         for backup in old.glob('before-characters-*.sqlite3'):backup.unlink()
         app=create_app(old,Engine(),self.reply);service=app.state.service
@@ -308,6 +452,29 @@ class CharacterTests(unittest.TestCase):
         for path in backups:
             with closing(sqlite3.connect(path)) as backup:
                 self.assertEqual(backup.execute('SELECT count(*) FROM voices').fetchone()[0],1)
+
+    def test_review_migration_preserves_confirmed_history_and_source(self):
+        character = self.character()
+        task = self.send(self.conversation(character))
+        self.refresh(character)
+        self.assertEqual(self.review(character, self.candidates(character)[0]).status_code, 200)
+        old = Path(self.temp.name) / 'pre-review'
+        old.mkdir()
+        with closing(self.service.connect()) as live, closing(sqlite3.connect(old / 'chat.sqlite3')) as db:
+            live.backup(db)
+            db.execute('DROP TABLE memory_candidates')
+            db.execute('ALTER TABLE memories DROP COLUMN revision')
+            db.commit()
+        app = create_app(old, Engine(), self.reply)
+        with TestClient(app, base_url='http://127.0.0.1') as client:
+            url = f"/api/characters/{character['id']}"
+            item, = client.get(f'{url}/memories').json()['items']
+            self.assertEqual(item['source_id'], task['reply_to'])
+            self.assertEqual(item['content'], '喜欢清淡的食物')
+            self.assertEqual(client.get(f'{url}/memory-candidates').json()['items'], [])
+        backup, = old.glob('before-memory-review-*.sqlite3')
+        with closing(sqlite3.connect(backup)) as db:
+            self.assertEqual(db.execute('SELECT source_id FROM memories').fetchone()[0], task['reply_to'])
 
 
 if __name__=='__main__':unittest.main()
