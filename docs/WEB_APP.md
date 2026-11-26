@@ -223,7 +223,11 @@ SQLite 迁移分别在增加人物和候选表前生成 `before-characters-<uuid
 
 提示词的字数要求不是服务端硬保证，token也不等于汉字数或音频秒数。若提供方忽略参数或提示，仍可能返回长回复；应用不伪装为短回答。提供方报告输出上限或Breeze达到750帧（约60秒）时，沿用原有明确提示。真实服务是否遵守约束需要实测，不保证任何语速下都在60秒内。
 
-消息气泡、紧凑语音卡片和安全的历史加粗显示保留；一条回复渲染为单张卡片，所有段落完整显示。界面使用统一设计令牌，桌面与窄屏列表/聊天视图共用黑色主题。检查命令：`node --check web/app.js`、`node tests/test_reply_ui.cjs`、`.venv/bin/python -m unittest discover -s tests -p "test_voice_app.py" -q`、`.venv/bin/python -m unittest discover -s tests -p "test_characters.py" -q`。
+消息气泡、紧凑语音卡片和安全的历史加粗显示保留；一条回复渲染为单张卡片，所有段落完整显示。列表和聊天视图共用主题。检查命令：`node --check web/app.js`、`node tests/test_reply_ui.cjs`、`.venv/bin/python -m unittest discover -s tests -p "test_voice_app.py" -q`、`.venv/bin/python -m unittest discover -s tests -p "test_characters.py" -q`。
+
+## 声音工作室界面（studio.css / studio.js）
+
+主界面外壳在 2026-11 重设计为「声音工作室」：单舞台 + 单抽屉。`web/index.html` 只链接 `/studio.css`（浅色纸面网格 + 钴蓝极光 + 黑胶唱片设计令牌）与既有脚本加 `/studio.js`（新外壳交互层：书房抽屉标签页与滑块、⌘K、回忆搜索过滤、记忆分段滑块、涟漪反馈）。`app.js` 统一更新首页服务状态，新打开或刷新首页页面时播放 3.5 秒落针动画，启用「减少动态效果」时跳过。首页按可用高度压缩布局，会话记录在内容区滚动。旧侧栏/旧首页不再渲染，相关元素以隐藏容器保留 ID 供 `app.js` 继续读写。旧样式 `web/style.css`、`web/memory.css`、`web/home.css` 仍留在磁盘上便于回退，但不再被引用；设计原型见 `web-test-artifacts/design-proposal/voice-studio.html`。
 
 ## Mac 与 Ubuntu 的训练边界
 

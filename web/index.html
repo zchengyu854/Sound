@@ -3,232 +3,116 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
-  <meta name="color-scheme" content="dark">
-  <meta name="theme-color" content="#08090b">
+  <meta name="color-scheme" content="light">
+  <meta name="theme-color" content="#f6f7f9">
   <meta name="page-type" content="software">
   <meta name="site-kind" content="software">
   <meta property="og:title" content="VOICE˚ — 声音记忆">
   <meta property="og:description" content="用你的声音库开启对话。参考录音与语音合成留在本机。">
   <meta name="description" content="VOICE˚ — 本地声音记忆。留住说过的话，和她的声音。参考录音与语音合成留在本机；聊天文字会发送至配置的 LLM。">
   <title>VOICE˚ — 声音记忆</title>
-  <link rel="stylesheet" href="/style.css">
-  <link rel="stylesheet" href="/memory.css">
-  <link rel="stylesheet" href="/home.css">
+  <link rel="stylesheet" href="/studio.css">
   <script src="/reply.js" defer></script>
   <script src="/audio.js" defer></script>
   <script src="/recorder.js" defer></script>
   <script src="/app.js" defer></script>
+  <script src="/studio.js" defer></script>
 </head>
 <body>
   <a class="home-skip" href="#message-input">跳到对话输入</a>
-  <div class="background" aria-hidden="true"></div>
 
-  <div class="app" id="app" data-home="true" data-view="chat">
-    <header class="topbar">
-      <button class="brand" id="brand-home" type="button" aria-label="回到回忆首页">
-        <span class="brand-word">VOICE<span class="brand-degree">˚</span></span>
-        <span class="brand-sub">声音记忆<br>MEMORY</span>
-      </button>
-      <div class="top-route" aria-hidden="true"><b>回忆</b><i>/</i><span>她</span><span class="concept" id="top-mode">MEMORY ROOM</span></div>
-      <div class="top-actions">
-        <button class="nav-link mobile-list" id="mobile-list" type="button" aria-label="打开回忆列表"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h10"/></svg><span>回忆</span></button>
-        <button class="nav-link home-nav" id="home-voices" type="button">声音</button>
-        <button class="nav-link home-nav" id="home-characters" type="button">人物</button>
-        <a class="nav-link home-nav" href="/tone/">语气试听</a>
-        <button class="status" id="top-status" type="button" aria-label="查看本地服务状态" aria-haspopup="dialog" aria-controls="local-dialog"><i aria-hidden="true"></i><span id="top-status-text">只在本机</span></button>
-        <button class="nav-link settings-button" id="nav-settings" type="button" aria-label="设置" aria-haspopup="dialog" aria-controls="settings-dialog" title="设置"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h6m4 0h6M4 17h10m4 0h2"/><circle cx="12" cy="7" r="2"/><circle cx="16" cy="17" r="2"/></svg><span>设置</span></button>
+  <div class="app" id="app" data-home="true">
+    <header class="bar">
+      <div class="bar-left">
+        <button class="brand" id="brand-home" type="button" aria-label="回到首页">
+          <span class="brand-word">VOICE<span class="brand-degree">˚</span></span>
+          <span class="brand-sub">声音记忆 · STUDIO</span>
+        </button>
+        <div class="chat-heading" id="chat-heading">
+          <strong id="chat-title">开始一段对话</strong>
+          <span id="chat-subtitle">添加参考录音，选择声音开始聊天</span>
+        </div>
+        <button class="bar-btn icon-only" id="mobile-list" type="button" aria-label="打开回忆列表" aria-haspopup="dialog" aria-controls="library-dialog">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 12a9 9 0 1 0 3-6.7L3 8"/><path d="M3 3v5h5"/><path d="M12 7v5l3 2"/></svg>
+        </button>
+      </div>
+      <div class="bar-right">
+        <button class="bar-btn memory-open" id="memory-open" type="button">
+          <span class="status-dot" aria-hidden="true"></span><span class="label">记忆</span><b data-memory-count>00</b>
+        </button>
+        <details class="chat-more" id="chat-more">
+          <summary class="icon-btn" aria-label="本会话更多操作" role="button">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="5" cy="12" r="1.4" fill="currentColor" stroke="none"/><circle cx="12" cy="12" r="1.4" fill="currentColor" stroke="none"/><circle cx="19" cy="12" r="1.4" fill="currentColor" stroke="none"/></svg>
+          </summary>
+          <div class="more-menu">
+            <button id="conversation-summary" type="button" hidden>会话摘要</button>
+            <button id="character-settings" type="button" hidden>人物设定</button>
+            <button id="character-memories" type="button" hidden>人物记忆</button>
+            <button id="character-evolution" type="button" hidden>交流风格</button>
+          </div>
+        </details>
+        <button class="status" id="top-status" type="button" aria-label="查看本地服务状态" aria-haspopup="dialog" aria-controls="local-dialog">
+          <i class="nav-dot" id="nav-dot" aria-hidden="true"></i><span id="top-status-text" class="visually-hidden">只在本机</span>
+        </button>
+        <button class="bar-btn icon-only" id="nav-settings" type="button" aria-label="设置" aria-haspopup="dialog" aria-controls="settings-dialog">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h6m4 0h6M4 17h10m4 0h2"/><circle cx="12" cy="7" r="2"/><circle cx="16" cy="17" r="2"/></svg>
+        </button>
       </div>
     </header>
 
-    <div class="workspace">
-      <aside class="sidebar" aria-label="回忆与会话">
-        <div class="drawer-heading home-history-heading">
-          <h2>回忆</h2>
-          <button class="close-dialog" id="close-history" type="button" aria-label="返回首页"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18 6L6 18M6 6l12 12"/></svg></button>
-        </div>
-        <button class="new-session" id="new-chat" type="button" aria-label="开始一段新的对话"><span class="plus" aria-hidden="true">＋</span><span>开始一段对话</span><span class="shortcut" aria-hidden="true">⌘N</span></button>
-        <button class="rail-add" id="add-character" type="button">＋ 创建人物</button>
+    <div id="service-status" class="service-status" role="status" aria-live="polite">正在连接本地服务…</div>
 
-        <nav class="memory-nav" aria-label="主导航">
-          <button class="nav-item active" id="nav-sessions" type="button"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5h16M4 12h10M4 19h13"/></svg><span class="label">回忆</span><span class="count" data-count>0</span></button>
-          <button class="nav-item" id="nav-characters" type="button"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="8" r="4"/><path d="M4.5 21c.9-4 3.9-6 7.5-6s6.6 2 7.5 6"/></svg><span class="label">人物</span><span class="count" data-character-count>0</span></button>
-          <button class="nav-item" id="nav-voices" type="button"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 12v0M8 8v8M12 4v16M16 7v10M20 11v2"/></svg><span class="label">声音</span><span class="count" data-voice-count>0</span></button>
-          <button class="nav-item" id="nav-local" type="button"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="5" width="16" height="11" rx="1.5"/><path d="M9 20h6M12 16v4"/></svg><span class="label">本地</span><span class="nav-dot" id="nav-dot" aria-hidden="true"></span></button>
-        </nav>
-
-        <div class="rail-heading"><span>回忆片段</span><span data-count>0</span></div>
-        <nav id="conversations" aria-label="历史会话"></nav>
-
-        <button class="sidebar-voice" id="sidebar-voice" type="button" aria-label="查看声音库">
-          <span class="voice-head"><span>她的声音</span><b id="sidebar-voice-tag">VOICE</b></span>
-          <span class="voice-name" id="sidebar-voice-name">尚未添加声音</span>
-          <span class="voice-meta" id="sidebar-voice-meta">添加一段参考录音，让声音留下来</span>
-          <svg viewBox="0 0 220 28" preserveAspectRatio="none" aria-hidden="true"><path d="M0 14H22L28 9L33 20L39 5L45 24L52 11L58 18L64 14H96L103 7L110 22L117 12L124 17L131 14H168L175 9L182 20L189 13L196 16H220" fill="none" stroke="currentColor" stroke-width="1"/></svg>
-        </button>
-        <div class="sidebar-footer"><span class="local-dot" aria-hidden="true"></span><span>只留在本机 / 不上传<br>参考录音与语音合成</span></div>
-      </aside>
-
-      <main class="chat">
-        <div class="chat-network" id="chat-network" aria-hidden="true"></div>
-        <header class="chat-header">
-          <button class="mobile-back" id="mobile-back" type="button" aria-label="返回回忆列表"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M15 18l-6-6 6-6"/></svg><span>回忆</span></button>
-          <div class="chat-heading"><h2 id="chat-title">开始一段对话</h2><p id="chat-subtitle">添加参考录音，选择声音开始聊天</p></div>
-          <div class="character-actions"><button id="conversation-summary" type="button" hidden>会话摘要</button><button id="character-settings" type="button" hidden>人物设定</button><button id="character-memories" type="button" hidden>记忆</button><button id="character-evolution" type="button" hidden>交流风格</button></div><label class="voice-picker"><span>人物 / 声音</span><select id="voice-select" aria-label="选择人物或声音，切换时新建会话"><option value="">尚未添加声音</option></select></label>
-        </header>
-        <div id="service-status" class="service-status" role="status" aria-live="polite">正在连接本地服务…</div>
-
-        <section class="timeline" id="timeline" aria-label="聊天记录" tabindex="0">
-          <div class="empty-state" id="empty-state">
-            <div class="memory-home hero" id="memory-home" data-enter>
-              <div class="memory-head">
-                <p class="eyebrow" id="home-eyebrow">声音记忆</p>
-                <p class="home-greeting" id="home-greeting">你好</p>
-                <h1>和熟悉的声音聊聊</h1>
-                <p class="lede" id="home-lede">先添加一段参考录音，就能开始对话。</p>
-                <button class="home-resume" id="home-resume" type="button" hidden>
-                  <span>继续上次对话 · <time id="resume-date"></time></span>
-                  <span id="resume-quote"></span>
-                </button>
-              </div>
-
-              <figure class="home-network">
-                <div class="home-waveform" id="home-network-start" aria-hidden="true">
-                <svg class="neural-tree" id="neural-tree" viewBox="0 0 680 410" aria-hidden="true">
-                  <defs>
-                    <linearGradient id="neural-gradient" x1="0" y1="0" x2="1" y2="1">
-                      <stop offset="0" stop-color="#709ba6"/>
-                      <stop offset=".54" stop-color="#a6c5cc"/>
-                      <stop offset="1" stop-color="#9d8067"/>
-                    </linearGradient>
-                    <radialGradient id="neural-halo">
-                      <stop offset="0" stop-color="#93c1cc" stop-opacity=".12"/>
-                      <stop offset="1" stop-color="#93c1cc" stop-opacity="0"/>
-                    </radialGradient>
-                  </defs>
-                  <circle class="neural-halo" cx="310" cy="195" r="180" fill="url(#neural-halo)"/>
-                  <g class="neural-line strong">
-                    <path d="M310 354C307 308 307 265 306 217"/>
-                    <path d="M306 217C274 187 244 174 207 158"/>
-                    <path d="M306 217C340 184 371 169 409 148"/>
-                  </g>
-                  <g class="neural-line">
-                    <path d="M207 158C176 143 146 126 124 94"/>
-                    <path d="M207 158C190 127 181 101 177 68"/>
-                    <path d="M207 158C180 159 157 166 135 180"/>
-                    <path d="M409 148C441 130 462 106 478 76"/>
-                    <path d="M409 148C428 120 438 92 441 56"/>
-                    <path d="M409 148C440 151 465 160 488 177"/>
-                    <path d="M306 308C270 287 231 277 191 272"/>
-                    <path d="M306 308C347 285 386 277 427 272"/>
-                    <path d="M191 272C168 260 146 245 128 225"/>
-                    <path d="M427 272C452 258 471 241 488 219"/>
-                    <path d="M124 94C107 82 91 75 72 76"/>
-                    <path d="M177 68C163 52 146 43 124 36"/>
-                    <path d="M478 76C495 61 512 55 532 57"/>
-                    <path d="M441 56C456 39 474 30 497 27"/>
-                    <path d="M128 225C111 213 92 207 71 208"/>
-                    <path d="M488 219C507 207 527 203 548 207"/>
-                  </g>
-                  <g class="neural-pulse">
-                    <path class="iri" d="M310 354C307 308 307 265 306 217C274 187 244 174 207 158C176 143 146 126 124 94"/>
-                    <path class="p2" d="M310 354C307 308 307 265 306 217C340 184 371 169 409 148C428 120 438 92 441 56"/>
-                    <path class="p3" d="M191 272C168 260 146 245 128 225C111 213 92 207 71 208"/>
-                  </g>
-                  <g>
-                    <circle class="neural-node" cx="124" cy="94" r="3.2"/>
-                    <circle class="neural-node warm" cx="177" cy="68" r="2.7"/>
-                    <circle class="neural-node" cx="478" cy="76" r="3"/>
-                    <circle class="neural-node" cx="441" cy="56" r="2.6"/>
-                    <circle class="neural-node warm" cx="207" cy="158" r="3.4"/>
-                    <circle class="neural-node" cx="409" cy="148" r="3.4"/>
-                    <circle class="neural-node" cx="128" cy="225" r="2.6"/>
-                    <circle class="neural-node warm" cx="488" cy="219" r="2.8"/>
-                    <circle class="neural-node" cx="72" cy="76" r="2.2"/>
-                    <circle class="neural-node" cx="124" cy="36" r="2.2"/>
-                    <circle class="neural-node warm" cx="532" cy="57" r="2.2"/>
-                    <circle class="neural-node" cx="497" cy="27" r="2.2"/>
-                    <circle class="neural-node warm" cx="71" cy="208" r="2.2"/>
-                    <circle class="neural-node" cx="548" cy="207" r="2.2"/>
-                  </g>
-                  <g class="neural-line">
-                    <path d="M216 334H251L259 326L268 346L277 319L286 351L295 327L304 340L314 333H351L360 320L369 348L378 328L387 337L396 333H424"/>
-                  </g>
-                  <path class="neural-line fine" d="M207 158C182 148 164 128 155 108M207 158C194 191 181 214 165 231M207 158C230 133 250 119 270 98M207 158C188 179 162 184 138 199M409 148C433 136 451 116 461 93M409 148C394 179 382 201 366 219M409 148C389 124 369 109 349 91M409 148C431 172 457 180 480 194M306 308C282 299 260 289 237 279M306 308C331 297 355 289 378 279M165 231C143 253 129 266 108 278M138 199C111 212 93 218 70 221M366 219C388 244 399 263 406 284M480 194C507 209 523 220 542 232M270 98C285 72 291 53 292 33M349 91C333 65 328 47 327 27M461 93C480 69 491 50 493 31M155 108C135 84 123 65 114 43M237 279C208 300 191 313 171 327M378 279C406 302 422 316 443 333M306 217C269 233 249 244 227 258M306 217C343 231 365 245 387 259"/>
-                  <path class="neural-line fine" d="M207 158C260 169 286 189 306 217M409 148C356 163 330 186 306 217M165 231C202 231 249 232 278 250M366 219C329 221 290 231 267 251M138 199C158 213 182 224 207 222M480 194C456 207 433 222 409 225M237 279C256 292 275 300 306 301M378 279C356 294 335 301 306 301M155 108C193 113 219 130 235 158M461 93C424 107 401 127 387 154M108 278C143 261 174 246 207 223M542 232C507 239 482 243 455 254M306 217C289 223 278 230 265 242M306 217C323 221 338 230 349 244M306 217C293 208 280 198 267 186M306 217C323 206 338 197 351 184"/>
-                  <g class="neural-dust">
-                    <circle cx="84" cy="132" r="1.4"/>
-                    <circle cx="103" cy="168" r="1"/>
-                    <circle cx="126" cy="143" r="1.2"/>
-                    <circle cx="565" cy="122" r="1.3"/>
-                    <circle cx="584" cy="171" r="1.1"/>
-                    <circle cx="527" cy="103" r="1"/>
-                    <circle cx="69" cy="282" r="1.1"/>
-                    <circle cx="94" cy="315" r="1.3"/>
-                    <circle cx="607" cy="271" r="1.1"/>
-                    <circle cx="571" cy="302" r="1.4"/>
-                    <circle cx="239" cy="63" r="1"/>
-                    <circle cx="385" cy="52" r="1.3"/>
-                    <circle cx="458" cy="44" r="1"/>
-                    <circle cx="186" cy="350" r="1.2"/>
-                    <circle cx="480" cy="355" r="1.1"/>
-                  </g>
-                  <g class="neural-pulse">
-                    <path class="p2" d="M306 308C331 297 355 289 378 279C406 302 422 316 443 333"/>
-                    <path class="p3" d="M207 158C260 169 286 189 306 217C343 231 365 245 387 259"/>
-                  </g>
-                  <circle class="neural-core" cx="306" cy="217" r="3.6"/>
-                  <g>
-                    <circle class="neural-node" cx="267" cy="186" r="2.1"/>
-                    <circle class="neural-node warm" cx="351" cy="184" r="2.1"/>
-                    <circle class="neural-node" cx="265" cy="242" r="1.9"/>
-                    <circle class="neural-node warm" cx="349" cy="244" r="1.9"/>
-                    <circle class="neural-node" cx="155" cy="108" r="2.8"/>
-                    <circle class="neural-node warm" cx="165" cy="231" r="2.6"/>
-                    <circle class="neural-node" cx="270" cy="98" r="2.4"/>
-                    <circle class="neural-node warm" cx="138" cy="199" r="2.2"/>
-                    <circle class="neural-node" cx="461" cy="93" r="2.7"/>
-                    <circle class="neural-node warm" cx="366" cy="219" r="2.4"/>
-                    <circle class="neural-node" cx="349" cy="91" r="2.3"/>
-                    <circle class="neural-node warm" cx="480" cy="194" r="2.4"/>
-                    <circle class="neural-node" cx="237" cy="279" r="2.7"/>
-                    <circle class="neural-node" cx="378" cy="279" r="2.6"/>
-                    <circle class="neural-node" cx="108" cy="278" r="2"/>
-                    <circle class="neural-node warm" cx="70" cy="221" r="1.9"/>
-                    <circle class="neural-node" cx="406" cy="284" r="2"/>
-                    <circle class="neural-node warm" cx="542" cy="232" r="2"/>
-                    <circle class="neural-node" cx="292" cy="33" r="1.8"/>
-                    <circle class="neural-node" cx="327" cy="27" r="2"/>
-                    <circle class="neural-node warm" cx="493" cy="31" r="1.8"/>
-                    <circle class="neural-node" cx="114" cy="43" r="1.7"/>
-                    <circle class="neural-node warm" cx="171" cy="327" r="1.8"/>
-                    <circle class="neural-node" cx="443" cy="333" r="1.8"/>
-                  </g>
-                  <path class="neural-wave" pathLength="1" d="M216 334H251L259 326L268 346L277 319L286 351L295 327L304 340L314 333H351L360 320L369 348L378 328L387 337L396 333H424"/>
+    <main class="stage">
+      <div class="stream" id="timeline" tabindex="0" aria-label="聊天记录">
+        <section class="empty-state" id="empty-state">
+          <div class="memory-home hero" id="memory-home" data-enter>
+            <div class="aurora" aria-hidden="true"><i></i><i></i><i></i></div>
+            <p class="overline"><span class="pulse" aria-hidden="true"></span><span id="intro-status">正在连接本地服务…</span></p>
+            <p class="eyebrow" id="home-eyebrow">声音记忆</p>
+            <p class="home-greeting" id="home-greeting">你好</p>
+            <h1>和熟悉的声音，<br>再聊<em>一会儿</em></h1>
+            <p class="lede" id="home-lede">先添加一段参考录音，就能开始对话。</p>
+            <button class="home-resume" id="home-resume" type="button" hidden>
+              <span class="resume-top"><span>继续上次对话</span><time id="resume-date"></time>
+                <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h14M13 6l6 6-6 6"/></svg>
+              </span>
+              <span id="resume-quote"></span>
+            </button>
+            <div class="presence-wrap">
+              <button class="record-disc" id="voice-disc" type="button" aria-label="打开声音库">
+                <svg class="record-ring" viewBox="0 0 240 240" aria-hidden="true"><circle class="ring-track" cx="120" cy="120" r="112"/></svg>
+                <svg class="intro-arm" viewBox="0 0 240 240" aria-hidden="true">
+                  <g><path d="M213 34 L204 89 Q203 96 197 101 L176 120" fill="none" stroke="#d2d6de" stroke-width="4"/>
+                    <path d="M181 114 l-10 11" stroke="#ff7a45" stroke-width="7" stroke-linecap="round"/>
+                    <circle cx="213" cy="34" r="8" fill="#363b46" stroke="#c3c8d0" stroke-width="2"/></g>
                 </svg>
-                </div>
-                <p class="intro-status" id="intro-status" aria-hidden="true">正在连接本地服务…</p>
-              </figure>
+                <span class="record-label"><span id="disc-initial">她</span></span>
+              </button>
+              <p class="presence-label"><span class="live" aria-hidden="true"></span>NOW · <b data-voice-count>00</b> VOICES · 点击管理声音</p>
             </div>
-
-            <div class="chat-empty">
-              <p class="chat-empty-kicker">NEW MEMORY / 新的对话</p>
-              <h3>从一句话开始</h3>
-              <p id="empty-copy">写下第一条消息。<br>AI 的思考过程、文字回复和语音会依次出现在这里。</p>
-              <button class="primary hero-cta" id="empty-add" type="button"><span id="empty-add-label">添加声音</span><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 17L17 7M7 7h10v10"/></svg></button>
-              <p class="empty-note">WAV · 3–30 秒 · 不超过 10 MB</p>
-            </div>
+            <div class="home-network" hidden><div class="home-waveform" id="home-network-start" aria-hidden="true"><div id="neural-tree"></div></div></div>
           </div>
-          <div id="messages" role="log" aria-label="消息"></div>
-        </section>
 
+          <div class="chat-empty">
+            <p class="chat-empty-kicker">NEW MEMORY / 新的对话</p>
+            <h3>从一句话开始</h3>
+            <p id="empty-copy">写下第一条消息。<br>AI 的思考过程、文字回复和语音会依次出现在这里。</p>
+            <button class="primary hero-cta" id="empty-add" type="button"><span id="empty-add-label">添加声音</span><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7 17L17 7M7 7h10v10"/></svg></button>
+            <p class="empty-note">WAV · 3–30 秒 · 不超过 10 MB</p>
+          </div>
+        </section>
+        <div id="messages" class="messages" role="log" aria-label="消息"></div>
+      </div>
+
+      <div class="composer-wrap">
         <form class="composer" id="composer">
-          <div class="composer-top" aria-hidden="true"><span>TO</span><b id="composer-to">她</b><span>·</span><span>VOICE</span><b class="voice" id="composer-voice">等待一段声音</b></div>
-          <label for="message-input" class="composer-label">输入消息</label>
-          <textarea id="message-input" maxlength="2000" placeholder="想说什么，就写下来…" rows="1" disabled></textarea>
+          <p class="composer-top" hidden aria-hidden="true"><span>TO</span><b id="composer-to">她</b><span>·</span><span>VOICE</span><b class="voice" id="composer-voice">等待一段声音</b></p>
+          <label for="message-input" class="visually-hidden">输入消息</label>
+          <textarea id="message-input" maxlength="2000" placeholder="说点什么… Enter 发送 / Shift+Enter 换行" rows="1" disabled></textarea>
           <p id="recording-status" class="recording-status" role="status" aria-live="polite"></p>
-          <div class="composer-bottom">
+          <div class="composer-row">
+            <a class="realtime-link ghost" id="realtime-link" href="/realtime/"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 10v4m4-7v10m5-14v18m5-14v10m4-7v4"/></svg>实时语音</a>
             <div class="composer-actions">
-              <a class="realtime-link" id="realtime-link" href="/realtime/"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 10v4m4-7v10m5-14v18m5-14v10m4-7v4"/></svg>实时语音</a>
               <button type="submit" class="home-start" id="home-start">开始对话<svg viewBox="0 0 24 24" aria-hidden="true"><path d="M5 12h14M13 6l6 6-6 6"/></svg></button>
               <button type="button" class="record-button" id="record" aria-label="按住录音，松开识别，最长30秒" disabled>按住说话</button>
               <button type="button" class="stop" id="stop" hidden>停止</button>
@@ -237,67 +121,115 @@
           </div>
         </form>
         <p class="home-privacy"><span>参考录音与语音合成不离开本机</span><span id="composer-hint">聊天文字会发送至你配置的大模型服务</span></p>
-      </main>
+      </div>
+    </main>
 
-      <aside class="memory-rail" aria-label="她的声音与回忆">
-        <section class="rail-card">
-          <div class="rail-head"><span>她的声音</span><span class="tag">01 / VOICE</span></div>
-          <div class="character-row">
-            <span class="monogram" id="rail-monogram" aria-hidden="true">◦</span>
-            <div class="character-copy"><h2 id="rail-character-name">还没有人物</h2><p id="rail-character-meta">创建人物，声音才会留下</p></div>
-          </div>
-          <div class="character-voice">
-            <svg viewBox="0 0 78 22" preserveAspectRatio="none" aria-hidden="true"><path d="M0 11H7L11 6L15 17L19 3L23 19L27 8L31 14L35 11H47L51 6L55 17L59 9L63 13H78" fill="none" stroke="currentColor" stroke-width="1"/></svg>
-            <span class="meta" id="rail-voice-meta">VOICE<b>等待添加</b></span>
-          </div>
-          <div class="character-actions"><button class="small-btn accent" id="home-character-settings" type="button">人物设定</button><button class="small-btn" id="home-voice-library" type="button">声音库</button></div>
-        </section>
-
-        <section class="rail-card">
-          <div class="rail-head"><span>回忆</span><span>ON THIS MAC</span></div>
-          <div class="pulse-grid">
-            <div><b id="pulse-sessions">0</b><span>段对话</span></div>
-            <div><b data-voice-count>0</b><span>个声音</span></div>
-            <div><b data-character-count>0</b><span>个人物</span></div>
-            <div><b data-memory-count>0</b><span>条记忆</span></div>
-          </div>
-          <div class="pulse-note"><span id="pulse-last">还没有留下日期</span><span>LOCAL</span></div>
-        </section>
-
-        <section class="rail-card">
-          <div class="rail-head"><span>记忆</span><span class="tag">AUTO</span></div>
-          <div class="memory-empty">
-            <span class="memory-ring" id="rail-memory-count" aria-hidden="true">0</span>
-            <div class="memory-copy"><strong id="rail-memory-title">还没有记忆</strong><span id="rail-memory-note">确认建议后，记忆会出现在这里</span></div>
-          </div>
-          <p class="memory-note">每 3 轮符合条件的回复后提炼 · 确认后记住</p>
-        </section>
-
-        <section class="rail-card">
-          <div class="rail-head"><span>回忆索引</span><span>RECENT</span></div>
-          <div class="index-rows" id="index-rows"></div>
-          <p class="index-note" id="index-note">按日期归档，只统计本机已有的对话。</p>
-        </section>
-
-        <section class="rail-card">
-          <div class="rail-head"><span>她的状态</span><span id="state-label">IDLE</span></div>
-          <div class="state-rows">
-            <div class="state-row" id="state-voice"><span class="dot" aria-hidden="true"></span><span class="name">声音</span><span class="desc" id="state-voice-text">等待</span></div>
-            <div class="state-row" id="state-llm"><span class="dot" aria-hidden="true"></span><span class="name">聊天</span><span class="desc" id="state-llm-text">等待</span></div>
-            <div class="state-row" id="state-local"><span class="dot" aria-hidden="true"></span><span class="name">本机</span><span class="desc" id="state-local-text">连接中</span></div>
-          </div>
-        </section>
-
-        <section class="rail-card">
-          <div class="rail-head"><span>关于这里</span><span>MEMORY</span></div>
-          <p class="about-copy">这里留住说过的话，和她的声音。</p>
-          <p class="about-meta">VOICE˚ / MEMORY ROOM<br>LOCAL / PRIVATE</p>
-        </section>
-
-        <p class="rail-privacy"><b>只留在本机</b> · 参考录音与语音合成不上传<br>聊天文字会发送至你配置的 LLM</p>
-      </aside>
-    </div>
+    <aside class="memory-rail" id="memory-rail" hidden aria-hidden="true">
+      <span id="top-mode">MEMORY ROOM</span>
+      <div class="rail-card">
+        <span id="pulse-sessions">00</span><span id="pulse-last">还没有留下日期</span>
+        <div id="rail-monogram">◦</div><h2 id="rail-character-name">还没有人物</h2><p id="rail-character-meta">创建人物，声音才会留下</p>
+        <span id="rail-voice-meta"><b>等待添加</b></span>
+        <span id="rail-memory-count">00</span><strong id="rail-memory-title">还没有记忆</strong><span id="rail-memory-note">确认建议后，记忆会出现在这里</span>
+        <div id="index-rows"></div><p id="index-note">按日期归档，只统计本机已有的对话。</p>
+        <span id="state-label">IDLE</span>
+        <div id="state-voice"><span id="state-voice-text">等待</span></div>
+        <div id="state-llm"><span id="state-llm-text">等待</span></div>
+        <div id="state-local"><span id="state-local-text">连接中</span></div>
+      </div>
+      <div id="chat-network" aria-hidden="true"></div>
+    </aside>
   </div>
+
+  <dialog id="library-dialog" class="library" tabindex="-1" aria-labelledby="library-title">
+    <div class="library-head">
+      <div>
+        <p class="library-kicker">VOICE˚ · LIBRARY</p>
+        <h2 id="library-title">书房</h2>
+      </div>
+      <button class="close-dialog icon-btn" type="button" aria-label="关闭书房"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M18 6L6 18M6 6l12 12"/></svg></button>
+    </div>
+    <nav class="library-tabs" role="tablist" aria-label="书房">
+      <button type="button" role="tab" id="tab-recall" data-tab="recall" aria-selected="true" aria-controls="panel-recall">回忆 <b data-count>00</b></button>
+      <button type="button" role="tab" id="tab-people" data-tab="people" aria-selected="false" aria-controls="panel-people">人物与声音</button>
+      <button type="button" role="tab" id="tab-memory" data-tab="memory" aria-selected="false" aria-controls="panel-memory">记忆 <b data-memory-count>00</b></button>
+      <button type="button" role="tab" id="tab-settings" data-tab="settings" aria-selected="false" aria-controls="panel-settings">设置</button>
+      <span class="tab-glider" aria-hidden="true"></span>
+    </nav>
+    <div class="library-body">
+      <section data-panel="recall" id="panel-recall" role="tabpanel" aria-labelledby="tab-recall">
+        <button class="drawer-new" id="new-chat" type="button" aria-label="开始一段新的对话"><span class="plus" aria-hidden="true">＋</span><span>开始一段对话</span><span class="shortcut" aria-hidden="true">⌘N</span></button>
+        <label class="search">
+          <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="11" cy="11" r="6"/><path d="M16 16l4 4"/></svg>
+          <input id="recall-search" placeholder="搜索回忆" aria-label="搜索回忆">
+          <kbd>⌘K</kbd>
+        </label>
+        <p id="recall-empty" class="dialog-intro" hidden>没有匹配的回忆。</p>
+        <nav id="conversations" aria-label="历史会话"></nav>
+      </section>
+
+      <section data-panel="people" id="panel-people" role="tabpanel" aria-labelledby="tab-people" hidden>
+        <div class="section-head">
+          <h3>人物 <b data-character-count>00</b></h3>
+          <button id="add-character" class="text-link" type="button">＋ 创建人物</button>
+        </div>
+        <button class="library-row" id="home-characters" type="button">
+          <span class="row-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="8" r="4"/><path d="M4.5 21c.9-4 3.9-6 7.5-6s6.6 2 7.5 6"/></svg></span>
+          <span class="row-copy"><strong>虚拟人物库</strong><span>性格、声音与示例对话；记忆分别保存</span></span>
+          <svg class="chev" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 6l6 6-6 6"/></svg>
+        </button>
+        <div class="section-head">
+          <h3>声音 <b data-voice-count>00</b></h3>
+          <button id="home-voice-library" class="text-link" type="button">＋ 添加 / 导入</button>
+        </div>
+        <button class="library-row" id="sidebar-voice" type="button" aria-label="查看声音库">
+          <span class="row-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 12v0M8 8v8M12 4v16M16 7v10M20 11v2"/></svg></span>
+          <span class="row-copy"><strong id="sidebar-voice-name">尚未添加声音</strong><span id="sidebar-voice-meta">添加一段参考录音，让声音留下来</span></span>
+          <b class="row-badge" id="sidebar-voice-tag">VOICE</b>
+          <svg class="chev" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 6l6 6-6 6"/></svg>
+        </button>
+        <div class="library-row row-static" id="voice-switch-row">
+          <span class="row-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 6l-5 6 5 6M16 6l5 6-5 6"/></svg></span>
+          <span class="row-copy"><strong>切换人物 / 声音</strong><span>选择后新建会话，当前会话保留</span></span>
+          <label class="voice-picker" for="voice-select"><span class="visually-hidden">人物 / 声音</span><select id="voice-select" aria-label="选择人物或声音，切换时新建会话"><option value="">尚未添加声音</option></select></label>
+        </div>
+        <p class="panel-note">参考录音、训练结果与合成音频只保存在这台 Mac。</p>
+      </section>
+
+      <section data-panel="memory" id="panel-memory" role="tabpanel" aria-labelledby="tab-memory" hidden>
+        <p class="sheet-note">同一人物的文字和实时语音会话共享已确认记忆。每 3 轮符合条件的回复后提炼建议，可能产生 LLM 费用。</p>
+        <button class="drawer-new" id="memory-open-drawer" type="button">
+          <span class="plus" aria-hidden="true">✦</span><span>打开人物记忆</span>
+        </button>
+        <p class="panel-note">已确认的记忆会在人物的所有对话里生效；待确认建议需要你逐条审核。</p>
+      </section>
+
+      <section data-panel="settings" id="panel-settings" role="tabpanel" aria-labelledby="tab-settings" hidden>
+        <button class="library-row" id="nav-settings-row" type="button">
+          <span class="row-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h6m4 0h6M4 17h10m4 0h2"/><circle cx="12" cy="7" r="2"/><circle cx="16" cy="17" r="2"/></svg></span>
+          <span class="row-copy"><strong>大模型与界面</strong><span>OpenAI 兼容接口 · 气泡透明度</span></span>
+          <svg class="chev" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 6l6 6-6 6"/></svg>
+        </button>
+        <button class="library-row" id="nav-local" type="button">
+          <span class="row-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><rect x="4" y="5" width="16" height="11" rx="1.5"/><path d="M9 20h6M12 16v4"/></svg></span>
+          <span class="row-copy"><strong>本地服务状态</strong><span>语音模型 · 聊天模型 · 语音识别</span></span>
+          <svg class="chev" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 6l6 6-6 6"/></svg>
+        </button>
+        <button class="library-row" id="nav-voices" type="button">
+          <span class="row-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 12v0M8 8v8M12 4v16M16 7v10M20 11v2"/></svg></span>
+          <span class="row-copy"><strong>训练声音</strong><span>说话语气 · 导入训练 ZIP · 参考录音</span></span>
+          <svg class="chev" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 6l6 6-6 6"/></svg>
+        </button>
+        <a class="library-row" href="/tone/">
+          <span class="row-icon"><svg viewBox="0 0 24 24" aria-hidden="true"><path d="M3 10v4m4-7v10m5-14v18m5-14v10m4-7v4"/></svg></span>
+          <span class="row-copy"><strong>语气试听</strong><span>在独立页面试听不同语气的效果</span></span>
+          <svg class="chev" viewBox="0 0 24 24" aria-hidden="true"><path d="M9 6l6 6-6 6"/></svg>
+        </a>
+        <p class="panel-note">聊天文字、人物设定及相关记忆会发送至配置的 LLM；参考录音与语音合成留在本机。</p>
+        <p class="version">VOICE˚ · LOCAL STUDIO · V0.2</p>
+      </section>
+    </div>
+  </dialog>
 
   <dialog id="voice-dialog" class="drawer" aria-labelledby="voice-dialog-title">
     <div class="drawer-heading"><h2 id="voice-dialog-title">训练声音</h2><button type="button" class="close-dialog" aria-label="关闭"><svg viewBox="0 0 24 24"><path d="M18 6L6 18M6 6l12 12"/></svg></button></div>
@@ -356,7 +288,7 @@
     <div class="status-row"><span>聊天模型</span><strong id="local-llm">未配置</strong></div>
     <div class="status-row"><span>语音识别</span><strong id="local-stt">加载中</strong></div>
     <div class="status-row"><span>任务</span><strong id="local-busy">空闲</strong></div>
-    <p class="privacy-note">聊天文字、人物设定及相关记忆会发送至配置的 LLM；参考录音与语音合成留在本机。页面字体与背景图来自 Google Fonts / Higgs，首次加载需要联网。</p>
+    <p class="privacy-note">聊天文字、人物设定及相关记忆会发送至配置的 LLM；参考录音与语音合成留在本机。页面不再加载外部字体或图片，完全离线可用。</p>
   </dialog>
 
   <dialog id="settings-dialog" class="drawer" aria-labelledby="app-settings-title">
@@ -416,10 +348,13 @@
   </dialog>
   <dialog id="character-settings-dialog" class="drawer" aria-labelledby="settings-title">
     <div class="drawer-heading"><h2 id="settings-title">本会话人物设定</h2><button class="close-dialog" type="button" aria-label="关闭"><svg viewBox="0 0 24 24"><path d="M18 6L6 18M6 6l12 12"/></svg></button></div>
-    <p class="dialog-intro">下方为创建会话时的快照。编辑人物后，新建会话才使用新设定。</p>
-    <p id="character-snapshot-version" class="form-note"></p>
-    <div id="character-snapshot"></div><button id="edit-current-character" class="primary wide" type="button">编辑人物最新设定</button>
-    <button id="start-latest-character" class="wide" type="button">用最新设定开始对话</button>
+    <p class="dialog-intro">编辑人物不影响本会话；新建会话才使用新设定。</p>
+    <p id="character-snapshot-version" class="snapshot-status"></p>
+    <div id="character-snapshot"></div>
+    <div class="snapshot-actions">
+      <button id="start-latest-character" class="primary wide" type="button">用最新设定开始对话</button>
+      <button id="edit-current-character" class="wide" type="button">编辑人物最新设定</button>
+    </div>
   </dialog>
   <dialog id="memory-dialog" class="drawer" aria-labelledby="memory-title">
     <div class="drawer-heading"><h2 id="memory-title">人物记忆</h2><button class="close-dialog" type="button" aria-label="关闭"><svg viewBox="0 0 24 24"><path d="M18 6L6 18M6 6l12 12"/></svg></button></div>

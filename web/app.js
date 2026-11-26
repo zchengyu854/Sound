@@ -86,14 +86,6 @@ function updatePlayback() {
   });
 }
 function activeMessage() { return state.messages.filter(message => message.role === "assistant" && ACTIVE.has(message.status)).at(-1); }
-function setView(view) {
-  if (view === "list") $("app").removeAttribute("data-intro");
-  $("app").dataset.view = view;
-  const target = view === "list"
-    ? $("conversations").querySelector(".conversation.active") || $("conversations").querySelector(".conversation") || $("new-chat")
-    : $("timeline");
-  target?.focus();
-}
 function scheduleRender() {
   if (renderFrame) return;
   renderFrame = requestAnimationFrame(() => { renderFrame = 0; renderMessages(); });
@@ -229,7 +221,7 @@ function setHome(home) {
   $("app").dataset.home = String(home);
   $(home ? "home-network-start" : "chat-network").append($("neural-tree"));
   $("top-mode").textContent = home ? "MEMORY ROOM" : "CONVERSATION";
-  setView("chat");
+  $("timeline").focus();
 }
 function goHome() {
   pauseAudio();
@@ -315,13 +307,13 @@ function renderHealth() {
   $("service-status").textContent = text;
   $("service-status").classList.toggle("warning", warning);
   $("service-status").hidden = quiet;
-  if ($("app").hasAttribute("data-intro")) {
-    $("intro-status").textContent = !state.online ? "正在重连本地服务…"
-      : health?.model_status === "loading" ? "正在加载并预热语音模型…"
-      : health?.model_status === "failed" ? "语音模型加载失败"
-      : health?.stt_status === "loading" ? "正在加载语音识别模型…"
-      : "正在打开声音记忆";
-  }
+  $("intro-status").textContent = !state.online ? "正在重连本地服务"
+    : health?.model_status === "loading" ? "正在加载并预热语音模型…"
+    : health?.model_status === "failed" ? "语音模型加载失败"
+    : health?.stt_status === "loading" ? "正在加载语音识别模型…"
+    : health?.busy ? "正在生成回复"
+    : !health?.llm_configured ? "等待配置聊天模型"
+    : $("app").hasAttribute("data-intro") ? "正在打开声音记忆" : "本地语音已就绪";
   $("nav-dot").className = `nav-dot ${state.online ? (warning ? "warning" : "online") : ""}`;
   const voiceReady = state.online && health?.model_status === "ready";
   const setRailState = (id, active, text) => {
@@ -810,7 +802,6 @@ $("chat-transparency").addEventListener("input", event => setChatTransparency(ev
 $("add-character").addEventListener("click", () => openCharacter());
 $("new-chat").addEventListener("click", openChat);
 $("nav-voices").addEventListener("click", openVoice);
-$("nav-sessions").addEventListener("click", goHome);
 function openLocalStatus() {
   renderHealth();
   if (!$("local-dialog").open) $("local-dialog").showModal();
@@ -826,18 +817,12 @@ $("brand-home").addEventListener("click", () => {
   closeDialogs();
   goHome();
 });
-$("mobile-list").addEventListener("click", () => setView("list"));
-$("close-history").addEventListener("click", () => {
-  setView("chat");
-  $("mobile-list").focus();
-});
-$("home-voices").addEventListener("click", openVoice);
+$("voice-disc").addEventListener("click", openVoice);
 $("home-characters").addEventListener("click", () => openLibrary());
 $("home-resume").addEventListener("click", () => {
   const latest = state.conversations[0];
   if (latest) selectConversation(latest.id); else beginConversation();
 });
-$("home-character-settings").addEventListener("click", () => openLibrary());
 $("home-voice-library").addEventListener("click", openVoice);
 $("sidebar-voice").addEventListener("click", openVoice);
 $("chat-dialog").addEventListener("close", () => { if (!state.current) pendingPrompt = ""; });
@@ -851,11 +836,6 @@ document.addEventListener("keydown", event => {
   if (document.querySelector("dialog[open]")) return;
   event.preventDefault();
   beginConversation();
-});
-$("mobile-back").addEventListener("click", () => setView("list"));
-document.addEventListener("keydown", event => {
-  if (event.key !== "Escape" || $("app").dataset.view !== "list" || document.querySelector("dialog[open]")) return;
-  $("close-history").click();
 });
 $("empty-add").addEventListener("click", () => state.voices.length ? openChat() : openVoice());
 document.querySelectorAll("dialog .close-dialog").forEach(button => button.addEventListener("click", () => button.closest("dialog").close()));
@@ -1048,16 +1028,19 @@ function startPolling() {
   });
   schedulePoll();
 }
+let lastIntroStartupId = null;
 function showStartupIntro(startupId) {
   const app = $("app");
-  if (!startupId || app.dataset.home !== "true" || app.dataset.view !== "chat" ||
+  if (!startupId || app.dataset.home !== "true" ||
       matchMedia("(prefers-reduced-motion: reduce)").matches) return;
-  try {
-    if (localStorage.getItem("voice-startup-intro") === startupId) return;
-    localStorage.setItem("voice-startup-intro", startupId);
-  } catch (_) { return; }
+  if (lastIntroStartupId === startupId) return;
+  lastIntroStartupId = startupId;
   app.setAttribute("data-intro", "");
-  setTimeout(() => app.removeAttribute("data-intro"), 3600);
+  setTimeout(() => {
+    if (lastIntroStartupId !== startupId || !app.hasAttribute("data-intro")) return;
+    app.removeAttribute("data-intro");
+    renderHealth();
+  }, 3600);
 }
 
 async function start() {
@@ -1109,7 +1092,6 @@ async function openLibrary() {
   }
   if (!$("characters-dialog").open) $("characters-dialog").showModal();
 }
-$("nav-characters").addEventListener("click", openLibrary);
 $("create-character").addEventListener("click", () => openCharacter());
 $("character-add-voice").addEventListener("click", openVoice);
 $("character-form").addEventListener("submit", async event => {
@@ -1126,22 +1108,50 @@ $("character-form").addEventListener("submit", async event => {
     const wasEditing = !!editingCharacter;
     $("character-dialog").close(); if ($("characters-dialog").open) $("characters-dialog").close();
     await refresh();
+    if ($("character-settings-dialog").open) renderCharacterSnapshot(currentConversation());
     if (!wasEditing) await newConversation(`c:${character.id}`);
     toast(wasEditing ? "人物已保存，新会话生效。" : "人物已创建，可以开始聊天。");
   } catch (error) { $("character-error").textContent = error.message; }
   finally { button.disabled = false; }
 });
+function snapshotStatus(conversation) {
+  const latest = state.characters.find(character => character.id === conversation.character_id);
+  if (!conversation.character_revision_id) return {text: "本会话创建于版本记录之前，无法确认是否为最新设定。", updated: false};
+  if (!latest) return {text: "暂时无法确认人物是否已有更新。", updated: false};
+  if (latest.profile_revision_id === conversation.character_revision_id) return {text: "本会话使用的就是人物最新设定。", updated: false};
+  return {text: "人物在本会话创建后已更新设定；下方为创建会话时的快照。", updated: true};
+}
+function snapshotField(label, value) {
+  const field = node("div", "snapshot-field");
+  field.append(node("h3", "", label), node("p", value ? "" : "empty", value || "未填写"));
+  return field;
+}
+function renderCharacterSnapshot(conversation) {
+  const profile = profileOf(conversation); if (!profile) return false;
+  const status = snapshotStatus(conversation), version = $("character-snapshot-version");
+  version.textContent = status.text;
+  version.classList.toggle("updated", status.updated);
+  const card = node("div", "snapshot-card");
+  for (const field of characterFields) card.append(snapshotField(characterLabels[field], profile[field]));
+  card.append(snapshotField("绑定声音", state.voices.find(voice => voice.id === profile.voice_id)?.name || profile.voice_id));
+  if (profile.examples?.length) {
+    const field = node("div", "snapshot-field");
+    field.append(node("h3", "", "示例对话"));
+    for (const example of profile.examples) field.append(node("p", "snapshot-example", `用户：${example.user}\n人物：${example.assistant}`));
+    card.append(field);
+  }
+  $("character-snapshot").replaceChildren(card);
+  return true;
+}
 $("character-settings").addEventListener("click", () => {
-  const conversation = currentConversation(), profile = profileOf(conversation); if (!profile) return;
-  $("character-snapshot-version").textContent = conversation.character_revision_id ? `本会话版本：${conversation.character_revision_id}` : "本会话使用历史快照";
-  $("character-snapshot").replaceChildren();
-  const labels = {name: "姓名", background: "背景", personality: "性格", relationship: "与你的关系", speech_style: "说话习惯"};
-  for (const field of characterFields) $("character-snapshot").append(node("h3", "", labels[field]), node("p", "profile-text", profile[field] || "未填写"));
-  for (const example of profile.examples) $("character-snapshot").append(node("p", "profile-text", `用户：${example.user}\n人物：${example.assistant}`));
+  if (!renderCharacterSnapshot(currentConversation())) return;
   $("character-settings-dialog").showModal();
 });
-$("edit-current-character").addEventListener("click", async () => {
-  try { openCharacter(await api(`characters/${currentConversation().character_id}`)); } catch (error) { toast(error.message); }
+$("edit-current-character").addEventListener("click", async event => {
+  const button = event.currentTarget; button.disabled = true;
+  try { openCharacter(await api(`characters/${currentConversation().character_id}`)); }
+  catch (error) { toast(error.message); }
+  finally { button.disabled = false; }
 });
 $("start-latest-character").addEventListener("click", async () => {
   const selected = currentConversation()?.character_id;
@@ -1313,6 +1323,7 @@ let summaryRevisionRequest = 0, summaryNextOffset = null;
 const summaryEditors = [];
 const summaryKinds = {user_statement: "用户陈述", assistant_suggestion: "人物建议", open_thread: "待继续讨论"};
 const profileLabels = {speech_style: "说话习惯", personality: "性格"};
+const characterLabels = {name: "姓名", background: "背景", personality: "性格", relationship: "与你的关系", speech_style: "说话习惯"};
 const revisionOrigins = {auto: "自动整理", manual: "手动修改", rollback: "恢复版本", clear: "清空", initial: "初始档案", migration: "历史档案", growth: "确认建议"};
 function backgroundStatus(data) {
   return ({idle: "已就绪", queued: "等待后台整理", updating: "正在后台整理…", failed: "整理失败", warning: "需要检查"}[data.status] || data.status || "已就绪") + (data.error ? `：${data.error}` : "");
@@ -1543,8 +1554,7 @@ async function loadProfileRevisions(reset = false) {
       const row = node("section", "memory-row"), details = node("details");
       details.append(node("summary", "", `${revisionOrigins[revision.origin] || revision.origin} · ${new Date(revision.created_at).toLocaleString("zh-CN")}`),
         node("small", "", revision.id), node("p", "profile-text", revision.reason || ""));
-      const labels = {name: "姓名", background: "背景", personality: "性格", relationship: "与你的关系", speech_style: "说话习惯"};
-      for (const field of characterFields) details.append(node("p", "profile-text", `${labels[field]}：${revision.profile[field] || "未填写"}`));
+      for (const field of characterFields) details.append(node("p", "profile-text", `${characterLabels[field]}：${revision.profile[field] || "未填写"}`));
       details.append(node("p", "profile-text", `声音：${state.voices.find(voice => voice.id === revision.profile.voice_id)?.name || revision.profile.voice_id}`));
       for (const example of revision.profile.examples || []) details.append(node("p", "profile-text", `用户：${example.user}\n人物：${example.assistant}`));
       if (revision.sources?.length) details.append(sourceDetails(revision.sources));
